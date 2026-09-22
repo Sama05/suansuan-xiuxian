@@ -9,6 +9,8 @@ npm install
 npm start          # 启动服务，默认 http://localhost:3210
 ```
 
+> 需要 Node ≥ 18（`better-sqlite3` 是原生模块，首次安装会编译，Windows 上可能需要 VS Build Tools）。
+
 浏览器打开 `http://localhost:3210`，注册账号即可开玩。
 
 ```bash
@@ -19,7 +21,7 @@ npm test           # 运行全部测试（2326 项）
 
 ## 玩法
 
-七个子页面，从顶栏切换：
+八个子页面，从顶栏切换：
 
 | 页面 | 内容 |
 |------|------|
