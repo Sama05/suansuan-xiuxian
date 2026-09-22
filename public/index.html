@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>算力修仙</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<!-- ============================================================
+     登录 / 注册
+     ============================================================ -->
+<div id="login-screen">
+  <div class="login-box">
+    <div class="login-logo">
+      <div class="zh">算力修仙</div>
+      <div class="en">Compute Cultivation</div>
+    </div>
+    <div class="login-tip">以算力入道，以设备筑基</div>
+
+    <div class="field">
+      <label for="in-username">道号</label>
+      <input id="in-username" type="text" maxlength="20" autocomplete="username"
+             placeholder="2-20 个字符，支持中文">
+    </div>
+    <div class="field">
+      <label for="in-password">密令</label>
+      <input id="in-password" type="password" maxlength="64" autocomplete="current-password"
+             placeholder="至少 4 位">
+    </div>
+
+    <div class="btn-row">
+      <button class="btn" id="btn-login">登入</button>
+      <button class="btn primary" id="btn-register">开辟道途</button>
+    </div>
+
+    <div class="modal-note" id="login-msg" style="text-align:center;min-height:18px"></div>
+  </div>
+</div>
+
+<!-- ============================================================
+     游戏主界面
+     ============================================================ -->
+<div id="game-screen" class="hidden">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">算力修仙</div>
+
+    <div class="res-group">
+      <div class="res">
+        <span class="k">金钱</span>
+        <span class="v gold" id="ui-money">0</span>
+        <span class="sub" id="ui-income">+0 / 秒</span>
+      </div>
+      <div class="res">
+        <span class="k">算力</span>
+        <span class="v azure" id="ui-compute">0</span>
+        <span class="sub" id="ui-compute-sub">设备提供</span>
+      </div>
+      <div class="res">
+        <span class="k">灵气</span>
+        <span class="v violet" id="ui-qi">0</span>
+        <span class="sub" id="ui-qi-sub">突破境界用</span>
+      </div>
+      <div class="res">
+        <span class="k">灵石</span>
+        <span class="v jade" id="ui-spirit">0</span>
+        <span class="sub" id="ui-spirit-sub">购修仙设备</span>
+      </div>
+      <div class="res">
+        <span class="k">神识</span>
+        <span class="v rose" id="ui-shenshi">1</span>
+        <span class="sub" id="ui-shenshi-sub">增幅算力与修炼</span>
+      </div>
+      <div class="res">
+        <span class="k">境界</span>
+        <span class="v" id="ui-realm-top">凡人</span>
+        <span class="sub" id="ui-realm-prog">0.00%</span>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <div class="clock">
+        <span class="clock-date" id="ui-clock">2000年1月1日 00:00</span>
+        <span class="clock-tier" id="ui-clock-tier">1 秒 = 10 分钟</span>
+      </div>
+      <span id="save-status">已同步</span>
+      <span id="ui-username" style="color:var(--text)"></span>
+      <button class="btn sm ghost" id="btn-save-now">存档</button>
+      <button class="btn sm ghost" id="btn-logout">登出</button>
+    </div>
+  </header>
+
+  <!-- 子页面导航 -->
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="realm">境界</button>
+    <button class="tab" data-tab="work">工作</button>
+    <button class="tab" data-tab="tech">设备</button>
+    <button class="tab" data-tab="invest">投向</button>
+    <button class="tab" data-tab="company" id="tab-company">
+      公司<span class="tab-badge" id="tab-company-badge">未成立</span>
+    </button>
+    <button class="tab" data-tab="stock" id="tab-stock">
+      股市<span class="tab-badge" id="tab-stock-badge">未开户</span>
+    </button>
+    <button class="tab" data-tab="market" id="tab-market">市场</button>
+<button class="tab locked" data-tab="technique" id="tab-technique">
+      功法<span class="tab-badge" id="tab-technique-badge">未习得</span>
+    </button>
+  </nav>
+
+  <main class="main">
+
+    <!-- ==========================================================
+         页面：境界
+         ========================================================== -->
+    <section class="page active" data-page="realm">
+      <div class="grid-2">
+
+        <div class="panel">
+          <div class="realm-card">
+            <div class="realm-name" id="ui-realm">凡人</div>
+            <div class="realm-tier" id="ui-realm-tier">TIER 0</div>
+            <div class="realm-bar-wrap">
+              <div class="bar"><div class="fill" id="ui-realm-bar"></div></div>
+              <div class="realm-meta">
+                <span id="ui-realm-need">— / —</span>
+                <span id="ui-realm-next">下一境：炼气</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel-body tight">
+            <div class="stat-row">
+              <span class="k">神识</span>
+              <span class="v" id="ui-stat-shenshi">1</span>
+            </div>
+            <div class="stat-row">
+              <span class="k">灵气产出倍率</span>
+              <span class="v" id="ui-stat-qimul">×1.00</span>
+            </div>
+            <div class="stat-row">
+              <span class="k">当前功法</span>
+              <span class="v" id="ui-stat-tech">无</span>
+            </div>
+            <div class="stat-row">
+              <span class="k">总工作时间</span>
+              <span class="v" id="ui-totaljobs">0 次</span>
+            </div>
+            <div class="stat-row">
+              <span class="k">手动催工</span>
+              <span class="v" id="ui-rushcount">0 次</span>
+            </div>
+            <div class="stat-row">
+              <span class="k">道龄</span>
+              <span class="v" id="ui-playtime">0 秒</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>时间流速</h2>
+            <span class="hint" id="ui-tier-hint">境界越高，光阴越快</span>
+          </div>
+          <div class="panel-body tight">
+            <div class="tier-list" id="tier-list"></div>
+            <label class="auto-tier-row">
+              <input type="checkbox" id="chk-auto-tier" checked>
+              <span>自动跟随最高已解锁档位</span>
+            </label>
+            <div class="note-line" id="ui-tier-note">
+              当前：<b id="ui-tier-current">1 秒 = 10 分钟</b>　
+              <span class="dim">游戏内 1 月 = 30 天，1 年 = 12 月</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>道途说明</h2>
+          <span class="hint">第一阶段 · 经营期</span>
+        </div>
+        <div class="panel-body doc">
+          <p><b>核心循环</b></p>
+          <p>在「工作」页选一份现实中的职业干活，赚取金钱 → 用金钱在「设备」页买下第一台<b>个人电脑</b> →
+             接触到一个可以计算的东西，于是获得<b>第一本功法</b> → 功法导引灵气、神识开始起作用 →
+             灵气累积突破境界 → 境界解锁更高档的时间流速、更高级的工作与更强功法。</p>
+          <p><b>两条货币，别搞混</b></p>
+          <p><b>灵气</b>是突破境界的唯一货币，来源是「修仙方向」的算力产出与后期修仙类工作。<b>灵石</b>是后期修仙资源，用来购买科技修仙设备（需要金钱 + 灵石双造价）。</p>
+          <p><b>神识一开始就有</b></p>
+          <p>神识随境界提升，并被设备——尤其是<b>科技修仙设备</b>——大幅放大。它同时做两件事：
+             放大实际算力的效果，以及加快功法修炼速度。而功法修炼速度，就是灵气提升速度。</p>
+          <p><b>精力是硬约束</b></p>
+          <p>工作消耗精力，精力按现实时间每秒恢复 1 点（上限随境界提升，功法被动还能再抬）。
+             时间流速可以加快游戏内时间，但<strong>不能让精力恢复变快</strong> ——
+             所以拉满时间档位只会让你更快花完精力，不会凭空多产出。</p>
+          <p><b>关于投向</b></p>
+          <p>算力是有限资源，分配比例之和不超过 100%。<span class="c-red">修仙</span>产出灵气（境界唯一来源），
+             <span class="c-red">金融</span>即时变现，<span class="c-red">AI</span>与<span class="c-red">硬件</span>是长线全局加成，
+             <span class="c-red">功法增幅</span>在习得功法后解锁。</p>
+          <p><b>离线收益</b></p>
+          <p>离线时间按 30% 效率结算，最多累计 48 小时。离线期间工作与功法修炼都会继续，工作同样受精力上限约束。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================================
+         页面：工作
+         ========================================================== -->
+    <section class="page" data-page="work">
+      <div class="grid-2">
+
+        <!-- 精力 -->
+        <div class="panel">
+          <div class="panel-head">
+            <h2>精力</h2>
+            <span class="hint" id="ui-energy-rate">+1.0 / 秒</span>
+          </div>
+          <div class="panel-body">
+            <div class="energy-wrap">
+              <div class="energy-bar">
+                <div class="energy-fill" id="ui-energy-bar"></div>
+                <div class="energy-text">
+                  <span id="ui-energy-val">100 / 100</span>
+                </div>
+              </div>
+              <div class="energy-meta">
+                <span id="ui-energy-next">下一份工作需 6 点</span>
+                <span id="ui-energy-wait"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 当前工作 -->
+        <div class="panel">
+          <div class="panel-head">
+            <h2>当前工作</h2>
+            <span class="hint" id="ui-job-status">进行中</span>
+          </div>
+          <div class="panel-body" id="current-job-body">
+            <div class="cur-job">
+              <div class="cur-job-head">
+                <span class="cur-job-name" id="ui-job-name">—</span>
+                <span class="cur-job-real" id="ui-job-real"></span>
+              </div>
+              <div class="job-bar-wrap">
+                <div class="bar"><div class="fill job-fill" id="ui-job-bar"></div></div>
+                <div class="job-meta">
+                  <span id="ui-job-time">—</span>
+                  <span id="ui-job-eta"></span>
+                </div>
+              </div>
+              <div class="cur-job-gain">
+                <span>单次收益</span>
+                <span class="gain gold" id="ui-job-money">+0</span>
+                <span class="gain violet hidden" id="ui-job-spirit">+0 灵气</span>
+                <span class="gain jade hidden" id="ui-job-stone">+0 灵石</span>
+              </div>
+              <div class="cur-job-actions">
+                <button class="btn primary" id="btn-rush">催 工</button>
+                <button class="btn sm ghost" id="btn-toggle-work">暂停</button>
+              </div>
+              <div class="hint" style="margin-top:8px">
+                催工：立即完成一份（消耗全额精力）
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>可从事的工作</h2>
+          <span class="hint">越高级耗时越长、精力消耗越多、收益越高</span>
+        </div>
+        <div id="job-list"></div>
+      </div>
+    </section>
+
+    <!-- ==========================================================
+         页面：设备
+         ========================================================== -->
+    <section class="page" data-page="tech">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>算力设备</h2>
+          <span class="hint" id="ui-dev-hint">后半段是「修仙 × 科技」设备，需金钱 + 灵石双造价，大幅增幅神识</span>
+        </div>
+        <div id="dev-list"></div>
+      </div>
+    </section>
+
+    <!-- ==========================================================
+         页面：投向
+         ========================================================== -->
+    <section class="page" data-page="invest">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>算力投向</h2>
+          <span class="hint alloc-sum" id="ui-alloc-sum">合计 100%</span>
+        </div>
+        <div id="inv-list"></div>
+        <div class="panel-body tight hidden" id="ui-alloc-warn"
+             style="border-top:1px solid var(--border);color:var(--red);font-size:12px;line-height:1.6">
+          修仙方向为 0%，灵气不会增长，境界无法推进。若只是想攒钱买设备，这样可以；否则请给修仙留出份额。
+        </div>
+        <div class="panel-body tight" style="border-top:1px solid var(--border);display:flex;gap:8px">
+          <button class="btn sm" id="btn-alloc-reset" style="flex:1">全部归修仙</button>
+          <button class="btn sm" id="btn-alloc-even" style="flex:1">四路均分</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==========================================================
+         页面：公司（产业）
+         ========================================================== -->
+    <section class="page" data-page="company">
+
+      <!-- 未成立：注册占位 -->
+      <div class="panel locked-panel" id="company-panel">
+        <div class="locked-body">
+          <div class="locked-icon">商</div>
+          <div class="locked-title">尚未成立公司</div>
+          <div class="locked-desc">
+            <b>工作是「别人雇你」，公司是「你自己生产、自己卖」。</b><br>
+            成立公司后你可以买下生产线，每个周期自动产出商品，卖到市场上换钱。
+          </div>
+
+          <div class="locked-notes">
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span><b>不消耗精力</b> —— 公司按「现实时间」运转，与工作互不抢资源，但产出也不受时间档位加速</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>每周期要付 <b>维护费</b>（原料 + 人工）；金钱不够就停产，但不会欠费</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>产物先入 <b>仓库</b>；仓库满了会积压停产 —— 记得卖货或扩容</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>商品 <b>市价会波动</b>：科技类逐年变价，修仙类每 10 年变价（涨红跌绿）</span>
+            </div>
+          </div>
+
+          <div class="locked-foot">
+            <div class="found-cost">
+              注册需 <b id="ui-co-found-cost">—</b> 金钱
+              <span class="dim" id="ui-co-found-lock"></span>
+            </div>
+            <button class="btn primary" id="btn-found-company">注册成立</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 已成立：真实界面 -->
+      <div id="company-main" class="hidden">
+
+        <div class="grid-2">
+
+          <!-- 经营概览 -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>经营概览</h2>
+              <span class="hint" id="ui-co-status">运转中</span>
+            </div>
+            <div class="panel-body">
+              <div class="co-cycle">
+                <div class="bar"><div class="fill co-fill" id="ui-co-cycle-bar"></div></div>
+                <div class="job-meta">
+                  <span id="ui-co-cycle-label">下个周期 —</span>
+                  <span id="ui-co-cycle-count">已完成 0 个周期</span>
+                </div>
+              </div>
+              <div class="stat-row">
+                <span class="k">毛产出 / 周期</span><span class="v gold" id="ui-co-gross">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">维护费 / 周期</span><span class="v red" id="ui-co-upkeep">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">净收益 / 周期</span><span class="v jade" id="ui-co-net">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">净收益 / 现实秒</span><span class="v jade" id="ui-co-netps">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">累计毛收入</span><span class="v" id="ui-co-revenue">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">累计维护费</span><span class="v" id="ui-co-upkeep-total">0</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 仓库 -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>仓库</h2>
+              <span class="hint" id="ui-co-wh-level">Lv.0</span>
+            </div>
+            <div class="panel-body">
+              <div class="mastery-wrap">
+                <div class="mastery-head">
+                  <span>容量占用</span>
+                  <span class="v" id="ui-co-wh-val">0 / 500</span>
+                </div>
+                <div class="bar"><div class="fill jade" id="ui-co-wh-bar"></div></div>
+              </div>
+              <div class="co-wh-actions">
+                <button class="btn sm primary" id="btn-co-warehouse">扩容</button>
+                <label class="auto-tier-row">
+                  <input type="checkbox" id="chk-co-autosell" checked>
+                  <span>自动卖出（每个周期清仓）</span>
+                </label>
+              </div>
+              <div class="hint" id="ui-co-wh-cost" style="margin-top:8px"></div>
+              <div class="panel-body tight"
+                   style="border-top:1px solid var(--border);margin-top:10px;padding:10px 0 0;
+                          color:var(--text-faint);font-size:11px;line-height:1.7">
+                关掉自动卖出后产物会留在仓库里，等价格合适再手动卖 —— 但仓库满了会停产。
+                原料费与人工费照付，所以压货是有成本的。
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- 工业算力：产线的「电」。买线只拿到上限，能开几成力看这里 -->
+        <div class="panel">
+          <div class="panel-head">
+            <h2>工业算力</h2>
+            <span class="hint" id="ui-co-cp-scale">—</span>
+          </div>
+          <div class="panel-body">
+            <div class="mastery-wrap">
+              <div class="mastery-head">
+                <span>供给 / 需求</span>
+                <span class="v" id="ui-co-cp-val">0 / 0</span>
+              </div>
+              <div class="bar"><div class="fill" id="ui-co-cp-bar"></div></div>
+            </div>
+            <div class="stat-row">
+              <span class="k">算力供给</span><span class="v jade" id="ui-co-cp-pool">0</span>
+            </div>
+            <div class="stat-row">
+              <span class="k">全厂需求</span><span class="v" id="ui-co-cp-demand">0</span>
+            </div>
+            <div class="stat-row">
+              <span class="k">「工业产能」份额</span><span class="v" id="ui-co-cp-share">0%</span>
+            </div>
+            <div class="co-wh-actions">
+              <button class="btn sm primary" id="btn-co-cp-goto">去调投向份额</button>
+            </div>
+            <div class="hint" id="ui-co-cp-tip" style="margin-top:8px"></div>
+          </div>
+        </div>
+
+        <!-- 生产线 -->
+        <div class="panel">
+          <div class="panel-head">
+            <h2>生产线</h2>
+            <span class="hint" id="ui-co-line-hint">买下一条线只是拿到产能上限，转起来要靠工业算力</span>
+          </div>
+          <div id="co-line-list"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ==========================================================
+         页面：市场（商品行情 · 独立页）
+         价格是公开的，未成立公司也能看；库存与卖出要公司成立后才可用。
+         ========================================================== -->
+    <section class="page" data-page="market">
+
+      <!-- 行业景气：上游涨价会顺着产业链传导，压缩下游毛利 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>行业景气</h2>
+          <span class="hint" id="ui-mk-ind-hint">上游原料涨 → 下游成本涨、售价跟涨，但毛利被压缩</span>
+        </div>
+        <div id="mk-ind-list"></div>
+      </div>
+
+      <!-- 价格走势 -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>价格走势</h2>
+          <span class="hint" id="ui-mk-chart-hint">点下面任意一行切换</span>
+        </div>
+        <div class="co-chart-wrap">
+          <div class="co-chart-head">
+            <span class="co-chart-name" id="ui-mk-chart-name">—</span>
+            <span class="co-chart-tag" id="ui-mk-chart-tag"></span>
+            <span class="co-chart-legend">
+              <i class="lg solid"></i><span>已发生</span>
+              <i class="lg dashed"></i><span>推演</span>
+              <i class="lg base"></i><span>基准价</span>
+            </span>
+          </div>
+          <div class="co-chart-body" id="mk-chart-body"></div>
+          <div class="co-chart-foot" id="ui-mk-chart-foot"></div>
+        </div>
+      </div>
+
+      <!-- 商品行情（按行业分组） -->
+      <div class="panel">
+        <div class="panel-head">
+          <h2>商品行情</h2>
+          <span class="hint" id="ui-mk-market-hint">科技类逐年变价 · 修仙类每 10 年变价</span>
+        </div>
+        <div id="mk-good-list"></div>
+        <div class="co-market-foot" id="mk-foot">
+          <span>库存市值合计 <b id="ui-mk-stock-value">0</b></span>
+          <span>库存 <b id="ui-mk-stock-count">0</b> 件</span>
+          <button class="btn sm" id="btn-mk-sell-all">全部卖出</button>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ==========================================================
+         页面：股市（证券账户）
+         ========================================================== -->
+    <section class="page" data-page="stock">
+
+      <!-- 未开户：锁定占位 -->
+      <div class="panel locked-panel" id="stock-panel">
+        <div class="locked-body">
+          <div class="locked-icon">券</div>
+          <div class="locked-title">尚未开立证券账户</div>
+          <div class="locked-desc">
+            <b>公司是「自己生产、自己卖」，股市是「买卖别人手上的公司」。</b><br>
+            开户后你可以按「期」买入或卖出上市公司股票，赚的只有行情波动的差价。<br>
+            池子里共 <b>50 家</b>（30 家科技 + 20 家修仙宗门），行情页按市值列前 10 家。
+          </div>
+
+          <div class="locked-notes">
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>成交价 = <b>自然价</b> × <b>冲击系数</b>；自然价 = 基准价 × 行情波动 × 与公司商品的联动</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>成交一律按<b>成交之后</b>的冲击价结算 —— 买入把自己顶高，卖出把自己砸低</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>你买出来的溢价会<b>逐期衰减</b>，等它涨回去再卖是拿不到的</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>唯一的盈利来源：<b>赌对自然价的方向</b> —— 低位买入、高位卖出</span>
+            </div>
+          </div>
+
+          <div class="locked-foot" id="ui-st-lock">需达到「炼气」才能开户</div>
+        </div>
+      </div>
+
+      <!-- 已开户：真实界面 -->
+      <div id="stock-main" class="hidden">
+
+        <div class="grid-2">
+
+          <!-- 账户概览 -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>证券账户</h2>
+              <span class="hint" id="ui-st-pnlratio">—</span>
+            </div>
+            <div class="panel-body tight">
+              <div class="stat-row">
+                <span class="k">总市值</span><span class="v gold" id="ui-st-value">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">持仓成本（含费）</span><span class="v" id="ui-st-cost">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">浮动盈亏</span><span class="v" id="ui-st-pnl">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">清仓可变现</span><span class="v" id="ui-st-liq">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">可变现盈亏</span><span class="v" id="ui-st-liqpnl">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">可用金钱</span><span class="v" id="ui-st-cash">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">累计已实现</span><span class="v" id="ui-st-realized">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">累计手续费</span><span class="v red" id="ui-st-fee">0</span>
+              </div>
+              <div class="stat-row">
+                <span class="k">成交笔数</span><span class="v" id="ui-st-trades">0</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 行情时钟 -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>行情时钟</h2>
+              <span class="hint" id="ui-st-peak">无冲击</span>
+            </div>
+            <div class="panel-body">
+              <div class="co-cycle">
+                <div class="bar"><div class="fill co-fill" id="ui-st-periodbar"></div></div>
+                <div class="job-meta">
+                  <span id="ui-st-period-label">距离下次变价 —</span>
+                  <span id="ui-st-period">第 0 期</span>
+                </div>
+              </div>
+              <div class="st-rules" id="ui-st-rules"></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- 行情 -->
+        <div class="panel">
+          <div class="panel-head">
+            <h2>行情</h2>
+            <span class="hint" id="ui-st-market-hint">点一行查看走势</span>
+          </div>
+          <div class="st-board-bar">
+            <span class="st-board-txt" id="ui-st-board-txt">市值榜 · 前 10 家</span>
+            <button class="btn sm" id="btn-st-board-all">显示全部 50 家</button>
+          </div>
+
+          <div class="co-chart-wrap">
+            <div class="co-chart-head">
+              <span class="co-chart-name" id="ui-st-chart-name">—</span>
+              <span class="co-chart-tag" id="ui-st-chart-tag"></span>
+              <span class="co-chart-legend">
+                <i class="lg solid"></i><span>已发生</span>
+                <i class="lg dashed"></i><span>推演</span>
+                <i class="lg base"></i><span>基准价</span>
+              </span>
+            </div>
+            <div class="co-chart-body" id="st-chart-body"></div>
+            <div class="co-chart-foot" id="ui-st-chart-foot"></div>
+          </div>
+
+          <div id="st-list"></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ==========================================================
+         页面：功法（未习得时整体锁定）
+         ========================================================== -->
+    <section class="page" data-page="technique">
+
+      <!-- 未习得：锁定占位 -->
+      <div class="panel locked-panel" id="technique-panel">
+        <div class="locked-body">
+          <div class="locked-icon">封</div>
+          <div class="locked-title">尚未习得功法</div>
+          <div class="locked-desc">
+            功法导引灵气、放大神识，是修仙线真正的起点。<br>
+            在习得第一部功法之前，本页不可操作。
+          </div>
+
+          <div class="locked-notes">
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>未习得功法时，<b>不产生灵气</b>（灵气由功法导引）</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>「投向」页的 <b>功法增幅</b> 项同样处于锁定状态，无法分配算力</span>
+            </div>
+            <div class="locked-note">
+              <span class="dot"></span>
+              <span>解锁条件：<b id="ui-tech-unlock">拥有第一台个人电脑</b></span>
+            </div>
+          </div>
+
+          <div class="locked-foot">
+            去「设备」页买一台<b>个人电脑</b>，你就会接触到第一本功法。
+          </div>
+        </div>
+      </div>
+
+      <!-- 已习得：真实界面 -->
+      <div id="technique-main" class="hidden">
+
+        <div class="grid-2">
+
+          <!-- 当前修炼 -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>当前修炼</h2>
+              <span class="hint">同一时间只能修炼一本</span>
+            </div>
+            <div class="panel-body">
+              <div class="cur-job-head">
+                <span class="tech-rarity" id="ui-tech-rarity">黄</span>
+                <span class="cur-job-name" id="ui-tech-name">—</span>
+                <span class="cur-job-real" id="ui-tech-school"></span>
+              </div>
+              <div class="tech-desc" id="ui-tech-desc"></div>
+
+              <div class="tech-kv">
+                <span class="k">功法等级</span>
+                <span class="v" id="ui-tech-level">0</span>
+                <span class="dim">由算力换算，无上限</span>
+              </div>
+              <div class="tech-kv">
+                <span class="k">主属性 · 灵气吸收</span>
+                <span class="v jade" id="ui-tech-main">+0%</span>
+                <span class="dim">随等级提升</span>
+              </div>
+
+              <div class="mastery-wrap">
+                <div class="mastery-head">
+                  <span>熟练度</span>
+                  <span class="v" id="ui-tech-mastery-tier">入门</span>
+                </div>
+                <div class="bar"><div class="fill jade" id="ui-tech-mastery-bar"></div></div>
+                <div class="mastery-meta">
+                  <span id="ui-tech-mastery-val">0 / 60</span>
+                  <span id="ui-tech-cultivate">+1.00 / 秒</span>
+                </div>
+              </div>
+
+              <div class="tech-passive-box" id="ui-tech-passive"></div>
+
+              <div class="cur-job-actions">
+                <button class="btn primary" id="btn-comprehend">参 悟</button>
+                <button class="btn sm ghost" id="btn-toggle-cultivate">停止修炼</button>
+              </div>
+              <div class="hint" style="margin-top:8px" id="ui-comprehend-hint">
+                参悟：消耗灵气，立即获得一笔熟练度
+              </div>
+            </div>
+          </div>
+
+          <!-- 神识 -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>神识</h2>
+              <span class="hint">一开始就有，随境界成长</span>
+            </div>
+            <div class="panel-body tight">
+              <div class="stat-row"><span class="k">当前神识</span><span class="v" id="ui-sh-total">0</span></div>
+              <div class="stat-row"><span class="k">境界基础</span><span class="v" id="ui-sh-base">0</span></div>
+              <div class="stat-row"><span class="k">设备倍率</span><span class="v" id="ui-sh-dev">×1</span></div>
+              <div class="stat-row"><span class="k">→ 算力增益</span><span class="v" id="ui-sh-compute">+0%</span></div>
+              <div class="stat-row"><span class="k">→ 修炼增益</span><span class="v" id="ui-sh-cultivate">+0%</span></div>
+            </div>
+            <div class="panel-body tight"
+                 style="border-top:1px solid var(--border);color:var(--text-faint);font-size:11px;line-height:1.7">
+              神识同时放大「实际算力的效果」与「功法修炼速度」。
+              而功法修炼速度，就是灵气提升速度。
+              后期设备（尤其科技修仙设备）对神识的增幅远高于早期设备。
+            </div>
+          </div>
+
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>功法阁</h2>
+            <span class="hint" id="ui-tech-count">0 / 6 已得</span>
+          </div>
+          <div id="tech-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>常驻被动</h2>
+            <span class="hint">熟练度修满后永久生效，切换功法不消失</span>
+          </div>
+          <div class="panel-body tight" id="passive-list"></div>
+        </div>
+
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="toast-zone"></div>
+
+<script src="/shared/decimal.js"></script>
+<script src="/shared/game-config.js"></script>
+<script src="/shared/game-core.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>

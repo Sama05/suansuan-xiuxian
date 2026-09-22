@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+
+# 运行时数据（含本地账号与存档，不进仓库）
+data/
+
+# 生成物：截图与静态预览页
+preview/
+testout.txt
+
+# Python 字节码
+__pycache__/
+*.pyc
+
+# 工具/编辑器
+.workbuddy/
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+
+# 本机私有的演示账号（见 tools/_env.py）
+tools/_local.json
