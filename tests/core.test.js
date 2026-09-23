@@ -29,7 +29,7 @@ console.log('\n=== 初始状态 ===');
   // 新增系统
   ok(s.gameSeconds === 0, '游戏内时间从 0 起算');
   ok(s.timeTier === GAME.time.defaultTier, '起始时间档位 = ' + GAME.time.defaultTier);
-  ok(s.autoTier === true, '默认自动跟随档位');
+  ok(s.autoTier === false, '不再自动跟随档位（时间流速由顶栏四键控制）');
   ok(s.energy === GAME.realms[0].maxEnergy, '初始精力 = 凡人上限', String(s.energy));
   ok(C.jobById(s.jobId) !== null, '默认选中第一份工作');
   ok(s.totalJobs === 0 && s.rushCount === 0, '工作计数从 0 开始');
@@ -98,26 +98,27 @@ console.log('\n=== 时间系统 ===');
   const dYear = C.gameDate(C.SEC_PER_DAY * 360);
   ok(dYear.year === 2001 && dYear.month === 1, '360 天 = 1 年', JSON.stringify(dYear));
 
-  // 档位解锁
-  ok(C.maxUnlockedTier(s) === 1, '凡人只解锁档1', String(C.maxUnlockedTier(s)));
-  ok(C.tierUnlocked(s, 2) === false, '档2 凡人时未解锁');
-  ok(C.setTimeTier(s, 2).ok === false, '凡人无法切到档2');
-  s.realm = 1;
-  ok(C.maxUnlockedTier(s) === 2, '炼气解锁档2');
+  // 档位解锁（档2「常速」从凡人就可 —— 顶栏播放键的基线档位）
+  ok(C.maxUnlockedTier(s) === 2, '凡人解锁到档2（常速）', String(C.maxUnlockedTier(s)));
+  ok(C.tierUnlocked(s, 2) === true, '档2（常速）凡人即可用');
+  ok(C.setTimeTier(s, 2).ok === true, '凡人可切到档2');
+  ok(C.maxUnlockedTier(s) === 2, '炼气档位上限不变');
   s.realm = 2;
   ok(C.maxUnlockedTier(s) === 3, '筑基解锁档3');
   s.realm = 3;
   ok(C.maxUnlockedTier(s) === 4, '金丹解锁档4');
   s.realm = 4;
   ok(C.maxUnlockedTier(s) === 4, '元婴仍为档4上限');
+  s.realm = 5;
+  ok(C.maxUnlockedTier(s) === 5, '化神解锁档5（1 秒 = 1 游戏年）');
 
-  // 手动切档会关闭自动
+  // 档位由玩家手动控制，不再自动跟随（autoTier 已废弃，字段仅为兼容旧存档保留）
   const s2 = C.createState();
   s2.realm = 4;
-  C.setAutoTier(s2, true);
-  ok(s2.timeTier === 4, '自动模式跟随到最高档');
   C.setTimeTier(s2, 2);
   ok(s2.timeTier === 2, '手动切到档2');
+  C.tick(s2, 1, { offline: false });
+  ok(s2.timeTier === 2, 'tick 不会自动跳档（时间流速由玩家控制）');
   ok(s2.autoTier === false, '手动切档后关闭自动');
   C.tick(s2, 1, { offline: false });
   ok(s2.timeTier === 2, '关闭自动后 tick 不会自动升档');
@@ -169,7 +170,9 @@ console.log('\n=== 精力系统 ===');
   };
   const a = mk();
   C.tick(a, 60, { offline: false });
-  ok(Math.abs(a.energy - 60) < 1e-6, '档4 下精力仍按现实时间恢复', String(a.energy));
+  ok(Math.abs(a.energy - 60 * C.energyRegen(a)) < 1e-6,
+    '档4 下精力按现实时间恢复（速度随境界 = ' + C.energyRegen(a) + '/秒）',
+    String(a.energy));
 }
 
 // ============================================================
@@ -217,9 +220,12 @@ console.log('\n=== 工作系统 ===');
   // 精力不足时进度停在满格等待，不丢进度。
   // 注意：必须用高档位才能造出「精力不够」的场景 —— 低档位下时间才是瓶颈，
   // 等满一份工作的时间里恢复的精力一定超过消耗。
+  // 境界用凡人（恢复 1/秒）而档位用档4：精力恢复速度随境界走，与档位无关，
+  // 这样 1 秒内只回 1 点、不够一份工作的 6 点。
   const s4 = C.createState();
   s4.realm = 4;
-  C.setAutoTier(s4, true);          // 档4：1 秒 = 1 月
+  C.setTimeTier(s4, 4);             // 档4：1 秒 = 1 月
+  s4.realm = 0;                     // 恢复速度按凡人 1/秒
   C.setJob(s4, 'flyer');
   s4.energy = 0;
   C.tick(s4, 1, { offline: false });
@@ -302,8 +308,9 @@ console.log('\n=== 工作系统 ===');
   // 后期工作产出灵气与灵石
   const lateJobs = GAME.jobs.filter((j) => j.spirit > 0);
   ok(lateJobs.length > 0, '存在产出灵气的后期工作', String(lateJobs.length) + ' 份');
-  ok(lateJobs.every((j) => j.unlock.realm === GAME.realms.length - 1),
-    '灵气工作都属于最高境界（修仙 + 科技结合）');
+  ok(lateJobs.every((j) => j.unlock.realm >= 4),
+    '灵气工作都在元婴及以上（境界已扩到 8 层，不必都挂最高境）',
+    lateJobs.map((j) => j.id + '@r' + j.unlock.realm).join(' '));
   const stoneJobs = GAME.jobs.filter((j) => j.stone > 0);
   ok(stoneJobs.length > 0, '存在产出灵石的后期工作', String(stoneJobs.length) + ' 份');
   ok(stoneJobs.every((j) => j.spirit > 0), '产出灵石的工作同时产出灵气');
@@ -470,20 +477,45 @@ console.log('\n=== 投资产出（收益递减） ===');
 }
 
 // ============================================================
-console.log('\n=== 硬件折扣 ===');
+console.log('\n=== 硬件折扣（v3.5 累积制） ===');
 {
   const s = C.createState();
-  s.realCompute = new D(1e6);
-  s.alloc.hardware = 1;
+  s.realm = 4;
+  s.devices.pc = 10;
   const inv = GAME.investments.find((i) => i.id === 'hardware');
-  const d = C.computeDiscount(s);
-  ok(d >= inv.cap && d <= 1, '折扣在 [cap, 1] 区间', String(d));
+  const acc = inv.accum || {};
+  const pc = GAME.devices.find((d) => d.id === 'pc');
 
-  s.realCompute = new D(1e12);
-  ok(C.computeDiscount(s) >= inv.cap, '算力再高也不低于 cap');
+  // 未累积：无折扣
+  ok('未累积时造价系数 = 1', C.hardwareCostFactor(s, pc) === 1);
 
+  // 累积后打折，且拉没份额不清空
+  s.alloc.hardware = 1;
+  C.tick(s, 120, { offline: false });
+  const d1 = C.hardwareCostFactor(s, pc);
+  ok('累积后打折（< 1）', d1 < 1, String(d1));
+  ok('折扣不超过软上限（造价 ≥ 原价 × (1 - maxRed)）',
+    d1 >= 1 - (acc.maxRed || 0.6) - 1e-9, String(d1));
+  const X1 = s.investedHardware.toNumber();
+  const costAtX1 = C.deviceCost(s, pc).toNumber();
   s.alloc.hardware = 0;
-  ok(C.computeDiscount(s) === 1, '不投硬件则无折扣');
+  C.tick(s, 30, { offline: false });
+  ok('拉没进度条：累积值保持住', Math.abs(s.investedHardware.toNumber() - X1) < 1e-6,
+    X1 + ' → ' + s.investedHardware.toNumber());
+  ok('拉没进度条：设备价不变（优惠永久保留）',
+    Math.abs(C.deviceCost(s, pc).toNumber() - costAtX1) < 1e-6);
+
+  // 稀释：同样的累积值，贵设备折扣远小于便宜设备
+  const big = GAME.devices.reduce((a, b) => (b.cost > a.cost ? b : a));
+  ok('跟随设备价格稀释：贵设备折扣小',
+    C.hardwareCostFactor(s, big) > C.hardwareCostFactor(s, pc),
+    big.id + ' ' + C.hardwareCostFactor(s, big).toFixed(4) + ' vs ' +
+    C.hardwareCostFactor(s, pc).toFixed(4));
+
+  // 存档往返
+  const back = C.hydrate(C.serialize(s));
+  ok('累积议价值随存档往返',
+    back.investedHardware.eq(s.investedHardware), back.investedHardware.toString());
 }
 
 // ============================================================
@@ -711,8 +743,9 @@ console.log('\n=== 公司系统 · 配置自洽 ===');
   const techGoods = cfg.goods.filter((g) => g.kind === 'tech');
   const xiuGoods = cfg.goods.filter((g) => g.kind === 'xiuxian');
   ok(techGoods.length > 0 && xiuGoods.length > 0, '科技类与修仙类商品都存在');
-  ok(techGoods.every((g) => g.periodYears === 1), '科技类商品逐年变价');
-  ok(xiuGoods.every((g) => g.periodYears === 10), '修仙类商品每 10 年变价');
+  // 变价周期按**现实秒**计（与时间档位解耦）：科技类 60 秒，修仙类 600 秒
+  ok(techGoods.every((g) => g.periodSeconds === 60), '科技类商品 60 秒变价');
+  ok(xiuGoods.every((g) => g.periodSeconds === 600), '修仙类商品 600 秒变价');
 
   // 行业内：价值递增、产量系数递减（越贵造得越慢 ——「堆产量」与「堆单价」两种打法）
   let ascOk = true, coefOk = true;
@@ -803,7 +836,7 @@ console.log('\n=== 公司系统 · 注册门槛 ===');
   ok(C.companyFounded(s), '注册后标记为已成立');
   ok(s.money.eq(before.sub(new D(GAME.company.foundCost))), '注册扣除注册费',
     before.toString() + ' -> ' + s.money.toString());
-  ok(typeof s.company.foundedDay === 'number' && s.company.foundedDay === C.gameDate(s.gameSeconds).days,
+  ok(typeof s.company.foundedDay === 'number' && s.company.foundedDay === C.gameDate(s.playTime).days,
     '成立日期 = 当日游戏日', String(s.company.foundedDay));
   ok(s.company.foundedDay === 0, '开局当天成立 → 第 0 天');
   ok(C.companyLockedReason(s) === '', '成立后无锁定原因');
@@ -1305,8 +1338,8 @@ console.log('\n=== 公司系统 · 市价（确定性） ===');
     ok(C.goodsTrend(g, 0) === 'flat', '开市无涨跌：' + g.name);
 
     const len = C.goodsPeriodSeconds(g);
-    ok(len === g.periodYears * 360 * 86400,
-      g.name + ' 变价周期 = ' + g.periodYears + ' 游戏年', String(len));
+    ok(len === g.periodSeconds,
+      g.name + ' 变价周期 = ' + g.periodSeconds + ' 现实秒', String(len));
     ok(C.goodsNextChangeIn(g, 0) === len, '开市距下次变价 = 一个周期：' + g.name);
 
     const third = Math.floor(len / 3);
@@ -1346,7 +1379,7 @@ console.log('\n=== 公司系统 · 市价（确定性） ===');
 
   // 同一期内价格不变
   const lp = C.goodsPeriodSeconds(chip);
-  ok(C.goodsPrice(chip, lp + 10).eq(C.goodsPrice(chip, lp + 500)),
+  ok(C.goodsPrice(chip, lp + 1).eq(C.goodsPrice(chip, lp + lp - 1)),
     '同一期内价格保持不变');
   // 跨期至少有一次不同（否则「浮动」形同虚设）
   ok(changed, '跨期存在真实变价');
@@ -1595,10 +1628,10 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   // ---- 初始：无抛压，市价 = 自然价 ----
   {
     const s = fresh();
-    s.gameSeconds = per * 3 + 10;
+    s.playTime = per * 3 + 10;
     ok(C.pressureOf(s, 'chip') === 0, '初始无抛压');
     ok(C.pressureOf(s, '不存在的商品') === 0, '未知商品抛压按 0 处理');
-    ok(C.goodsPriceWith(s, chip).eq(C.naturalPrice(chip, s.gameSeconds, s)),
+    ok(C.goodsPriceWith(s, chip).eq(C.naturalPrice(chip, s.playTime, s)),
       '无抛压时市价 = 自然价');
     ok(C.marketDropRatio(s, chip) === 0, '无抛压时折价为 0');
     ok(C.pressureOf(C.createState(), 'chip') === 0, '未成立公司时抛压为 0');
@@ -1608,7 +1641,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   {
     const s = fresh();
     s.company.lastPeriod.chip = 0;
-    s.gameSeconds = per * 1 + 1;
+    s.playTime = per * 1 + 1;
     s.company.producedThisPeriod.chip = 300;
     s.company.soldThisPeriod.chip = 300;
     C.syncMarket(s);
@@ -1620,7 +1653,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   {
     const s = fresh();
     s.company.lastPeriod.chip = 2;
-    s.gameSeconds = per * 2 + 5;
+    s.playTime = per * 2 + 5;
     s.company.stock.chip = 5000;
 
     const before = C.goodsPriceWith(s, chip);
@@ -1633,11 +1666,11 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
       String(s.company.soldThisPeriod.chip));
 
     // 跨到下一期 → 抛压生效
-    s.gameSeconds = per * 3 + 5;
+    s.playTime = per * 3 + 5;
     C.syncMarket(s);
     ok(C.pressureOf(s, 'chip') > 0, '跨期后抛压生效', C.pressureOf(s, 'chip').toFixed(4));
     ok(C.marketDropRatio(s, chip) > 0, '跨期后出现折价');
-    ok(C.goodsPriceWith(s, chip).lt(C.naturalPrice(chip, s.gameSeconds)),
+    ok(C.goodsPriceWith(s, chip).lt(C.naturalPrice(chip, s.playTime)),
       '被压低的价格低于自然价');
   }
 
@@ -1645,7 +1678,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   {
     const s = fresh();
     s.company.lastPeriod.chip = 5;
-    s.gameSeconds = per * 8 + 1;                 // 跨 3 期
+    s.playTime = per * 8 + 1;                 // 跨 3 期
     s.company.pressure.chip = 0;
     s.company.producedThisPeriod.chip = 300;     // 每期产出 100
     s.company.soldThisPeriod.chip = 900;         // 每期净抛售 200 → add 封顶 1
@@ -1663,7 +1696,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
     // 跨期结算必须按 n 均摊，否则 baseVolume（件/期）与累计量不是一个量纲
     const s2 = fresh();
     s2.company.lastPeriod.chip = 0;
-    s2.gameSeconds = per * 10 + 1;               // 跨 10 期
+    s2.playTime = per * 10 + 1;               // 跨 10 期
     s2.company.producedThisPeriod.chip = 1000;   // 每期 100
     s2.company.soldThisPeriod.chip = 1100;       // 总共只多卖 100 → 每期净抛售 10
     C.syncMarket(s2);
@@ -1678,12 +1711,12 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
     const s = fresh();
     s.company.pressure.chip = 0.8;
     s.company.lastPeriod.chip = 0;
-    s.gameSeconds = per * 1 + 1;
+    s.playTime = per * 1 + 1;
     C.syncMarket(s);
     const p1 = C.pressureOf(s, 'chip');
     ok(Math.abs(p1 - 0.8 * MK.decay) < 1e-9, '无新抛售时按 decay 衰减', p1.toFixed(6));
 
-    s.gameSeconds += per * 4;
+    s.playTime += per * 4;
     C.syncMarket(s);
     const p2 = C.pressureOf(s, 'chip');
     ok(Math.abs(p2 - p1 * Math.pow(MK.decay, 4)) < 1e-9,
@@ -1698,7 +1731,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
     s.company.pressure.chip = 1;
     s.company.lastPeriod.chip = 0;
     s.company.soldThisPeriod.chip = 1e9;
-    s.gameSeconds = per * 1 + 1;
+    s.playTime = per * 1 + 1;
     C.syncMarket(s);
     ok(C.pressureOf(s, 'chip') <= 1 + 1e-12, '压力不会超过 1（不会无限叠加）',
       String(C.pressureOf(s, 'chip')));
@@ -1708,8 +1741,8 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   {
     const s = fresh();
     s.company.pressure.chip = 1;
-    s.gameSeconds = per * 4 + 1;
-    const nat = C.naturalPrice(chip, s.gameSeconds, s);
+    s.playTime = per * 4 + 1;
+    const nat = C.naturalPrice(chip, s.playTime, s);
     ok(C.goodsPriceWith(s, chip).eq(nat.mul(1 - MK.maxDrop)),
       '满压时价格 = 自然价 × (1 − maxDrop)', C.goodsPriceWith(s, chip).toString());
     ok(Math.abs(C.marketDropRatio(s, chip) - MK.maxDrop) < 1e-9,
@@ -1720,7 +1753,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
     // 任何期数下都不得击穿下限（自然波动下限与抛压下限会叠加）
     let lowest = null;
     for (let p = 1; p <= 240; p++) {
-      s.gameSeconds = per * p + 1;
+      s.playTime = per * p + 1;
       const v = C.goodsPriceWith(s, chip);
       if (lowest === null || v.lt(lowest)) lowest = v;
     }
@@ -1731,7 +1764,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   // ---- 成交价 / 收入 / 毛产值预估都走带抛压的价格 ----
   {
     const s = fresh();
-    s.gameSeconds = per * 5 + 1;
+    s.playTime = per * 5 + 1;
     s.company.pressure.chip = 1;
     s.company.stock.chip = 10;
     const before = s.money;
@@ -1752,7 +1785,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   }
   {
     const s = fresh([['smelter', 1]]);
-    s.gameSeconds = per * 5 + 1;
+    s.playTime = per * 5 + 1;
     s.realCompute = new D(1e9);
     C.setAllocation(s, { industry: 1 });
     ok(C.lineOwned(s, 'smelter') === 1, '已买到炼钢厂（解锁链可用）');
@@ -1774,10 +1807,10 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   {
     const s = fresh();
     s.company.pressure.chip = 1;
-    s.gameSeconds = per * 10 + 1;
+    s.playTime = per * 10 + 1;
     const win = C.goodsWindowWith(s, chip, 3, 3);
     ok(win.length === 7, '带抛压窗口取到 7 个点', String(win.length));
-    const curP = C.goodsPeriod(chip, s.gameSeconds);
+    const curP = C.goodsPeriod(chip, s.playTime);
     const atCur = win.filter((x) => x.period === curP)[0];
     ok(win[0].impact === 1, '过去期不受当期抛压影响（画的是历史）');
     ok(Math.abs(atCur.impact - (1 - MK.maxDrop)) < 1e-9, '当前期承受完整抛压');
@@ -1790,9 +1823,9 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
     // 无抛压时，带抛压序列 = 纯自然序列 × 行业传导指数
     // （纯自然序列用于「这张图本来该怎么走」的参考线，不含传导成本）
     const s2 = fresh();
-    s2.gameSeconds = per * 12 + 1;
+    s2.playTime = per * 12 + 1;
     const a = C.goodsWindowWith(s2, chip, 3, 3);
-    const b = C.goodsWindow(chip, s2.gameSeconds, 3, 3);
+    const b = C.goodsWindow(chip, s2.playTime, 3, 3);
     const indIdx = C.industryPriceIndex(s2, chip.industry);
     let same = a.length === b.length;
     if (same) {
@@ -1808,7 +1841,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   // ---- 市场概览 ----
   {
     const s = fresh();
-    s.gameSeconds = per * 5 + 1;
+    s.playTime = per * 5 + 1;
     s.company.pressure.chip = 0.5;
     const ms = C.marketSummary(s);
     ok(ms !== null && ms.goods.length === GAME.company.goods.length,
@@ -1826,7 +1859,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
   // ---- hydrate 夹取（客户端可上报，只能挡越界） ----
   {
     const s = fresh();
-    s.gameSeconds = per * 6 + 10;
+    s.playTime = per * 6 + 10;
     s.company.pressure.chip = 0.5;
     s.company.soldThisPeriod.chip = 42;
     s.company.producedThisPeriod.chip = 17;
@@ -1859,7 +1892,7 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
     const ahead = JSON.parse(JSON.stringify(raw));
     ahead.company.lastPeriod.chip = 99999;
     const ha = C.hydrate(ahead);
-    ok(ha.company.lastPeriod.chip <= C.goodsPeriod(chip, ha.gameSeconds),
+    ok(ha.company.lastPeriod.chip <= C.goodsPeriod(chip, ha.playTime),
       'lastPeriod 不允许超前于当前期（否则抛压永远等不到结算）',
       String(ha.company.lastPeriod.chip));
   }
@@ -1870,13 +1903,13 @@ console.log('\n=== 公司系统 · 市场抛压（卖出影响下一期） ===')
     ok(C.syncMarket(raw) === null, '未成立公司时市场不结算');
 
     raw.company.founded = true;
-    raw.gameSeconds = per * 2 + 1;
+    raw.playTime = per * 2 + 1;
     for (const g of GAME.company.goods) raw.company.lastPeriod[g.id] = 0;
     // 能结算的只有「当前期数已经前进」的商品：科技类逐年变价，修仙类每 10 年
     // 才变一次，所以此时只有 3 种科技品该结算 —— 这正是期望行为。
     // 12 个行业 × 6 种产物，其中 6 个科技行业逐年变价（36 种），
     // 修仙行业每 10 年才变一次 —— 此刻还没跨过期边界
-    const due = GAME.company.goods.filter((g) => C.goodsPeriod(g, raw.gameSeconds) > 0);
+    const due = GAME.company.goods.filter((g) => C.goodsPeriod(g, raw.playTime) > 0);
     const techCount = GAME.company.goods.filter((g) => g.kind === 'tech').length;
     ok(due.length === techCount, '此刻只有科技类跨过了期边界',
       due.length + ' / 科技类 ' + techCount);
@@ -1913,7 +1946,7 @@ console.log('\n=== 股市（证券账户） · 配置自洽 ===');
     if (!(st.basePrice > 0)) bad = st.id + ' basePrice 必须 > 0';
     if (!(st.volatility > 0)) bad = st.id + ' volatility 必须 > 0';
     if (!(st.depth >= 1)) bad = st.id + ' depth 必须 >= 1';
-    if (!(st.periodYears > 0)) bad = st.id + ' periodYears 必须 > 0';
+    if (!(st.periodSeconds > 0)) bad = st.id + ' periodSeconds 必须 > 0';
     if (!(st.minFactor > 0 && st.minFactor < 1)) bad = st.id + ' minFactor 应在 (0,1)';
     if (!(st.maxFactor > 1)) bad = st.id + ' maxFactor 应 > 1';
     if (st.link && !C.goodById(st.link)) bad = st.id + ' link 指向不存在的商品: ' + st.link;
@@ -1970,7 +2003,7 @@ console.log('\n=== 股市 · 价格构成（确定性） ===');
   // 第 0 期按基准价挂牌
   {
     const s = mk();
-    s.gameSeconds = 0;
+    s.playTime = 0;
     ok(C.stockNaturalPrice(s, tianji).eq(new D(tianji.basePrice)),
       '第 0 期自然价 = 基准价', C.stockNaturalPrice(s, tianji).toString());
     ok(C.stockImpact(s, tianji) === 1, '无持仓无交易时冲击系数 = 1');
@@ -1986,18 +2019,18 @@ console.log('\n=== 股市 · 价格构成（确定性） ===');
     const b = C.stockNaturalPrice(mk(), tianji, per * 7 + 3).toString();
     ok(a === b, '同一期的自然价可复现（前后端不会算出两个价）', a);
     const s2 = mk();
-    s2.gameSeconds = per * 7 + 3;
+    s2.playTime = per * 7 + 3;
     ok(C.stockPrice(s2, tianji).toString() === a, '成交价同样可复现');
   }
 
   // 期数推进会改价，但同一期内任何秒数都不变
   {
     const s = mk();
-    s.gameSeconds = per * 3 + 10;
+    s.playTime = per * 3 + 10;
     const p1 = C.stockNaturalPrice(s, tianji).toString();
-    s.gameSeconds = per * 3 + per - 1;
+    s.playTime = per * 3 + per - 1;
     ok(C.stockNaturalPrice(s, tianji).toString() === p1, '同一期内价格恒定（只在期边界变价）');
-    s.gameSeconds = per * 4 + 1;
+    s.playTime = per * 4 + 1;
     ok(C.stockNaturalPrice(s, tianji).toString() !== p1, '跨期后价格改变');
   }
 
@@ -2020,7 +2053,7 @@ console.log('\n=== 股市 · 价格构成（确定性） ===');
     const s = mk();
     let up = 0, down = 0;
     for (let p = 2; p <= 60; p++) {
-      s.gameSeconds = p * per + 1;
+      s.playTime = p * per + 1;
       const t = C.stockTrend(s, tianji);
       if (t === 'up') up++; else if (t === 'down') down++;
     }
@@ -2030,7 +2063,7 @@ console.log('\n=== 股市 · 价格构成（确定性） ===');
   // 序列（走势图数据源）
   {
     const s = mk();
-    s.gameSeconds = per * 10 + 1;
+    s.playTime = per * 10 + 1;
     const w = C.stockWindow(s, tianji, 5, 5);
     ok(w.length === 11, 'stockWindow(5,5) 给出 11 期', String(w.length));
     ok(w[0].period === 5 && w[10].period === 15, '窗口期号连续正确',
@@ -2075,7 +2108,7 @@ console.log('\n=== 股市 · 冲击系数（反作用） ===');
   ok(i1 > i0, '同样一笔买入，持仓越集中冲击越大', i0.toFixed(5) + ' → ' + i1.toFixed(5));
 
   // 过去期不再受冲击影响（已经拿不回来了）
-  s.gameSeconds = 10 * C.stockPeriodSeconds(tianji);
+  s.playTime = 10 * C.stockPeriodSeconds(tianji);
   s.stock.flow[tianji.id] = 5000;
   ok(C.stockSeries(s, tianji, 3, 5).every((x) => x.impact === 1),
     '历史期的冲击恒为 1（历史价不可考）');
@@ -2260,7 +2293,7 @@ console.log('\n=== 股市 · 卖出与「一轮买卖必亏」 ===');
     const s = mk();
     C.buyStock(s, tianji.id, 1000);
     ok(C.stockFlow(s, tianji.id) === 1000, '前置：有净买入流');
-    s.gameSeconds = per * 60 + 1;
+    s.playTime = per * 60 + 1;
     C.syncStocks(s);
     ok(C.stockFlow(s, tianji.id) === 0, '多期之后净买入流归零', String(C.stockFlow(s, tianji.id)));
     ok(C.stockImpact(s, tianji) === 1, '冲击回归 1');
@@ -2288,7 +2321,7 @@ console.log('\n=== 股市 · 跨期结算（flow 衰减） ===');
   {
     const s = mk();
     // 未跨期 → 不结算
-    s.gameSeconds = 1;
+    s.playTime = 1;
     const acc0 = C.syncStocks(s);
     ok(acc0 === null || acc0.stocks === 0, '未跨期时不结算');
     ok(C.stockFlow(s, tianji.id) === 1000, '未跨期时净买入流不变');
@@ -2296,7 +2329,7 @@ console.log('\n=== 股市 · 跨期结算（flow 衰减） ===');
 
   {
     const s = mk();
-    s.gameSeconds = per * 4 + 1;      // 跨 4 期
+    s.playTime = per * 4 + 1;      // 跨 4 期
     C.syncStocks(s);
     ok(C.stockFlow(s, tianji.id) === Math.trunc(1000 * Math.pow(decay, 4)),
       'flow = trunc(原值 × decay^期数)',
@@ -2308,7 +2341,7 @@ console.log('\n=== 股市 · 跨期结算（flow 衰减） ===');
   {
     // 结算返回的冲击与当前读数一致
     const s = mk();
-    s.gameSeconds = per * 1 + 1;
+    s.playTime = per * 1 + 1;
     const acc = C.syncStocks(s);
     ok(acc !== null && acc.stocks >= 1, '跨期结算给出结算股票数', String(acc && acc.stocks));
     ok(Math.abs(acc.settled[tianji.id].impact - C.stockImpact(s, tianji)) < 1e-12,
@@ -2320,11 +2353,11 @@ console.log('\n=== 股市 · 跨期结算（flow 衰减） ===');
   {
     // 股票不跨期时不结算（周期更长的那只）
     const s = mk();
-    const long = GAME.stock.stocks.filter((x) => x.periodYears > 1);
+    const long = GAME.stock.stocks.filter((x) => x.periodSeconds > 60);
     if (long.length) {
       const st = long[0];
-      s.gameSeconds = per * 2 + 1;
-      for (const x of GAME.stock.stocks) s.stock.lastPeriod[x.id] = C.stockPeriod(x, s.gameSeconds);
+      s.playTime = per * 2 + 1;
+      for (const x of GAME.stock.stocks) s.stock.lastPeriod[x.id] = C.stockPeriod(x, s.playTime);
       const acc = C.syncStocks(s);
       ok(acc === null || acc.stocks === 0, '只推进了 1 期的短周期，不会带上长周期一起结算');
     } else {
@@ -2341,8 +2374,8 @@ console.log('\n=== 股市 · 跨期结算（flow 衰减） ===');
     const before = C.stockFlow(s, tianji.id);
     const impBefore = Math.abs(C.stockImpact(s, tianji) - 1);
     C.tick(s, 3600 * 24 * 365 * 3, { offline: false });
-    ok(C.stockPeriod(tianji, s.gameSeconds) >= 3, 'tick 把游戏时间推进了至少 3 期',
-      String(C.stockPeriod(tianji, s.gameSeconds)));
+    ok(C.stockPeriod(tianji, s.playTime) >= 3, 'tick 把行情推进了至少 3 期',
+      String(C.stockPeriod(tianji, s.playTime)));
     ok(C.stockFlow(s, tianji.id) < before, 'tick 之后净买入流已衰减',
       String(C.stockFlow(s, tianji.id)) + ' < ' + String(before));
     ok(Math.abs(C.stockImpact(s, tianji) - 1) <= impBefore, 'tick 之后冲击不比原来更大');
@@ -2360,14 +2393,14 @@ console.log('\n=== 股市 · 与公司商品的联动 ===');
   const w = GAME.stock.linkWeight;
   const s = C.createState();
   s.realm = 1;
-  s.gameSeconds = per * 5 + 60;
+  s.playTime = per * 5 + 60;
   const base = C.stockNaturalPrice(s, chipsci).toNumber();
   // 联动因子吃的是「关联商品的实际价格水平 / 基准价」这个整体倍数：
   //   F = 商品行情倍数（goodsPrice / basePrice，不含抛压）× 行业传导
   //   I = 抛压冲击（goodsPriceWith / goodsPrice）
   // 于是无抛压时 M₀ = F、被压后 M₁ = F × I，
   // 而 联动因子 = 1 + (M − 1) × linkWeight。
-  const goodsBase = C.goodsPrice(chip, s.gameSeconds).toNumber();
+  const goodsBase = C.goodsPrice(chip, s.playTime).toNumber();
   const F = (goodsBase / chip.basePrice) * C.industryPriceIndex(s, chip.industry);
   ok(Math.abs(F - 1) > 1e-6, '前置：关联商品的行情本身已偏离基准价',
     F.toFixed(6));
@@ -2377,7 +2410,7 @@ console.log('\n=== 股市 · 与公司商品的联动 ===');
   s.company.pressure[chip.id] = 0.1;
   const after = C.stockNaturalPrice(s, chipsci).toNumber();
   // 抛压冲击要单独取：goodsPriceWith 里已经含了传导，直接相除会把传导算进 I 里去
-  const I = C.marketImpactAt(s, chip, C.goodsPeriod(chip, s.gameSeconds));
+  const I = C.marketImpactAt(s, chip, C.goodsPeriod(chip, s.playTime));
   ok(I < 1, '前置：关联商品确实被抛压压低了', I.toFixed(6));
   ok(after < base, '公司商品被砸价时关联股票自然价同步下降',
     base.toFixed(2) + ' → ' + after.toFixed(2));
@@ -2394,7 +2427,7 @@ console.log('\n=== 股市 · 与公司商品的联动 ===');
   {
     const clean = C.createState();
     clean.realm = 1;
-    clean.gameSeconds = per * 5 + 60;
+    clean.playTime = per * 5 + 60;
     ok(Math.abs(C.stockLinkFactor(clean, chipsci, 5) - 1) > 1e-6,
       '即使关联商品无抛压，其行情波动也会传导给关联股票',
       C.stockLinkFactor(clean, chipsci, 5).toFixed(6));
@@ -2465,7 +2498,7 @@ console.log('\n=== 股市 · 概览与序列化往返 ===');
     const s = C.createState();
     s.realm = 1;
     s.money = new D(1e12);
-    s.gameSeconds = 5 * C.stockPeriodSeconds(tianji) + 30;
+    s.playTime = 5 * C.stockPeriodSeconds(tianji) + 30;
     C.buyStock(s, tianji.id, 1500);
 
     const raw = C.serialize(s);
@@ -2490,7 +2523,7 @@ console.log('\n=== 股市 · 概览与序列化往返 ===');
     const s = C.createState();
     s.realm = 1;
     s.money = new D(1e12);
-    s.gameSeconds = 3 * C.stockPeriodSeconds(tianji) + 5;
+    s.playTime = 3 * C.stockPeriodSeconds(tianji) + 5;
     C.buyStock(s, tianji.id, 1200);
     const raw = C.serialize(s);
 
@@ -2519,7 +2552,7 @@ console.log('\n=== 股市 · 概览与序列化往返 ===');
     const ahead = JSON.parse(JSON.stringify(raw));
     ahead.stock.lastPeriod[tianji.id] = 99999;
     const ha = C.hydrate(ahead);
-    ok(ha.stock.lastPeriod[tianji.id] <= C.stockPeriod(tianji, ha.gameSeconds),
+    ok(ha.stock.lastPeriod[tianji.id] <= C.stockPeriod(tianji, ha.playTime),
       'lastPeriod 不允许超前于当前期（否则冲击永远等不到衰减）',
       String(ha.stock.lastPeriod[tianji.id]));
 
@@ -2568,6 +2601,379 @@ console.log('\n=== 股市 · 概览与序列化往返 ===');
     ok(prev.stock.realized !== undefined, '离线预览给出已实现盈亏');
     ok(prev.stock.totalValue !== undefined, '离线预览给出持仓市值');
   }
+}
+
+// ============================================================
+console.log('\n=== 渡劫（突破境界的门槛） ===');
+{
+  const CFG = GAME.tribulation;
+  ok(!!CFG && CFG.implemented === true, '渡劫系统已启用');
+  ok(Array.isArray(CFG.baseRate) && CFG.baseRate.length >= GAME.realms.length,
+    '成功率表覆盖全部境界', String((CFG.baseRate || []).length) + ' vs ' + GAME.realms.length);
+  ok(CFG.baseRate[0] > CFG.baseRate[Math.min(4, CFG.baseRate.length - 1)],
+    '境界越高基础成功率越低', CFG.baseRate.slice(0, 5).join(' → '));
+
+  // —— 灵气未满不可渡 ——
+  const s0 = C.createState();
+  ok(!C.tribulationReady(s0), '灵气未满时不可渡劫');
+  const r0 = C.doTribulation(s0);
+  ok(r0.ok === false, '灵气未满时渡劫被拒', r0.msg);
+
+  // —— 灵气满格：金丹 → 元婴 ——
+  const mk = (realm) => {
+    const s = C.createState();
+    s.realm = realm;
+    s.qi = new D(GAME.realms[realm].need);
+    s.learned = { jiuzhang: { mastery: 0, tier: 5, passive: true } };
+    return s;
+  };
+  const sA = mk(3);
+  const odds = C.tribulationOdds(sA);
+  ok(odds.rate > 0 && odds.rate <= (CFG.maxRate || 0.95),
+    '成功率落在 (0, maxRate] 内', String(odds.rate));
+  ok(odds.base === CFG.baseRate[3], '成功率含境界基础项', String(odds.base));
+  ok(odds.perfectAdd === (CFG.prepare.perfectPer || 0) * 1,
+    '每本修满功法提供造诣加成', String(odds.perfectAdd));
+  ok(odds.computeAdd === 0, '算力恰在基准时冗余为 0', String(odds.computeAdd));
+
+  // 算力冗余：每高 10 倍 +perDecade，且封顶
+  const sB = mk(3);
+  sB.realCompute = new D(CFG.prepare.computeBase[3] * 1e3);
+  const oddsB = C.tribulationOdds(sB);
+  ok(oddsB.computeAdd > odds.computeAdd, '算力更厚时冗余加成更高',
+    oddsB.computeAdd + ' > ' + odds.computeAdd);
+  ok(oddsB.computeAdd <= (CFG.prepare.computeCap || 0.15) + 1e-12,
+    '算力冗余不超过上限', String(oddsB.computeAdd));
+
+  // —— 成功分支 ——
+  const sC = mk(2);   // 筑基 → 金丹
+  let okC = null;
+  for (let k = 0; k < 4000 && !okC; k++) {
+    sC.playTime = k * 60;
+    const r = C.doTribulation(sC);
+    if (r.ok && r.success) okC = { r: r, s: sC };
+  }
+  ok(!!okC, '存在成功的渡劫样本');
+  if (okC) {
+    ok(okC.r.realm === 3 && okC.s.realm === 3, '渡劫成功后境界 +1', String(okC.s.realm));
+    ok(okC.s.tribulation.level === 1, '渡劫成功后淬体 +1 层', String(okC.s.tribulation.level));
+    ok(okC.s.qi.lt(new D(GAME.realms[2].need)), '成功后扣除本次突破所需灵气', okC.s.qi.toString());
+    ok(C.tribulationBonus(okC.s, 'qiSpeed') > 0, '淬体层数带来永久加成');
+  }
+
+  // —— 失败分支：元婴以下全清 ——
+  const wipeRealm = (CFG.passiveRules || {}).belowRealm || 4;
+  let failS = null;
+  for (let k = 0; k < 6000 && !failS; k++) {
+    const s = mk(wipeRealm - 1);
+    s.playTime = k * 60;
+    s.devices.pc = 30;
+    s.money = new D(1e9);
+    s.spiritStone = new D(500);
+    s.aiBonus = new D(777);
+    s.learned = { jiuzhang: { mastery: 500, tier: 3, passive: true } };
+    s.technique = 'jiuzhang';
+    s.jobDone.flyer = 9; s.totalJobs = 40;
+    C.foundCompany(s);
+    s.stock.shares[GAME.stock.stocks[0].id] = 12;
+    s.rebirth.count = 1; s.rebirth.daoTotal = 200; s.tribulation.level = 3;
+    const r = C.doTribulation(s);
+    if (r.ok && !r.success) failS = { r: r, s: s };
+  }
+  ok(!!failS, '存在失败的渡劫样本（元婴之下）');
+  if (failS) {
+    ok(failS.r.fullWipe === true, '元婴以下失败标记为全清');
+    ok(failS.s.realm === 0, '失败后退回凡人', String(failS.s.realm));
+    ok(failS.s.devices.pc === 0, '全清会抹掉设备');
+    ok(Object.keys(failS.s.learned).length === 0, '全清会抹掉功法');
+    ok(failS.s.technique === null, '全清会清掉当前修炼');
+    ok(failS.s.aiBonus.isZero(), '全清会清掉 AI 加成');
+    ok(failS.s.company.founded === false, '全清会撤销公司');
+    ok(failS.s.stock.shares[GAME.stock.stocks[0].id] === 0, '全清会清空持仓');
+    ok(failS.s.jobDone.flyer === 9 && failS.s.totalJobs === 40,
+      '工作履历保留（否则升职链要重跑）');
+    ok(failS.s.rebirth.count === 2 && failS.s.rebirth.daoTotal > 200,
+      '道行仍按被动比例结算并累计');
+    ok(failS.s.tribulation.level === 3, '淬体层数跨兵解保留');
+    ok(failS.s.playTime >= 0 && failS.s.gameSeconds >= 0, '时间不倒流');
+  }
+
+  // —— 确定性：同一状态必然得到同一结果（前后端各跑一遍必须一致）——
+  {
+    const a = mk(2); a.playTime = 1234;
+    const b = C.hydrate(C.serialize(a));
+    ok(C.tribulationRoll(a) === C.tribulationRoll(b),
+      '渡劫 roll 是状态的纯函数（存档往返不变）');
+    const ra = C.doTribulation(a);
+    const rb = C.doTribulation(b);
+    ok(ra.success === rb.success, '两端渡劫结果一致',
+      ra.success + ' vs ' + rb.success);
+  }
+
+  // —— tick 的 tribulation:false 选项：浏览器端用它把渡劫交给服务端 ——
+  {
+    const s = mk(1);
+    s.autoTribulation = true;
+    const before = s.realm;
+    C.tick(s, 5, { offline: false, tribulation: false });
+    ok(s.realm === before, 'tribulation:false 时不自动渡劫', String(s.realm));
+    ok(s.qi.gte(new D(GAME.realms[1].need)), '灵气仍在累积（满格待渡）');
+  }
+
+  // —— serialize / hydrate 带上渡劫字段 ——
+  {
+    const s = mk(1);
+    s.tribulation.level = 7; s.tribulation.attempts = 11; s.tribulation.failures = 4;
+    s.autoTribulation = false;
+    const b = C.hydrate(C.serialize(s));
+    ok(b.tribulation.level === 7 && b.tribulation.attempts === 11 &&
+       b.tribulation.failures === 4, '渡劫计数随存档往返');
+    ok(b.autoTribulation === false, '自动渡劫开关随存档往返');
+    s.tribulation.level = 9999;
+    ok(C.hydrate(C.serialize(s)).tribulation.level <= (CFG.maxLevel || 40),
+      '淬体层数被夹到 maxLevel（防手改存档）');
+  }
+}
+
+// ============================================================
+console.log('\n=== 投向 · 显示口径与可用性 ===');
+{
+  const s = C.createState();
+  s.realm = 2;
+  s.realCompute = new D(1e5);
+  s.learned = { jiuzhang: { mastery: 0, tier: 0, passive: false } };
+  s.technique = 'jiuzhang';
+
+  const xi = GAME.investments.find((i) => i.id === 'xiuxian');
+  const ai = GAME.investments.find((i) => i.id === 'ai');
+  ok(xi.unit === 'qi' && ai.unit === 'compute', '投向声明了各自的显示量纲');
+
+  // 修仙方向的显示值必须含灵气倍率（否则玩家看到的数字比实际小几个数量级）
+  C.setAllocation(s, { xiuxian: 1 });
+  const raw = C.investOutput(s, xi).toNumber();
+  const rate = C.investOutputRate(s, xi);
+  ok(rate === raw * C.qiMultiplier(s),
+    '修仙方向显示值 = 裸产出 × 灵气倍率',
+    rate.toFixed(2) + ' vs ' + raw.toFixed(2) + ' × ' + C.qiMultiplier(s).toFixed(2));
+  ok(rate > raw, '修仙方向显示值不低于裸产出（早期倍率 ≥ 1）');
+
+  // AI 方向显示的是「算力/秒」而不是中间量
+  C.setAllocation(s, { ai: 1 });
+  const aiRaw = C.investOutput(s, ai).toNumber();
+  const aiRate = C.investOutputRate(s, ai);
+  ok(Math.abs(aiRate - aiRaw * (ai.aiToCompute || 0)) < 1e-9,
+    'AI 方向显示值 = 产出 × aiToCompute（算力/秒）');
+  ok(aiRate > 0, 'AI 方向给出正的算力增量');
+
+  // 数值重平衡：拉满修仙投向在筑基期算力下，静态积累时间应是「小时级」而非「天级」
+  const sJ = C.createState();
+  sJ.realm = 2;
+  sJ.learned = { jiuzhang: { mastery: 0, tier: 0, passive: false } };
+  sJ.technique = 'jiuzhang';
+  sJ.realCompute = new D(1e5);
+  C.setAllocation(sJ, { xiuxian: 1 });
+  const qiPerSec = C.investOutputRate(sJ, xi);
+  const need = GAME.realms[2].need;
+  const staticSec = need / Math.max(1e-9, qiPerSec);
+  ok(staticSec < 6 * 3600,
+    '筑基期拉满修仙投向的静态积累时间 ≤ 6 小时（早先是几十小时）',
+    (staticSec / 3600).toFixed(1) + ' h（灵气 ' + qiPerSec.toFixed(1) + ' / 秒，阈值 ' + need + '）');
+
+  // 锁定文案
+  const sEmpty = C.createState();
+  ok(C.investmentLockReason(sEmpty, GAME.investments.find((i) => i.id === 'technique')) === '未习得功法',
+    '功法增幅锁定文案 = 未习得功法');
+  ok(C.investmentLockReason(sEmpty, GAME.investments.find((i) => i.id === 'industry')) === '未成立公司',
+    '工业产能锁定文案 = 未成立公司');
+}
+
+// ============================================================
+console.log('\n=== 工作系统 · 灵石来源与设备节奏匹配 ===');
+{
+  const stoneJobs = GAME.jobs.filter((j) => j.stone > 0);
+  ok(stoneJobs.length >= 4, '存在多档灵石工作', String(stoneJobs.length));
+  // 首个需要灵石的设备
+  const stoneDev = GAME.devices.find((d) => (d.stoneCost || 0) > 0);
+  ok(!!stoneDev, '存在需要灵石的设备');
+  const first = stoneJobs[0];
+  ok(first.unlock.realm >= 4,
+    '首个灵石工作在元婴及以上（与修仙 × 科技设备同步开放）',
+    first.id + '@r' + first.unlock.realm);
+  // 按精力上限估算：刷满首台设备所需灵石的耗时应该是「几十分钟」而不是「一天」
+  const realm = GAME.realms[GAME.realms.length - 1];
+  const perJob = first.stone;
+  const secs = stoneDev.stoneCost / perJob * first.energy;   // 精力恢复 1/秒
+  ok(secs < 2 * 3600,
+    '刷满「' + stoneDev.name + '」所需灵石 ≤ 2 小时（精力约束下）',
+    Math.round(secs / 60) + ' 分钟（' + stoneDev.stoneCost + ' 灵石 × ' + first.energy + ' 精力 / ' + perJob + ' 颗）');
+  // 灵石工作的解锁链不能过长：前置工作完成次数 ≤ 15
+  ok((first.unlock.after || {}).times <= 15,
+    '首个灵石工作的前置完成次数 ≤ 15（避免「钱够了拿不到灵石」）',
+    JSON.stringify(first.unlock.after));
+}
+
+// ============================================================
+console.log('\n=== v3.3 · 精力恢复随境界 / 熟练度主属性 / 稀有度阶梯 / 时间控制 ===');
+{
+  // —— 精力恢复随境界抬升 ——
+  const sR = C.createState();
+  let prevRegen = 0;
+  let regenMono = true;
+  const regenList = [];
+  for (let r = 0; r < GAME.realms.length; r++) {
+    sR.realm = r;
+    const g = C.energyRegen(sR);
+    regenList.push(GAME.realms[r].name + ' ' + g);
+    if (g < prevRegen) regenMono = false;
+    prevRegen = g;
+  }
+  ok(regenMono, '精力恢复速度随境界单调递增', regenList.join(' → '));
+  ok(C.energyRegen(sR) > GAME.energy.regenPerSecond,
+    '最高境的恢复速度高于凡人基准（不再恒为 1）',
+    C.energyRegen(sR) + ' > ' + GAME.energy.regenPerSecond);
+  // 元婴期做一份 520 精力的工作，等待时间应在一分钟量级（旧口径要 520 秒）
+  const sYuan = C.createState(); sYuan.realm = 4;
+  const waitSec = 520 / C.energyRegen(sYuan);
+  ok(waitSec < 120, '元婴期 520 精力的等待 ≤ 2 分钟（旧口径 520 秒）',
+    Math.round(waitSec) + ' 秒');
+  // tick 里的恢复确实用了逐境速度
+  const sTick = C.createState(); sTick.realm = 4; sTick.energy = 0;
+  C.tick(sTick, 10, { offline: false });
+  ok(Math.abs(sTick.energy - 10 * C.energyRegen(sTick)) < 1e-6,
+    'tick 的精力恢复按当前境界的速度走',
+    sTick.energy + ' vs ' + (10 * C.energyRegen(sTick)));
+
+  // —— 熟练度段位影响主属性 ——
+  const sT = C.createState(); sT.realm = 4; sT.realCompute = new D(1e6);
+  const tech = GAME.techniques.list[0];
+  sT.learned[tech.id] = { mastery: 0, tier: 0, passive: false };
+  const at = (t) => { sT.learned[tech.id].tier = t; return C.techMainQiSpeed(sT, tech); };
+  const v0 = at(0), v5 = at(5), v3 = at(3);
+  ok(v5 > v3 && v3 > v0, '熟练度越高主属性越强',
+    v0.toFixed(3) + ' < ' + v3.toFixed(3) + ' < ' + v5.toFixed(3));
+  const mm = GAME.techniques.masteryMain || {};
+  ok(Math.abs(v0 / v5 - (mm.base || 0.5) / ((mm.base || 0.5) + 5 * (mm.perTier || 0.1))) < 1e-9,
+    '熟练系数 = base + perTier × 段位（入门 0.5 → 圆满 1.0）');
+
+  // —— 稀有度阶梯：天最稀有、荒最普遍 ——
+  const R = GAME.techniques.rarities;
+  ok(R[0].name === '荒' && R[R.length - 1].name === '天',
+    '稀有度阶梯从荒到天', R.map((r) => r.name + r.level).join(' '));
+  ok(R.every((r, i) => i === 0 || r.mainQiSpeed > R[i - 1].mainQiSpeed),
+    '稀有度越高主属性基值越强',
+    R.map((r) => r.mainQiSpeed).join(' < '));
+  // 功法的数学深度与稀有度必须同向（列表按深奥程度升序，稀有度 level 也须升序）
+  const lvOf = (id) => (R.find((r) => r.id === id) || {}).level || 0;
+  const list = GAME.techniques.list;
+  let lvMono = true;
+  for (let i = 1; i < list.length; i++) {
+    if (lvOf(list[i].rarity) < lvOf(list[i - 1].rarity)) lvMono = false;
+  }
+  ok(lvMono, '功法表的稀有度随数学深度递增',
+    list.map((t) => t.name + '/' + t.rarity).join(' → '));
+  ok(list.length >= GAME.realms.length,
+    '功法数量覆盖境界数（每境至少一本可修）', String(list.length));
+
+  // —— 游戏时间暂停 ——
+  const sP = C.createState();
+  const sp0 = C.gameSecondsPerRealSecond(sP);
+  sP.timePaused = true;
+  ok(C.gameSecondsPerRealSecond(sP) === 0, '暂停时游戏时间停走');
+  ok(C.energyRegen(sP) > 0, '暂停不影响精力恢复（走现实时间）');
+  sP.timePaused = false;
+  ok(C.gameSecondsPerRealSecond(sP) === sp0, '恢复后回到原档位');
+  C.setTimePaused(sP, true);
+  ok(sP.timePaused === true, 'setTimePaused 可切换');
+  const g0 = sP.gameSeconds;
+  C.tick(sP, 10, { offline: false });
+  ok(sP.gameSeconds === g0, '暂停期间 tick 不推进游戏时间', sP.gameSeconds + ' vs ' + g0);
+  ok(sP.energy > 100 || sP.energy >= C.maxEnergy(sP), '暂停期间精力照常恢复');
+
+  // —— 行情前瞻（事件通知栏用）——
+  const sF = C.createState(); sF.realm = 4;
+  const st0 = GAME.stock.stocks[0];
+  const f = C.stockForecastPct(sF, st0);
+  ok(typeof f === 'number' && Number.isFinite(f), 'stockForecastPct 给出有限值',
+    String(f));
+  // 确定性：同一状态两次计算一致
+  ok(f === C.stockForecastPct(sF, st0), '行情前瞻是确定性的');
+}
+
+console.log('\n=== v3.4 · 转生衰减快照 / 功法成就解锁 / 功法规模 ===');
+{
+  // —— 转生衰减快照：兵解后新买的设备全额累加 ——
+  const sA = C.createState(); sA.realm = 4;
+  const dev = GAME.devices.find((d) => d.id === 'leyline');
+  sA.devices[dev.id] = 1;
+  C.doRebirth(sA, 'active');
+  const effBefore = C.deviceComputeEffective(sA).toNumber();
+  ok('兵解后旧存量仍被压数量级', effBefore < Number(C.totalCompute(sA)),
+    effBefore.toExponential(2) + ' < ' + C.totalCompute(sA).toString());
+  sA.money = new D(1e30); sA.spiritStone = new D(1e15);
+  C.buyDevice(sA, dev.id);
+  const effAfter = C.deviceComputeEffective(sA).toNumber();
+  ok('兵解后新买设备全额累加（增量 = 设备算力）',
+    Math.abs((effAfter - effBefore) - dev.compute) < dev.compute * 1e-9,
+    (effAfter - effBefore).toExponential(2) + ' vs ' + dev.compute.toExponential(2));
+  // 神识倍率同步增长
+  const m1 = C.shenshiDeviceMultiplier(sA);
+  C.buyDevice(sA, dev.id);
+  ok('新设备也全额累加进神识倍率', C.shenshiDeviceMultiplier(sA) > m1,
+    m1.toFixed(3) + ' → ' + C.shenshiDeviceMultiplier(sA).toFixed(3));
+  // 快照随存档往返
+  const backA = C.hydrate(C.serialize(sA));
+  ok('快照随存档往返且有效算力一致',
+    C.deviceComputeEffective(backA).eq(C.deviceComputeEffective(sA)),
+    C.deviceComputeEffective(backA).toString());
+  // 旧存档迁移：无快照字段 → hydrate 补拍，之后买设备仍全额累加
+  const legacy = JSON.parse(JSON.stringify(C.serialize(sA)));
+  delete legacy.rebirth.baseCompute; delete legacy.rebirth.baseShenshi;
+  const mig = C.hydrate(legacy);
+  const mBefore = C.deviceComputeEffective(mig).toNumber();
+  mig.money = new D(1e30); mig.spiritStone = new D(1e15);
+  C.buyDevice(mig, dev.id);
+  ok('旧存档迁移后买设备仍全额累加',
+    Math.abs((C.deviceComputeEffective(mig).toNumber() - mBefore) - dev.compute)
+      < dev.compute * 1e-9);
+  // 未兵解：衰减恒等
+  const sN = C.createState();
+  ok('未兵解时有效算力 = 原始算力', C.deviceComputeEffective(sN).eq(C.totalCompute(sN)));
+
+  // —— 功法成就解锁 ——
+  const sC = C.createState(); sC.realm = 4;
+  const condOf = (id) => GAME.techniques.list.find((t) => t.id === id);
+  ok('条件未达成时不可解锁', !C.techUnlockConditionMet(sC, condOf('chousuan')));
+  sC.totalJobs = 3;
+  ok('完成工作 ≥3 解锁筹算小术', C.techUnlockConditionMet(sC, condOf('chousuan')));
+  ok('每本功法都有解锁文案',
+    C.techniqueList(sC).every((t) => t.unlockText && t.unlockText.length > 0),
+    C.techniqueList(sC).filter((t) => !t.unlockText).map((t) => t.id).join(','));
+  // 稀有度规模：每级 ≥5，除天外每级 ≥1 本境界解锁
+  const byR = {};
+  for (const r of GAME.techniques.rarities) byR[r.id] = { total: 0, realm: 0 };
+  for (const t of GAME.techniques.list) {
+    byR[t.rarity].total += 1;
+    if (t.realm) byR[t.rarity].realm += 1;
+  }
+  ok('每个稀有度至少 5 本功法',
+    GAME.techniques.rarities.every((r) => byR[r.id].total >= 5),
+    GAME.techniques.rarities.map((r) => r.name + ':' + byR[r.id].total).join(' '));
+  ok('除天级外每个稀有度至少 1 本境界解锁',
+    GAME.techniques.rarities.filter((r) => r.id !== '天')
+      .every((r) => byR[r.id].realm >= 1),
+    GAME.techniques.rarities.filter((r) => r.id !== '天')
+      .map((r) => r.name + ':' + byR[r.id].realm).join(' '));
+
+  // —— peakPressure 只增与成就联动 ——
+  const sP = C.createState(); sP.realm = 4;
+  ok('初始 peakPressure = 0', (sP.company.peakPressure || 0) === 0);
+  sP.company.peakPressure = 0.42;
+  ok('pressurePeak 0.4 达成 / 0.5 未达成',
+    C.techUnlockConditionMet(sP, condOf('fubian')) &&
+    !C.techUnlockConditionMet(sP, condOf('tuoyuan')));
+  const backP = C.hydrate(C.serialize(sP));
+  ok('peakPressure 随存档往返', Math.abs(backP.company.peakPressure - 0.42) < 1e-9,
+    String(backP.company.peakPressure));
 }
 
 console.log('\n' + '='.repeat(46));

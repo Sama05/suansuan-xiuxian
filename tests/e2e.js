@@ -96,7 +96,8 @@ async function req(path, opts) {
     // 新系统字段
     ok(typeof r.data.state.gameSeconds === 'number', '存档含游戏内时间');
     ok(r.data.state.timeTier === 1, '起始时间档位 = 1', String(r.data.state.timeTier));
-    ok(r.data.state.autoTier === true, '默认自动跟随档位');
+    ok(r.data.state.autoTier === false, '不再自动跟随档位（顶栏四键手动控制）');
+    ok(r.data.state.timePaused === false, '默认不暂停');
     ok(r.data.state.energy === 100, '初始精力 = 100', String(r.data.state.energy));
     ok(typeof r.data.state.jobId === 'string', '默认已选中工作', String(r.data.state.jobId));
     ok(r.data.state.totalJobs === 0, '工作计数从 0 开始');
@@ -105,17 +106,22 @@ async function req(path, opts) {
     // 配置下发
     ok(Array.isArray(r.data.config.jobs) && r.data.config.jobs.length >= 10,
       '返回工作列表', String((r.data.config.jobs || []).length) + ' 份');
-    ok(Array.isArray(r.data.config.time.tiers) && r.data.config.time.tiers.length === 4,
-      '返回 4 个时间档位');
-    ok(r.data.config.energy.regenPerSecond === 1, '精力恢复 1/秒');
+    ok(Array.isArray(r.data.config.time.tiers) && r.data.config.time.tiers.length === 5,
+      '返回 5 个时间档位');
+    ok(r.data.config.energy.regenPerSecond === 1, '精力恢复基准 1/秒（凡人）');
+    ok(r.data.config.realms.length >= 8, '境界表已扩到 8 层');
+    ok(r.data.config.realms.every((x) => typeof x.regen === 'number'),
+      '每个境界都带精力恢复速度');
     ok(r.data.config.techniques.implemented === true, '功法系统标记为已实现');
-    ok((r.data.config.techniques.rarities || []).length === 6, '返回 6 级稀有度',
-      (r.data.config.techniques.rarities || []).map((x) => x.name).join(''));
+    const rars = r.data.config.techniques.rarities || [];
+    ok(rars.length === 8, '返回 8 级稀有度', rars.map((x) => x.name).join(''));
+    ok(rars[0].name === '荒' && rars[rars.length - 1].name === '天',
+      '稀有度阶梯：荒最普遍 → 天最稀有');
     ok((r.data.config.techniques.mastery || []).length === 6, '返回 6 段熟练度',
       (r.data.config.techniques.mastery || []).map((x) => x.name).join('/'));
     ok((r.data.config.techniques.list || []).length >= 6, '返回功法表',
       String((r.data.config.techniques.list || []).length));
-    ok(r.data.config.shenshi.computeBonusPerPoint > 0, '神识配置已下发');
+    ok(r.data.config.shenshi.computePerPointRealm > 0, '神识配置已下发');
     ok(r.data.config.investments.some((i) => i.id === 'technique' && i.locked === true),
       '功法增幅项标记为锁定');
 
@@ -148,13 +154,17 @@ async function req(path, opts) {
     ok(rJ2.data.ok === true, '完成 5 次后解锁便利店并可选择', JSON.stringify(rJ2.data.msg || ''));
 
     // ---- 时间档位 ----
+    // 档3（1 秒 = 1 游戏天）要筑基才解锁；档2（常速）凡人即可用
     const rT = await req('/api/action', { token, method: 'POST', body: { action: 'setTimeTier', payload: { tier: 3 } } });
     ok(rT.status === 400, '凡人无法切到未解锁档位', JSON.stringify(rT.data.msg));
     const rT2 = await req('/api/action', { token, method: 'POST', body: { action: 'setTimeTier', payload: { tier: 1 } } });
     ok(rT2.data.ok === true, '可以切到已解锁档位');
-    ok(rT2.data.result.auto === false, '手动切档后关闭自动跟随');
-    const rA = await req('/api/action', { token, method: 'POST', body: { action: 'setAutoTier', payload: { auto: true } } });
-    ok(rA.data.result.auto === true, '可以重新开启自动跟随');
+    ok(rT2.data.result.auto === false, '切档走手动路径');
+    // 档位不再自动跟随（autoTier 已废弃）：切到档1 后 tick 不会自己跳上去
+    const rTier2 = await req('/api/action', { token, method: 'POST', body: { action: 'setTimeTier', payload: { tier: 2 } } });
+    ok(rTier2.data.ok === true, '凡人可切到档2（常速）');
+    const rBack = await req('/api/action', { token, method: 'POST', body: { action: 'setTimeTier', payload: { tier: 1 } } });
+    ok(rBack.data.ok === true, '切回档1');
 
     // ---- 暂停 / 恢复 ----
     const rW = await req('/api/action', { token, method: 'POST', body: { action: 'setWorking', payload: { working: false } } });
@@ -379,7 +389,7 @@ async function req(path, opts) {
     ok(num(v.company.goods[0].price) > 0, '行情含市价',
       JSON.stringify(v.company.goods[0].price));
     ok(v.company.goods[0].price.m !== undefined, '市价以 {m,e} 下发（前后端同口径）');
-    ok(v.company.goods.every((g) => g.periodYears > 0), '每个商品都有变价周期');
+    ok(v.company.goods.every((g) => g.periodSeconds > 0), '每个商品都有变价周期');
     ok(v.company.goods.some((g) => g.kind === 'tech'), '行情含科技类商品');
     ok(v.company.goods.some((g) => g.kind === 'xiuxian'), '行情含修仙类商品');
 
@@ -710,15 +720,15 @@ async function req(path, opts) {
 
     // ---- 砸库存：当期不生效，跨期才压价 ----
     // 说明：这段账号是炼气期、时间档位很低，靠真实时间等一个游戏年不现实，
-    // 所以直接把 gameSeconds 推到下一期之后，再制造一小段「净抛售」。
+    // 所以直接把行情时钟（playTime）推到下一期之后，再制造一小段「净抛售」。
     const st = (await req('/api/load', { token: coToken })).data.state;
     const gConf = Core.goodById('iron_ore');
     const per = Core.goodsPeriodSeconds(gConf);
-    const jumpTo = (Core.goodsPeriod(gConf, st.gameSeconds) + 2) * per + 1;
+    const jumpTo = (Core.goodsPeriod(gConf, st.playTime) + 2) * per + 1;
     const newPeriod = Core.goodsPeriod(gConf, jumpTo);
 
     const craft = JSON.parse(JSON.stringify(st));
-    craft.gameSeconds = jumpTo;
+    craft.playTime = jumpTo;
     craft.company.autoSell = false;
     for (const g of GAME.company.goods) {
       craft.company.lastPeriod[g.id] = Core.goodsPeriod(g, jumpTo);
@@ -794,7 +804,7 @@ async function req(path, opts) {
       await req('/api/save', { token: coToken, method: 'POST', body: { state: ahead } });
       const back = (await req('/api/load', { token: coToken })).data.state;
       ok(back.company.lastPeriod.iron_ore <=
-         Core.goodsPeriod(gConf, back.gameSeconds) + 1,
+         Core.goodsPeriod(gConf, back.playTime) + 1,
         '超前的 lastPeriod 被夹回当前期',
         String(back.company.lastPeriod.iron_ore));
     }
@@ -832,7 +842,7 @@ async function req(path, opts) {
       'view 含全部股票', String(v.stock.stocks && v.stock.stocks.length));
 
     const s0 = v.stock.stocks[0];
-    for (const f of ['id', 'name', 'code', 'basePrice', 'depth', 'periodYears',
+    for (const f of ['id', 'name', 'code', 'basePrice', 'depth', 'periodSeconds',
       'period', 'nextPeriod', 'price', 'naturalPrice', 'impact', 'impactPct',
       'shares', 'heldRatio', 'cost', 'avgCost', 'value', 'pnl', 'pnlRatio',
       'liquidateValue', 'liquidatePnl', 'liquidateImpact', 'flow', 'trend',
@@ -1029,7 +1039,7 @@ async function req(path, opts) {
       await req('/api/save', { token: coToken, method: 'POST', body: { state: ahead } });
       const back4 = (await req('/api/load', { token: coToken })).data.state;
       ok(back4.stock.lastPeriod.tianji <=
-         Core.stockPeriod(tianji, back4.gameSeconds) + 1,
+         Core.stockPeriod(tianji, back4.playTime) + 1,
         '超前的期数游标被夹回当前期', String(back4.stock.lastPeriod.tianji));
       ok(back4.stock.totalTrades >= 2, '成交笔数不会被倒退清零',
         String(back4.stock.totalTrades));
@@ -1228,7 +1238,7 @@ async function req(path, opts) {
       s.realm = 4;
       s.money = new D(1e12);
       Core.foundCompany(s);
-      s.gameSeconds = 300 * 360 * 86400;      // 走到行情已经散开的时期
+      s.playTime = 300 * 60;                 // 走到行情已经散开的期（第 300 期）
 
       let checked = 0;
       for (const ind of GAME.company.industries) {
@@ -1250,6 +1260,203 @@ async function req(path, opts) {
       }
       ok(checked > 0, '至少验证了一个有上下游关系的行业', String(checked));
     }
+  }
+
+  console.log('\n=== 5i. 兵解 · 转生（接口层） ===');
+  {
+    const Core = require('../shared/game-core.js');
+    const D = require('../shared/decimal.js');
+    const GAME = require('../shared/game-config.js');
+
+    // 独立账号，避免污染前面几块的测试状态
+    const ru = 'rebirth_' + Date.now().toString(36);
+    const rr = await req('/api/register', { method: 'POST', body: { username: ru, password: 'test1234' } });
+    ok(rr.data.ok === true, '兵解测试账号已注册');
+    const tk = rr.data.token;
+
+    let r = await req('/api/load', { token: tk });
+    ok(r.data.config.rebirth && r.data.config.rebirth.implemented === true, '转生配置已下发');
+    ok((r.data.config.rebirth.perks || []).length === 6, '道行加成表 6 项已下发',
+      String((r.data.config.rebirth.perks || []).length));
+    ok(r.data.state.rebirth && r.data.state.rebirth.count === 0, '新存档带空的转生状态');
+
+    // 未达元婴时兵解必须被服务端拒绝（不能只靠前端置灰）
+    r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'rebirth', payload: {} } });
+    ok(r.status === 400 && r.data.ok === false, '未达元婴时兵解被服务端拒绝', JSON.stringify(r.data.msg));
+
+    // 造一份「元婴 + 公司 + 股市持仓」的存档（realm 是只增字段，0 → 4 允许）
+    const s = Core.hydrate(r.data.state);
+    s.realm = 4;
+    s.money = new D(1e15);
+    s.spiritStone = new D(1e6);
+    Core.foundCompany(s);
+    Core.buyLine(s, 'mine');
+    // 造点真实设备算力，才能验证「转生衰减是压数量级，不是乘一个比例」
+    s.devices['datacenter'] = 100;
+    s.devices['megacenter'] = 20;
+    s.company.warehouseLevel = 3;
+    s.stock.shares[GAME.stock.stocks[0].id] = 500;
+    s.stock.totalTrades = 7;
+    const craft = Core.serialize(s);
+    r = await req('/api/save', { token: tk, method: 'POST', body: { state: craft } });
+    ok(r.data.ok === true, '造好一份「元婴 + 公司 + 持仓」的存档');
+
+    r = await req('/api/view', { token: tk });
+    const rb = r.data.view.rebirth;
+    ok(rb && rb.unlocked === true, '元婴后转生面板解锁');
+    ok(rb.daoGain === 100, '道行收益 = 100', String(rb.daoGain));
+    ok(rb.daoGainPassive === 30, '被动兵解三折 = 30', String(rb.daoGainPassive));
+    ok(rb.discount === 1, '未兵解过时转生衰减指数 = 1（不能把 base 当成常驻指数）', String(rb.discount));
+
+    // 服务端权威兵解
+    r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'rebirth', payload: {} } });
+    ok(r.data.ok === true, '兵解成功', JSON.stringify(r.data.result || r.data.msg));
+    ok(r.data.result.dao === 100, '服务端给出 100 道行', String(r.data.result.dao));
+    ok(Math.abs(r.data.result.discount - 0.5) < 1e-9, '兵解后衰减指数 = 0.50（按数量级压）',
+      String(r.data.result.discount));
+
+    const after = Core.hydrate(r.data.state);
+    ok(after.realm === 0, '境界归零');
+    ok(after.qi.toNumber() === 0, '灵气清零');
+    ok(after.money.toNumber() === GAME.base.startMoney, '金钱回到起手值', String(after.money.toNumber()));
+    ok(after.spiritStone.toNumber() === 0, '灵石清零');
+    ok(after.company.founded === false, '公司被清空');
+    ok(Core.lineOwned(after, 'mine') === 0, '生产线被清空');
+    ok(after.stock.shares[GAME.stock.stocks[0].id] === 0, '股市持仓被清空');
+    ok(after.stock.totalTrades === 0, '股市统计归零');
+    ok(after.rebirth.dao === 100 && after.rebirth.count === 1, '道行与兵解次数已入账');
+
+    // 兵解结果必须真的落盘 —— 不能被 /api/save 的「只增保护」公司/股市又补回来
+    r = await req('/api/load', { token: tk });
+    const loaded = Core.hydrate(r.data.state);
+    ok(loaded.company.founded === false, '落盘后公司仍是清空状态（只增保护没有把它救回来）');
+    ok(Core.lineOwned(loaded, 'mine') === 0, '落盘后生产线仍为空');
+    ok(loaded.stock.totalTrades === 0, '落盘后股市统计为零');
+    ok(Core.rebirthDiscount(loaded) === 0.5, '落盘后衰减指数仍是 0.50');
+    // 关键：衰减必须是「幂」而不是「乘 0.5」—— 后者对跨 16 个数量级的算力没有刹车力
+    {
+      const rawC = Core.totalCompute(loaded).toNumber();
+      const effC = Core.deviceComputeEffective(loaded).toNumber();
+      ok(Math.abs(effC - Math.sqrt(rawC)) / Math.max(1, effC) < 0.02,
+        '有效设备算力 = 原值 ^ 0.50（按数量级压，不是乘比例）',
+        effC.toExponential(2) + ' ≈ sqrt(' + rawC.toExponential(2) + ')');
+      ok(effC < rawC / 1e3, '至少压掉 3 个数量级', effC + ' vs ' + rawC);
+    }
+
+    // 拿兵解前的旧存档来回写 → 必须被打回（典型场景：另一个标签页还在用旧 state）
+    r = await req('/api/save', { token: tk, method: 'POST', body: { state: craft } });
+    ok(r.status === 409, '拿兵解前的旧存档回写会被拒（409）', String(r.status));
+    ok(r.data.state && Core.hydrate(r.data.state).rebirth.count === 1,
+      '409 回包里给的是服务端版本（仍是已兵解状态）');
+
+    // 买道行加成
+    r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'buyPerk', payload: { perkId: 'shenshi' } } });
+    ok(r.data.ok === true, '买道行加成成功', JSON.stringify(r.data.result || r.data.msg));
+    ok(r.data.result.level === 1 && r.data.result.daoLeft === 60, '等级 1 / 剩余道行 60',
+      JSON.stringify(r.data.result));
+
+    r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'buyPerk', payload: { perkId: 'shenshi' } } });
+    ok(r.status === 400, '道行不足时买加成被拒（第二级 72 > 60）', JSON.stringify(r.data.msg));
+
+    r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'buyPerk', payload: { perkId: 'nope' } } });
+    ok(r.status === 400, '不存在的加成被拒');
+
+    // 伪造：把加成等级直接写到天上
+    r = await req('/api/load', { token: tk });
+    const cheat = r.data.state;
+    cheat.rebirth.perks.shenshi = 99;
+    cheat.rebirth.dao = 1e9;
+    cheat.rebirth.daoTotal = 1e9;
+    r = await req('/api/save', { token: tk, method: 'POST', body: { state: cheat } });
+    ok(r.data.ok === true, '伪造存档已提交');
+    r = await req('/api/load', { token: tk });
+    const after2 = Core.hydrate(r.data.state);
+    ok(after2.rebirth.perks.shenshi === 8, '伪造的加成等级被夹到硬上限 8',
+      String(after2.rebirth.perks.shenshi));
+
+    // 被动兵解的接口入口（将来渡劫失败接上时不用改接口）
+    r = await req('/api/load', { token: tk });
+    const s2 = Core.hydrate(r.data.state);
+    s2.realm = 4;
+    await req('/api/save', { token: tk, method: 'POST', body: { state: Core.serialize(s2) } });
+    r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'rebirth', payload: { mode: 'passive' } } });
+    ok(r.data.ok === true && r.data.result.mode === 'passive', '被动兵解入口可用');
+    ok(r.data.result.dao === 48, '被动兵解道行 = 160 × 0.3 = 48（三折）',
+      String(r.data.result.dao));
+    ok(r.data.result.count === 2, '兵解次数累加到 2', String(r.data.result.count));
+  }
+
+  console.log('\n=== 5j. 渡劫（服务端权威） ===');
+  {
+    const Core = require('../shared/game-core.js');
+    const D = require('../shared/decimal.js');
+    const GAME = require('../shared/game-config.js');
+    // 独立账号，避免污染前面几块的测试状态
+    const tu = 'trib_' + Date.now().toString(36);
+    const tr = await req('/api/register', { method: 'POST', body: { username: tu, password: 'test1234' } });
+    ok(tr.data.ok === true, '渡劫测试账号已注册');
+    const tk = tr.data.token;
+
+    let r = await req('/api/view', { token: tk });
+    ok(!!(r.data.view && r.data.view.tribulation), 'view 暴露渡劫面板数据');
+    // config 只随 /api/load 下发（/api/view 是纯视图，不带配置）
+    r = await req('/api/load', { token: tk });
+    ok(!!(r.data.config && r.data.config.tribulation &&
+          Array.isArray(r.data.config.tribulation.baseRate)),
+      'config 下发渡劫成功率表与规则');
+
+    // 灵气未满必须被服务端拒绝（不能只靠前端置灰）
+    r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'tribulation' } });
+    ok(r.status === 400 && r.data.ok === false, '灵气未满时渡劫被服务端拒绝',
+      JSON.stringify(r.data.msg || ''));
+
+    /**
+     * 造「金丹 + 灵气满格 + 自动渡劫关」的存档，换着 playTime 反复渡。
+     * roll 是状态的纯函数，playTime 变 → 结果变，所以几十次内必然成功过也失败过。
+     * 每轮都重新落盘 —— 上一次失败可能已经把这一世全清了。
+     */
+    let sawSuccess = null;
+    let sawFail = null;
+    for (let k = 0; k < 80 && !(sawSuccess && sawFail); k++) {
+      const cur = await req('/api/load', { token: tk });
+      const st = Core.hydrate(cur.data.state);
+      st.realm = 3;
+      st.qi = new D(GAME.realms[3].need);
+      st.playTime = k * 60 + 7;
+      st.autoTribulation = false;   // 关掉自动，避免 /api/action 的前置推进抢先渡劫
+      st.learned = { jiuzhang: { mastery: 0, tier: 5, passive: true } };
+      await req('/api/save', { token: tk, method: 'POST', body: { state: Core.serialize(st) } });
+      r = await req('/api/action', { token: tk, method: 'POST', body: { action: 'tribulation' } });
+      if (!r.data || r.data.ok !== true) continue;
+      if (r.data.result.success) sawSuccess = r.data.result;
+      else sawFail = r.data.result;
+    }
+    ok(!!sawSuccess, '至少一次渡劫成功');
+    if (sawSuccess) {
+      ok(sawSuccess.realm === 4, '渡劫成功后境界 +1（金丹 → 元婴）', String(sawSuccess.realm));
+      ok(sawSuccess.level >= 1, '渡劫成功后淬体至少 1 层', String(sawSuccess.level));
+    }
+    if (sawFail) {
+      ok(sawFail.fullWipe === true, '元婴以下渡劫失败 = 全清');
+      ok(typeof sawFail.dao === 'number' && sawFail.dao > 0, '失败仍结算被动道行',
+        String(sawFail.dao));
+    }
+
+    // 落盘状态必须与服务端结论一致
+    const fin = Core.hydrate((await req('/api/load', { token: tk })).data.state);
+    if (sawSuccess && !sawFail) {
+      ok(fin.realm === 4, '落盘境界 = 渡劫结果', String(fin.realm));
+      ok(fin.tribulation.level >= 1, '落盘淬体层数 ≥ 1', String(fin.tribulation.level));
+    } else if (sawFail && !sawSuccess) {
+      ok(fin.realm === 0, '落盘境界归零（被动兵解）', String(fin.realm));
+      ok(Object.keys(fin.learned).length === 0, '落盘后功法已被全清');
+    }
+    // 自动渡劫开关走服务端
+    r = await req('/api/action', { token: tk, method: 'POST',
+      body: { action: 'setAutoTribulation', payload: { on: false } } });
+    ok(r.data.ok === true && r.data.result.auto === false, '自动渡劫开关可切换');
+    r = await req('/api/load', { token: tk });
+    ok(Core.hydrate(r.data.state).autoTribulation === false, '开关已落盘');
   }
 
   console.log('\n' + '='.repeat(46));

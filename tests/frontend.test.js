@@ -186,9 +186,13 @@ function installStubs() {
     ok(html.includes('id="job-list"'), '工作页含工作列表容器');
     ok(html.includes('id="btn-rush"'), '工作页含催工按钮');
 
-    // 时间系统
+    // 时间系统：档位选择已改成顶栏四键
     ok(html.includes('id="ui-clock"'), '顶栏含游戏内时钟');
-    ok(html.includes('id="tier-list"'), '境界页含时间档位选择');
+    ok(html.includes('id="btn-tc-play"') && html.includes('id="btn-tc-max"') &&
+       html.includes('id="btn-tc-slower"') && html.includes('id="btn-tc-faster"'),
+      '顶栏含时间流速四键（减速 / 播放暂停 / 加速 / 最大速）');
+    ok(html.includes('id="event-bar"') && html.includes('id="ui-ev-text"'),
+      '页面最上方含事件通知栏');
 
     // 功法页锁定占位
     ok(html.includes('id="technique-panel"'), '功法页容器存在');
@@ -368,9 +372,10 @@ function installStubs() {
     ok(el('ui-money') && el('ui-money').textContent === '20',
       '顶栏金钱已渲染（初始 20）', el('ui-money') && el('ui-money').textContent);
     ok(el('ui-energy-val') && el('ui-energy-val').textContent === '100 / 100',
-      '精力已渲染', el('ui-energy-val') && el('ui-energy-val').textContent);
-    ok(el('ui-energy-rate') && el('ui-energy-rate').textContent === '+1.0 / 秒',
-      '精力恢复速率已渲染', el('ui-energy-rate') && el('ui-energy-rate').textContent);
+      '精力已渲染（上限整数）', el('ui-energy-val') && el('ui-energy-val').textContent);
+    ok(el('ui-energy-rate') && el('ui-energy-rate').textContent === '+1 / 秒',
+      '精力恢复速率已渲染（凡人 1 点/秒，整数不带小数点）',
+      el('ui-energy-rate') && el('ui-energy-rate').textContent);
 
     ok(el('ui-job-name') && el('ui-job-name').textContent === '街头发传单',
       '当前工作已渲染（默认第一份）', el('ui-job-name') && el('ui-job-name').textContent);
@@ -379,11 +384,10 @@ function installStubs() {
     ok(el('ui-job-time') && el('ui-job-time').textContent.indexOf('/') > 0,
       '工作进度已渲染', el('ui-job-time') && el('ui-job-time').textContent);
 
-    // 档位列表骨架
-    const tierHtml = el('tier-list') ? el('tier-list').innerHTML : '';
-    ok(tierHtml.indexOf('缓') >= 0 && tierHtml.indexOf('常') >= 0 &&
-       tierHtml.indexOf('疾') >= 0 && tierHtml.indexOf('倏') >= 0,
-      '4 个时间档位都已渲染');
+    // 时间流速：列表已移除，改为顶栏四键 + 时钟旁的档位文案
+    ok(el('ui-clock-tier') && el('ui-clock-tier').textContent.indexOf('1 秒') === 0,
+      '时钟旁显示当前档位', el('ui-clock-tier') && el('ui-clock-tier').textContent);
+    ok(!el('tier-list'), '境界页不再铺档位列表（已由顶栏四键取代）');
 
     // 工作列表骨架
     const jobHtml = el('job-list') ? el('job-list').innerHTML : '';
@@ -391,10 +395,26 @@ function installStubs() {
     ok(jobHtml.split('class="job-item').length - 1 >= 10,
       '工作列表条目数 ≥ 10', String(jobHtml.split('class="job-item').length - 1));
 
-    // 投向里应有功法增幅且默认置灰
+    // 投向里应有功法增幅。锁定标签改成了「文案由核心层给」—— 骨架里只留占位，
+    // 所以这里改为断言：① 占位存在；② 核心层给出的锁定文案两方向各自正确。
+    // （早先写成写死的「未习得功法」，于是工业产能未成立公司时也显示「未习得功法」。）
     const invHtml = el('inv-list') ? el('inv-list').innerHTML : '';
-    ok(invHtml.indexOf('功法增幅') >= 0, '投向列表含「功法增幅」项');
-    ok(invHtml.indexOf('未习得功法') >= 0, '功法增幅标记为未习得');
+    ok(invHtml.indexOf('功法算力投入') >= 0, '投向列表含「功法算力投入」项');
+    ok(invHtml.indexOf('data-role="locktag"') >= 0, '投向锁定标签占位已就位');
+    const st0 = global.GameCore.createState();
+    const invTech = global.GAME.investments.find((i) => i.id === 'technique');
+    const invInd = global.GAME.investments.find((i) => i.id === 'industry');
+    ok(global.GameCore.investmentLockReason(st0, invTech) === '未习得功法',
+      '功法增幅未习得时锁定文案 = 未习得功法');
+    ok(global.GameCore.investmentLockReason(st0, invInd) === '未成立公司',
+      '工业产能未成立公司时锁定文案 = 未成立公司（不再是「未习得功法」）');
+    // 习得功法之后（哪怕没在修炼）功法增幅必须可用 —— 这是本轮修的可用性判定
+    st0.learned = { jiuzhang: { mastery: 0, tier: 0, passive: false } };
+    st0.technique = null;
+    ok(global.GameCore.investmentAvailable(st0, invTech) === true,
+      '已习得功法（未在修炼）时功法增幅可用');
+    ok(global.GameCore.investmentLockReason(st0, invTech) === '',
+      '已习得功法后不再显示锁定文案');
 
     // 功法页
     ok(el('ui-tech-unlock') && el('ui-tech-unlock').textContent.length > 0,
@@ -462,8 +482,8 @@ function installStubs() {
     ok(coGoodHtml.indexOf('铁矿石') >= 0 && coGoodHtml.indexOf('世界树') >= 0,
       '市场列表含首尾商品');
     ok(coGoodHtml.indexOf('上游 · ') >= 0, '行业分组标出上游行业');
-    ok(coGoodHtml.indexOf('每 1 年变价') >= 0 && coGoodHtml.indexOf('每 10 年变价') >= 0,
-      '市场标出科技类逐年 / 修仙类十年变价');
+    ok(coGoodHtml.indexOf('每 1 分钟变价') >= 0 && coGoodHtml.indexOf('每 10 分钟变价') >= 0,
+      '市场标出科技类 1 分钟 / 修仙类 10 分钟变价');
     ok(coGoodHtml.indexOf('卖出') >= 0, '市场含卖出按钮');
 
     // 行业景气条
@@ -521,8 +541,12 @@ function installStubs() {
     ok(T('tab-technique-badge') === '已习得', '标签徽章显示已习得', T('tab-technique-badge'));
 
     ok(T('ui-tech-name') === '九章算经·残卷', '当前功法名已渲染', T('ui-tech-name'));
-    ok(T('ui-tech-rarity') === '黄', '稀有度已渲染', T('ui-tech-rarity'));
-    ok(el2('ui-tech-rarity').dataset.rarity === 'huang', '稀有度标记已设置');
+    // 稀有度阶梯已改为「天最稀有、荒最普遍」：第一本功法（算术）是最常见的荒
+    ok(T('ui-tech-rarity') === '荒', '稀有度已渲染', T('ui-tech-rarity'));
+    ok(el2('ui-tech-rarity').dataset.rarity === '荒', '稀有度标记已设置');
+    ok(global.GAME.techniques.rarities[0].name === '荒' &&
+       global.GAME.techniques.rarities[global.GAME.techniques.rarities.length - 1].name === '天',
+      '稀有度阶梯：荒最普遍 → 天最稀有');
     ok(T('ui-tech-school').indexOf('算术') >= 0, '功法门类已渲染', T('ui-tech-school'));
     ok(/^\d+$/.test(T('ui-tech-level')), '功法等级已渲染', T('ui-tech-level'));
     ok(T('ui-tech-main').charAt(0) === '+', '主属性（灵气吸收）已渲染', T('ui-tech-main'));
@@ -539,13 +563,20 @@ function installStubs() {
       '被动属性标出了常驻条件');
 
     ok(T('ui-tech-count').indexOf('/') > 0, '功法阁计数已渲染', T('ui-tech-count'));
+    // v3.4：功法阁只渲染「已拥有」的功法（本场景学了 2 本）；全部功法走图鉴
     const techHtml = el2('tech-list') ? el2('tech-list').innerHTML : '';
     const techCount = techHtml.split('data-tech="').length - 1;
-    ok(techCount === global.GAME.techniques.list.length,
-      '功法阁渲染出全部功法',
+    ok(techCount === 2,
+      '功法阁只显示已拥有的功法（不渲染未习得的行）',
       String(techCount) + ' / ' + global.GAME.techniques.list.length);
-    ok(techHtml.indexOf('九章算经') >= 0 && techHtml.indexOf('连续统真言') >= 0,
-      '功法阁含最低与最高稀有度功法');
+    const codexHtml = el2('tech-codex') ? el2('tech-codex').innerHTML : '';
+    const codexCount = codexHtml.split('data-codex="').length - 1;
+    ok(codexCount === global.GAME.techniques.list.length,
+      '图鉴渲染出全部功法（含未拥有的）',
+      String(codexCount) + ' / ' + global.GAME.techniques.list.length);
+    ok(codexHtml.indexOf('九章算经') >= 0 && codexHtml.indexOf('连续统真言') >= 0 &&
+       codexHtml.indexOf('解锁：') >= 0,
+      '图鉴含稀有度两端功法并给出解锁条件');
 
     ok(el2('passive-list').innerHTML.indexOf('工作金钱') >= 0, '常驻被动汇总已渲染');
 
@@ -840,22 +871,24 @@ function installStubs() {
     const Core = global.GameCore;
     const D = global.Decimal;
     const G = global.GAME;
-    const SEC_YEAR = 360 * 86400;
+    // 行情按现实秒走：科技类 60 秒一期，修仙类 600 秒一期。
+    // 用 60 秒的整数倍当时间戳，两类商品的期边界都能覆盖到。
+    const PER_SEC = 60;
 
-    // 找一个「同年里既有商品涨、又有商品跌」的年份 —— 两个分支才会都走到
+    // 找一个「同一期里既有商品涨、又有商品跌」的期 —— 两个分支才会都走到
     let pick = null;
     for (let p = 1; p <= 300; p++) {
-      const t = p * SEC_YEAR;
+      const t = p * PER_SEC;
       const trs = G.company.goods.map((g) => Core.goodsTrend(g, t));
       if (trs.indexOf('up') >= 0 && trs.indexOf('down') >= 0) { pick = { p, t }; break; }
     }
-    ok(pick !== null, '存在涨跌并存的年份', pick ? String(pick.p) : '未找到');
-    const t0 = pick ? pick.t : SEC_YEAR;
+    ok(pick !== null, '存在涨跌并存的期', pick ? String(pick.p) : '未找到');
+    const t0 = pick ? pick.t : PER_SEC;
 
     const s = Core.createState();
     s.realm = 1;
     s.money = new D(1e8);
-    s.gameSeconds = t0;
+    s.playTime = t0;
     Core.foundCompany(s);
     Core.buyLine(s, 'mine');
 
@@ -865,7 +898,7 @@ function installStubs() {
     const pressuredGood = G.company.goods[0].id;
     s.company.pressure[pressuredGood] = 0.5;
     for (const g of G.company.goods) {
-      s.company.lastPeriod[g.id] = Core.goodsPeriod(g, s.gameSeconds);
+      s.company.lastPeriod[g.id] = Core.goodsPeriod(g, s.playTime);
     }
 
     const snap = Core.serialize(s);
@@ -909,7 +942,7 @@ function installStubs() {
     let consistent = true;
     const seen = {};
     for (const g of G.company.goods) {
-      const tr = Core.goodsTrend(g, s.gameSeconds);
+      const tr = Core.goodsTrend(g, s.playTime);
       seen[tr] = (seen[tr] || 0) + 1;
       const cls = String(Gd(g.id, 'gtrend').className);
       if (cls !== 'trend ' + tr) {
@@ -933,7 +966,7 @@ function installStubs() {
     // 非开市期：市价整体已偏离基准价
     let anyDiff = false;
     for (const g of G.company.goods) {
-      const f = Core.goodsPrice(g, s.gameSeconds).div(new D(g.basePrice)).toNumber();
+      const f = Core.goodsPrice(g, s.playTime).div(new D(g.basePrice)).toNumber();
       if (Math.abs(f - 1) > 1e-9) anyDiff = true;
     }
     ok(anyDiff, '非开市期至少有一个商品价格偏离基准价');
@@ -1011,7 +1044,7 @@ function installStubs() {
     ok(/\.co-press\.hidden/.test(css0), 'CSS 定义了抛压条的隐藏态');
 
     const g0 = G.company.goods[0];
-    const tr0 = Core.goodsTrend(g0, s.gameSeconds);
+    const tr0 = Core.goodsTrend(g0, s.playTime);
     const want = tr0 === 'up' ? 'var(--red)'
       : (tr0 === 'down' ? 'var(--jade)' : 'var(--text-faint)');
     ok(svg.indexOf('stroke="' + want + '"') > 0, '折线颜色随涨跌（涨红跌绿）',
@@ -1021,8 +1054,8 @@ function installStubs() {
       '默认选中第一个商品', EL_CACHE['ui-mk-chart-name'].textContent);
     ok(/变价$/.test(EL_CACHE['ui-mk-chart-tag'].textContent), '走势图标出变价周期',
       EL_CACHE['ui-mk-chart-tag'].textContent);
-    ok(EL_CACHE['ui-mk-chart-foot'].textContent.indexOf('时间轴') === 0,
-      '走势图给出时间轴范围', EL_CACHE['ui-mk-chart-foot'].textContent);
+    ok(EL_CACHE['ui-mk-chart-foot'].textContent.indexOf('第 ') === 0,
+      '走势图给出期数范围', EL_CACHE['ui-mk-chart-foot'].textContent);
     ok(EL_CACHE['ui-mk-chart-foot'].textContent.indexOf('基准') > 0, '走势图给出基准价');
 
     // 每个商品行内的迷你走势图
@@ -1067,7 +1100,7 @@ function installStubs() {
     const s = Core.createState();
     s.realm = 1;
     s.money = new D(1e12);
-    s.gameSeconds = 50 * 360 * 86400;      // 第 50 期，确保选中行的期数不是 0
+    s.playTime = 50 * 60;                  // 第 50 期（科技类 60 秒一期），确保选中行的期数不是 0
 
     // 池子 50 家、界面只列市值前 10 —— 所以测试要挑**榜内**的股票，
     // 榜外行默认不渲染，拿它断言等于什么都没测到。
@@ -1322,8 +1355,10 @@ function installStubs() {
     ok(typeof global.GameCore.setTimeTier === 'function', '全局 GameCore.setTimeTier 可用');
     ok(Array.isArray(global.GAME.devices) && global.GAME.devices.length > 0, '全局 GAME.devices 可用');
     ok(Array.isArray(global.GAME.jobs) && global.GAME.jobs.length > 0, '全局 GAME.jobs 可用');
-    ok(Array.isArray(global.GAME.time.tiers) && global.GAME.time.tiers.length === 4,
-      '全局 GAME.time.tiers 有 4 档');
+    ok(Array.isArray(global.GAME.time.tiers) && global.GAME.time.tiers.length === 5,
+      '全局 GAME.time.tiers 有 5 档（含化神解锁的 1 秒 = 1 游戏年）');
+    ok(global.GAME.time.tiers[global.GAME.time.tiers.length - 1].unlockRealm === 5,
+      '最高档在化神解锁（超出元婴之后）');
     ok(Array.isArray(global.GAME.realms) && global.GAME.realms.length > 0, '全局 GAME.realms 可用');
 
     const NodeCore = require(path.join(ROOT, 'shared', 'game-core.js'));
@@ -1331,6 +1366,115 @@ function installStubs() {
     ok(typeof NodeCore.tick === 'function', 'Node require game-core 可用');
     ok(typeof NodeDec === 'function', 'Node require decimal 可用');
     ok(NodeCore.tick === global.GameCore.tick, '前后端拿到的是同一份实现（非副本）');
+  }
+
+  console.log('\n=== 兵解 · 转生（界面）===');
+  {
+    const Core = global.GameCore;
+    const D = global.Decimal;
+    const G = global.GAME;
+
+    const bootWith = async (snap) => {
+      installStubs();
+      global.fetch = async (url) => {
+        const u = String(url);
+        if (u.indexOf('/api/me') >= 0) {
+          return { ok: true, status: 200, json: async () => ({ ok: true, username: 'tester' }) };
+        }
+        if (u.indexOf('/api/load') >= 0) {
+          return { ok: true, status: 200, json: async () => ({ ok: true, isNew: false, state: snap, config: null, offline: null }) };
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      };
+      delete require.cache[path.join(ROOT, 'public', 'js', 'app.js')];
+      let err = null;
+      try {
+        require(path.join(ROOT, 'public', 'js', 'app.js'));
+      } catch (e) {
+        err = e;
+      }
+      await new Promise((r) => setTimeout(r, 60));
+      return err;
+    };
+
+    // ---------- 场景 A：元婴 + 已兵解一次 + 买过 1 级加成 ----------
+    const s = Core.createState();
+    s.realm = 4;
+    s.money = new D(1e12);
+    for (const d of G.devices) s.devices[d.id] = 1;
+    s.learned['jiuzhang'] = { mastery: 0, tier: 2, passive: false };
+    s.technique = 'jiuzhang';
+    s.playTime = 5000;
+    s.rebirth = {
+      count: 1, dao: 150, daoTotal: 250,
+      perks: { shenshi: 1 },
+      history: [{ n: 1, realm: 4, realmName: '元婴', dao: 100, money: { m: 1, e: 6 }, gameSeconds: 0, mode: 'active' }],
+    };
+    const errA = await bootWith(Core.serialize(s));
+    ok(errA === null, '带转生存档时 app.js 初始化无异常',
+      errA ? errA.message + ' @ ' + String(errA.stack || '').split('\n')[1] : '');
+
+    const el = (id) => EL_CACHE[id];
+    ok(el('rb-lock').classList.contains('hidden'), '已解锁时不显示门槛说明');
+    ok(!el('rb-main').classList.contains('hidden'), '已解锁时显示转生面板');
+    ok(el('ui-rb-count').textContent === '1', '已兵解次数已渲染', el('ui-rb-count').textContent);
+    ok(el('ui-rb-dao').textContent === '150', '可用道行已渲染', el('ui-rb-dao').textContent);
+    ok(el('ui-rb-daototal').textContent === '250', '累计道行已渲染', el('ui-rb-daototal').textContent);
+    // 1 次兵解 → 衰减指数 0.50（界面显示 ^0.50，与 Core 同一口径）
+    ok(el('ui-rb-disc').textContent === '^' + Core.rebirthDiscount(s).toFixed(2),
+      '转生衰减指数已渲染', el('ui-rb-disc').textContent);
+    ok(el('ui-rb-gain').textContent === '160', '本次道行收益已渲染（100 → 160）',
+      el('ui-rb-gain').textContent);
+    ok(el('ui-rb-gain-passive').textContent === '48', '被动兵解三折已渲染（160 × 0.3）',
+      el('ui-rb-gain-passive').textContent);
+    ok(String(el('ui-rb-nextline').textContent).indexOf('^0.53') > 0,
+      '下一次的衰减指数在文案里可见', el('ui-rb-nextline').textContent);
+
+    const perkHtml = String(el('rb-perk-list').innerHTML);
+    ok(perkHtml.split('class="rb-perk-lv"').length - 1 === 6, '道行加成渲染 6 项',
+      String(perkHtml.split('class="rb-perk-lv"').length - 1));
+    ok(perkHtml.indexOf('神识根基') >= 0 && perkHtml.indexOf('市场人脉') >= 0, '加成名取自配置');
+    ok(perkHtml.indexOf('Lv 1 / 8') >= 0, '已买等级已渲染');
+    ok(perkHtml.indexOf('已满级') < 0, '未满级时不出现「已满级」');
+    ok(perkHtml.split('data-perk="').length - 1 === 6, '每项加成都有升级按钮');
+
+    const histHtml = String(el('rb-history').innerHTML);
+    ok(histHtml.indexOf('#1') >= 0, '兵解记录已渲染');
+    ok(histHtml.indexOf('元婴') >= 0, '记录里带上一世境界');
+    ok(histHtml.indexOf('+100') >= 0, '记录里带道行收益');
+
+    // ---------- 场景 B：未达元婴门槛 ----------
+    const s2 = Core.createState();
+    s2.realm = 2;
+    const errB = await bootWith(Core.serialize(s2));
+    ok(errB === null, '未达门槛时 app.js 初始化无异常',
+      errB ? errB.message : '');
+    ok(!EL_CACHE['rb-lock'].classList.contains('hidden'), '未达门槛时显示门槛说明');
+    ok(EL_CACHE['rb-main'].classList.contains('hidden'), '未达门槛时隐藏转生面板');
+    ok(String(EL_CACHE['ui-rb-lock'].textContent).indexOf('元婴') >= 0, '门槛文案提到元婴',
+      EL_CACHE['ui-rb-lock'].textContent);
+
+    // ---------- HTML 骨架：id 必须齐全（否则 renderRebirthPage 会写空）----------
+    const html = read('public/index.html');
+    const needIds = [
+      'rebirth-panel', 'rb-lock', 'rb-main', 'ui-rb-count', 'ui-rb-dao', 'ui-rb-daototal',
+      'ui-rb-disc', 'ui-rb-gain', 'ui-rb-gain-passive', 'ui-rb-nextline', 'btn-rebirth',
+      'rb-perk-list', 'rb-history', 'rebirth-modal', 'rb-lost-list', 'rb-keep-list',
+      'rb-gain-list', 'btn-rebirth-cancel', 'btn-rebirth-confirm',
+    ];
+    const missing = needIds.filter((id) => html.indexOf('id="' + id + '"') < 0);
+    ok(missing.length === 0, 'index.html 里兵解相关 id 全部存在',
+      missing.join(', '));
+
+    // 确认弹窗三栏的标题必须在（这是「不可撤销操作」的硬要求）
+    ok(html.indexOf('rb-col lost') > 0 && html.indexOf('rb-col keep') > 0
+      && html.indexOf('rb-col gain') > 0, '确认弹窗含「失去 / 保留 / 获得」三栏');
+
+    // app.js 引用同一套 id，且不再引用被删掉的神识旧字段
+    const appJs = read('public/js/app.js');
+    ok(appJs.indexOf('renderRebirthPage') > 0, 'app.js 已接入 renderRebirthPage');
+    ok(appJs.indexOf('computeBonusPerPoint') < 0, 'app.js 不再引用被移除的神识旧系数');
+    ok(appJs.indexOf('shenshiComputeMultiplier') > 0, 'app.js 用分层后的实际乘区显示加成');
   }
 
   console.log('\n' + '='.repeat(46));

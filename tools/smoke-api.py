@@ -58,7 +58,7 @@ ok('配置含 6 级稀有度', len(cfg.get('techniques', {}).get('rarities') or 
    [x.get('name') for x in (cfg.get('techniques', {}).get('rarities') or [])])
 ok('配置含熟练度 6 段', len(cfg.get('techniques', {}).get('mastery') or []) == 6,
    [x.get('name') for x in (cfg.get('techniques', {}).get('mastery') or [])])
-ok('配置含神识段', 'computeBonusPerPoint' in (cfg.get('shenshi') or {}))
+ok('配置含神识段', 'computePerPointRealm' in (cfg.get('shenshi') or {}))
 ok('设备表 ≥ 10 台', len(cfg.get('devices') or []) >= 10, len(cfg.get('devices') or []))
 shen_devs = [d for d in (cfg.get('devices') or []) if d.get('shenshiBonus')]
 ok('存在增幅神识的设备 ≥ 5 台', len(shen_devs) >= 5, len(shen_devs))
@@ -204,8 +204,8 @@ ok('行情含合法涨跌标记',
    all(x['trend'] in ('up', 'down', 'flat') for x in v['goods']),
    [x['trend'] for x in v['goods']])
 ok('市价以 {m,e} 下发', all('m' in x['price'] and 'e' in x['price'] for x in v['goods']))
-ok('科技类逐年变价', all(x['periodYears'] == 1 for x in v['goods'] if x['kind'] == 'tech'))
-ok('修仙类十年变价', all(x['periodYears'] == 10 for x in v['goods'] if x['kind'] == 'xiuxian'))
+ok('科技类 60 秒变价', all(x['periodSeconds'] == 60 for x in v['goods'] if x['kind'] == 'tech'))
+ok('修仙类 600 秒变价', all(x['periodSeconds'] == 600 for x in v['goods'] if x['kind'] == 'xiuxian'))
 
 # 抬境界与金钱
 rich = json.loads(json.dumps(co_st))

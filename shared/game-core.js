@@ -5,23 +5,32 @@
  * 两边算法完全一致，避免出现「前端显示的进度」与「后端保存的进度」对不上。
  *
  * ============================================================
- * 三条时间线的分工（改数值前务必理解）
+ * 时间线的分工（改数值前务必理解）
  * ============================================================
  *   1) 游戏内时间（gameSeconds）—— 由时间档位决定流速，驱动「工作耗时」与日期显示。
- *   2) 现实时间（dt）          —— 驱动设备被动收益、算力投资产出、精力恢复、功法修炼。
- *   3) 精力                    —— 按现实时间恢复，是**与档位无关**的产出硬上限。
+ *   2) 现实秒累计（playTime）   —— **行情时钟**：商品市场与股市的「期」都按它推进
+ *                                 （见 marketClock）。与时间档位无关。
+ *   3) 现实时间（dt）           —— 驱动设备被动收益、算力投向产出、精力恢复、
+ *                                 公司生产周期、功法修炼。
+ *   4) 精力                     —— 按现实时间恢复，是**与档位无关**的产出硬上限。
  *
  * 为什么精力必须按现实时间算：时间档位可以调到「1 秒 = 1 个月」，
  * 如果产出上限也跟着游戏时间膨胀，玩家拉满档位就能无限产出。
  * 精力把总产出锁死在「每秒恢复 1 点」上，档位只决定你多快花完这份额度。
  *
+ * 为什么行情也必须按现实时间算（与精力同一个道理）：
+ *   档 4（1 秒 = 1 游戏月）下，1 游戏年只有 12 现实秒。若「期」按游戏内时间计，
+ *   抛压与股市冲击每 12 秒就衰减一半、约 1 分钟归零 —— 砸盘被压价、大单砸自己
+ *   这两条约束会形同虚设，把档位拉满等于免罚。改用现实秒后，任何档位下
+ *   行情节奏一致，档位只加速工作。
+ *
  * ============================================================
- * 两条货币 + 两个属性
+ * 两条货币 + 三个属性
  * ============================================================
  *   金钱 money        —— 买设备、开公司
  *   灵气 qi           —— **突破境界的唯一货币**，需先习得功法才会产生
  *   灵石 spiritStone  —— 后期修仙资源，买科技修仙设备用
- *   算力 compute      —— 设备提供，投向四个方向
+ *   算力 compute      —— 设备提供，投向六个方向（含功法增幅、工业产能）
  *   神识 shenshi      —— 一开始就有，随境界成长，被设备（尤其科技修仙设备）增幅。
  *                        同时放大「实际算力效果」与「功法修炼速度」，
  *                        而功法修炼速度就是灵气提升速度。
@@ -34,6 +43,11 @@
     ? require('./game-config.js') : root.GAME;
 
   const D = Decimal;
+
+  /** 数值兜底：非有限数时取默认值（配置缺字段时，不要让它变成 NaN 渗进乘区） */
+  function num(v, dflt) {
+    return (typeof v === 'number' && Number.isFinite(v)) ? v : dflt;
+  }
 
   // ---------- 时间常量 ----------
   const SEC_PER_MIN = 60;
@@ -113,10 +127,15 @@
       devices: {},
       alloc: {},
       produced: {},
-      costDiscount: 1,
       realCompute: new D(0),
       aiBonus: new D(0),
       investedCompute: new D(0),
+      /**
+       * 计算设备领域的**累积议价值**（v3.5）—— 永久压低设备造价。
+       * 每秒按 hardware 投向份额增长；拉没进度条只停止增长、不清空。
+       * 折扣比例按「该设备现价」稀释，见 hardwareDiscountFor。
+       */
+      investedHardware: new D(0),
 
       // ---- 公司（产业）----
       /**
@@ -124,8 +143,9 @@
        *   工作 = 职业（别人雇你，固定收益、消耗精力）
        *   公司 = 产业（自己生产、自己卖，收益随市价浮动、扣维护费）
        *
-       * 注意 `stock` 存的是**件数**（整数），市价不存档 —— 它由 gameSeconds
-       * 确定性推导（见 goodsPrice），这样前端 tick 与后端离线结算算出的价格完全一致。
+       * 注意 `stock` 存的是**件数**（整数），市价不存档 —— 它由 marketClock
+       * （现实秒，见 marketClock 的注释）确定性推导，这样前端 tick 与后端
+       * 离线结算算出的价格完全一致。
        */
       company: {
         /** 是否已注册成立 */
@@ -168,6 +188,11 @@
         producedThisPeriod: {},
         /** 上次结算抛压时各商品所处的期数 { [goodId]: period } */
         lastPeriod: {},
+        /**
+         * 历史最高抛压（0~1，只增不减）—— 「操控市场」类功法成就的达成凭据。
+         * 抛压只在清仓砸盘时产生，能留下高水位 = 玩家真的砸过盘。
+         */
+        peakPressure: 0,
       },
 
       // ---- 股市（证券账户）----
@@ -202,6 +227,39 @@
       spiritStone: new D(0),
       realm: 0,
       realmProgress: new D(0),
+
+      // ---- 转生（兵解）----
+      /**
+       * 每一世的沉淀。兵解时：count +1、道行按「境界 + 已兵解次数」结算
+       * （**对资产总量不敏感**）、境界与灵气归零、公司股市全清、
+       * 设备保留但吃转生折扣（算力与神识倍率各留一定比例）。
+       *   count    已完成的兵解次数（只增，防作弊）
+       *   dao      未分配的道行
+       *   daoTotal 历史累计道行（只增，防作弊）
+       *   perks    各项永久加成的等级 { [perkId]: level }
+       *   history  每世摘要（最多保留 20 条，仅用于展示）
+       */
+      rebirth: { count: 0, dao: 0, daoTotal: 0, perks: {}, history: [] },
+
+      // ---- 渡劫（突破境界的门槛）----
+      /**
+       * 每成功渡劫一次 +1 层的**永久**沉淀 —— 跨兵解不丢，
+       * 是转生循环里「这一世没有白过」的那部分。
+       *   level     当前层数（效果 = 层数 × tribulation.boon[key]）
+       *   attempts  累计尝试次数（展示用）
+       *   failures  累计失败次数（展示用）
+       *   won/lost  最近一次渡劫的结果，供界面做一次性提示
+       */
+      tribulation: { level: 0, attempts: 0, failures: 0, won: null, lost: null },
+      /** 是否自动渡劫（灵气一够就硬闯） */
+      autoTribulation: true,
+      /** 游戏时间是否暂停（精力恢复 / 投向 / 公司 / 修炼走现实时间，不受影响） */
+      timePaused: false,
+      /**
+       * 自动跟随最高档 —— 已废弃（见 stepTick 第 13 步的注释）。
+       * 字段保留只为兼容旧存档；新代码不再读它。
+       */
+      autoTier: false,
 
       // ---- 统计 ----
       playTime: 0,
@@ -245,7 +303,7 @@
     s.realmProgress = D.fromJSON(raw.realmProgress);
     s.aiBonus = D.fromJSON(raw.aiBonus);
     s.investedCompute = D.fromJSON(raw.investedCompute);
-    s.costDiscount = typeof raw.costDiscount === 'number' ? raw.costDiscount : 1;
+    s.investedHardware = raw.investedHardware ? D.fromJSON(raw.investedHardware) : new D(0);
 
     /**
      * 存档迁移（v1 → v2）：
@@ -264,6 +322,55 @@
     s.realm = Number.isInteger(raw.realm) ? Math.max(0, raw.realm) : 0;
     s.playTime = raw.playTime || 0;
     s.lastTick = raw.lastTick || Date.now();
+
+    // ---- 转生（兵解）----
+    // 逐项夹范围：count / daoTotal 只增（服务端 /api/save 另有保护），
+    // dao 夹到 [0, daoTotal]，perks 每项夹到 [0, 该加成的 maxLevel] ——
+    // 后者是防手改存档：不加这一道，玩家可以直接把加成等级填到天上。
+    {
+      const rc = (raw.rebirth && typeof raw.rebirth === 'object') ? raw.rebirth : {};
+      const rp = (rc.perks && typeof rc.perks === 'object') ? rc.perks : {};
+      const perks = {};
+      for (const p of ((GAME.rebirth && GAME.rebirth.perks) || [])) {
+        const lv = Math.max(0, Math.floor(num(rp[p.id], 0)));
+        perks[p.id] = Math.min(Math.floor(num(p.maxLevel, 0)), lv);
+      }
+      const count = Math.max(0, Math.floor(num(rc.count, 0)));
+      const daoTotal = Math.max(0, Math.floor(num(rc.daoTotal, 0)));
+      let dao = Math.max(0, Math.floor(num(rc.dao, 0)));
+      if (dao > daoTotal) dao = daoTotal;
+      const history = Array.isArray(rc.history) ? rc.history.slice(-20) : [];
+      s.rebirth = {
+        count: count, dao: dao, daoTotal: daoTotal, perks: perks, history: history,
+        // 转生衰减快照：baseCompute 是 D，baseShenshi 是 number；
+        // 旧存档没有这两个字段（null），hydrate 尾部会在设备还原后补拍
+        baseCompute: (rc.baseCompute && typeof rc.baseCompute === 'object') ? D.fromJSON(rc.baseCompute) : null,
+        baseShenshi: (typeof rc.baseShenshi === 'number' && rc.baseShenshi >= 0) ? rc.baseShenshi : null,
+      };
+    }
+
+    // ---- 渡劫 ----
+    // level 夹到 [0, maxLevel]（防手改存档直接填层数）；次数只做非负夹取。
+    {
+      const cfgT = tribulationCfg();
+      const rt = (raw.tribulation && typeof raw.tribulation === 'object') ? raw.tribulation : {};
+      const maxLv = Math.max(0, Math.floor(num(cfgT.maxLevel, 40)));
+      const level = Math.min(maxLv, Math.max(0, Math.floor(num(rt.level, 0))));
+      s.tribulation = {
+        level: level,
+        attempts: Math.max(0, Math.floor(num(rt.attempts, 0))),
+        failures: Math.max(0, Math.floor(num(rt.failures, 0))),
+        won: rt.won || null,
+        lost: rt.lost || null,
+      };
+      // 老存档没有这个字段时跟随配置默认值
+      s.autoTribulation = (raw.autoTribulation === undefined || raw.autoTribulation === null)
+        ? (cfgT.autoDefault !== false)
+        : !!raw.autoTribulation;
+    }
+
+    // ---- 时间暂停 ----
+    s.timePaused = !!raw.timePaused;
 
     // ---- 时间 ----
     s.gameSeconds = typeof raw.gameSeconds === 'number' && raw.gameSeconds >= 0 ? raw.gameSeconds : 0;
@@ -306,6 +413,11 @@
           mastery: mastery,
           tier: Math.max(tier, tierFromMastery),
           passive: !!rec.passive || Math.max(tier, tierFromMastery) >= PERFECT_TIER,
+          // v3.5 每本功法独立的经验 / 等级。旧存档没有这两个字段 ——
+          // level 置 -1 作为迁移标记，hydrate 尾部（realCompute 还原后）
+          // 按旧全局公式补一次初始等级，经验从 0 起步。
+          exp: (typeof rec.exp === 'number' && rec.exp >= 0) ? rec.exp : 0,
+          level: Number.isInteger(rec.level) && rec.level >= 0 ? rec.level : -1,
         };
       }
     }
@@ -414,10 +526,19 @@
         s.company.soldThisPeriod[g.id] = clampCount(rc.soldThisPeriod && rc.soldThisPeriod[g.id]);
         s.company.producedThisPeriod[g.id] =
           clampCount(rc.producedThisPeriod && rc.producedThisPeriod[g.id]);
-        // 记录期数；比当前期还大的值会让抛压永远不结算，直接裁到当前期
+        // 记录期数；比当前期还大的值会让抛压永远不结算，直接裁到当前期。
+        // 期数按**现实秒**口径（marketClock）。旧存档里存的是「游戏内年」口径的
+        // 期数，在档 4 下会大出好几个数量级，正好被这里夹回当前期 ——
+        // 代价只是跳过一期的抛压结算，之后一切正常。
         const lp = clampCount(rc.lastPeriod && rc.lastPeriod[g.id]);
-        const cur = goodsPeriod(g, s.gameSeconds);
+        const cur = goodsPeriod(g, marketClock(s));
         s.company.lastPeriod[g.id] = Math.min(lp, cur);
+      }
+      // 历史最高抛压：只增不减，且必须落在 [0,1]
+      {
+        const pk = Number(rc.peakPressure);
+        const curPeak = Math.max(0, Math.min(1, Number.isFinite(pk) ? pk : 0));
+        if (curPeak > (s.company.peakPressure || 0)) s.company.peakPressure = curPeak;
       }
 
       // 未成立则清空库存与周期进度，避免「先囤货再成立」绕过启动成本。
@@ -465,9 +586,9 @@
         s.stock.cost[st.id] = c.isNeg() ? new D(0) : c;
         // 持股为 0 时成本必须归零，否则「卖了又留着成本」会让浮盈看起来是巨亏
         if (s.stock.shares[st.id] === 0) s.stock.cost[st.id] = new D(0);
-        // 期数游标不允许超前于当前期，否则冲击永远等不到衰减
+        // 期数游标不允许超前于当前期，否则冲击永远等不到衰减（口径同上：现实秒）
         const lp = clampInt(rs.lastPeriod && rs.lastPeriod[st.id], 0, 1e15);
-        s.stock.lastPeriod[st.id] = Math.min(lp, stockPeriod(st, s.gameSeconds));
+        s.stock.lastPeriod[st.id] = Math.min(lp, stockPeriod(st, marketClock(s)));
       }
     }
 
@@ -475,6 +596,28 @@
     const maxE = maxEnergy(s);
     s.energy = typeof raw.energy === 'number' && raw.energy >= 0
       ? Math.min(raw.energy, maxE) : maxE;
+
+    // ---- 功法等级迁移（v3.5）----
+    // 旧模型：level = floor(log10(1+实际算力) × 4)，全功法共享。
+    // 新模型：每本独立。迁移时按旧公式给每本一个起始等级（不丢旧进度），
+    // 经验从 0 起步，之后各自独立成长。
+    for (const id of Object.keys(s.learned)) {
+      const rec = s.learned[id];
+      if (rec.level < 0) {
+        const c = realComputeOf(s).toNumber();
+        rec.level = c > 0 ? Math.max(0, Math.floor(Math.log10(1 + c) * 4)) : 0;
+      }
+    }
+
+    // ---- 转生衰减快照迁移（v3.4）----
+    // 旧存档兵解过但没有快照字段 → 在设备已还原之后补拍一次。
+    // 从这一刻起新买的设备全额累加；快照前的存量继续按旧口径吃衰减。
+    {
+      const rst = rebirthState(s);
+      if (rst.count > 0 && (!rst.baseCompute || rst.baseCompute.gt(totalCompute(s)))) {
+        snapshotRebirthBase(s);
+      }
+    }
 
     s.shenshi = totalShenshi(s);
     s.realCompute = realComputeOf(s);
@@ -484,6 +627,7 @@
 
   /** 序列化为可存档的纯 JSON */
   function serialize(s) {
+    const st = rebirthState(s);
     const out = {
       money: s.money.toJSON(),
       qi: s.qi.toJSON(),
@@ -492,7 +636,7 @@
       realCompute: s.realCompute.toJSON(),
       aiBonus: s.aiBonus.toJSON(),
       investedCompute: s.investedCompute.toJSON(),
-      costDiscount: s.costDiscount,
+      investedHardware: s.investedHardware.toJSON(),
 
       gameSeconds: s.gameSeconds,
       timeTier: s.timeTier,
@@ -512,6 +656,39 @@
       learned: {},
 
       realm: s.realm,
+      /**
+       * 转生（兵解）。
+       * count / daoTotal / perks 都是**只增字段**，服务端 /api/save 会拒绝回退。
+       * dao 会因为消费加成而减少，所以不走只增保护，改为夹到 [0, daoTotal]。
+       */
+      rebirth: {
+        count: st.count,
+        dao: st.dao,
+        daoTotal: st.daoTotal,
+        perks: Object.assign({}, st.perks),
+        history: st.history.slice(-20),
+        // 转生衰减快照（v3.4）：null = 未兵解过或旧存档待迁移
+        baseCompute: (st.baseCompute && typeof st.baseCompute.toJSON === 'function')
+          ? st.baseCompute.toJSON() : null,
+        baseShenshi: (typeof st.baseShenshi === 'number') ? st.baseShenshi : null,
+      },
+
+      /**
+       * 渡劫。
+       * level 同样是**只增字段**（服务端 /api/save 会拒绝回退）——
+       * 它是「每一世没有白过」的那部分沉淀，跨兵解必须原样带着。
+       * won / lost 是一次性提示，存下来只为刷新页面后还能补一条 toast。
+       */
+      tribulation: {
+        level: tribulationLevel(s),
+        attempts: tribulationState(s).attempts,
+        failures: tribulationState(s).failures,
+        won: tribulationState(s).won || null,
+        lost: tribulationState(s).lost || null,
+      },
+      autoTribulation: s.autoTribulation !== false,
+      /** 游戏时间是否暂停 */
+      timePaused: !!s.timePaused,
       playTime: s.playTime,
       lastTick: s.lastTick,
       devices: Object.assign({}, s.devices),
@@ -541,6 +718,8 @@
         soldThisPeriod: Object.assign({}, s.company.soldThisPeriod),
         producedThisPeriod: Object.assign({}, s.company.producedThisPeriod),
         lastPeriod: Object.assign({}, s.company.lastPeriod),
+        // 历史最高抛压（只增字段）：「操控市场」类功法成就的凭据
+        peakPressure: s.company.peakPressure || 0,
       },
 
       stock: {
@@ -559,7 +738,10 @@
     }
     for (const id of Object.keys(s.learned)) {
       const rec = s.learned[id];
-      out.learned[id] = { mastery: rec.mastery, tier: rec.tier, passive: rec.passive };
+      out.learned[id] = {
+        mastery: rec.mastery, tier: rec.tier, passive: rec.passive,
+        exp: rec.exp || 0, level: rec.level || 0,
+      };
     }
     for (const k of Object.keys(s.produced)) out.produced[k] = s.produced[k].toJSON();
     return out;
@@ -611,7 +793,27 @@
   }
 
   /** 当前档位：1 现实秒 = 多少游戏秒 */
+  /**
+   * 精力恢复速度（点 / 现实秒）—— **随境界提升**。
+   *
+   * 为什么不能恒为 1：工作的单次精力消耗随境界涨（15 → 38 → 80 → 200 → 520），
+   * 恢复恒为 1 意味着元婴期做一份工作要干等 8 分钟以上，纯耗时间不产生决策。
+   * 恢复速度按 ~×1.45 / 境抬升，把等待压回一分钟上下。
+   *
+   * 为什么这不会让收入失控：高档位下工作收益的瓶颈会自动从「精力」切到
+   * 「游戏时间」（advanceWork 取两者较小值）—— 元婴档 1 秒 = 1 游戏月时，
+   * 一份 86400 游戏小时的工作时间下限就是 120 现实秒，恢复再快也加不了钱，
+   * 只是把「干等」变成「接着干」。
+   */
+  function energyRegen(s) {
+    const r = GAME.realms[Math.min(s.realm, GAME.realms.length - 1)];
+    const v = (r && typeof r.regen === 'number') ? r.regen : GAME.energy.regenPerSecond;
+    return num(v, 1);
+  }
+
   function gameSecondsPerRealSecond(s) {
+    // 暂停档：游戏时间停走，精力恢复 / 投向 / 公司 / 修炼照常（它们走现实时间）
+    if (s.timePaused) return 0;
     return tierInfo(s.timeTier).gameSecondsPerRealSecond;
   }
 
@@ -657,38 +859,948 @@
   // 精力
   // ============================================================
 
-  /** 当前精力上限（境界基础 × 功法被动加成） */
+  /**
+   * 当前精力上限 = 境界基础 ×(1 + 功法被动) ×(1 + 道行 · 精力淬炼)。
+   * 精力是与时间档位解耦的产能硬上限，所以这条加成的实际影响比它看起来大。
+   */
   function maxEnergy(s) {
     const r = GAME.realms[Math.min(s.realm, GAME.realms.length - 1)];
     const base = (r && r.maxEnergy) || (GAME.realms[0] && GAME.realms[0].maxEnergy) || 100;
-    return base * (1 + passiveBonus(s, 'energyMax'));
+    return base
+      * (1 + passiveBonus(s, 'energyMax'))
+      * (1 + perkValue(s, 'energyMax'))
+      * (1 + tribulationBonus(s, 'energyMax'));
   }
 
   // ============================================================
   // 神识
   // ============================================================
 
-  /** 境界提供的基础神识 */
+  /**
+   * 境界提供的基础神识。
+   * 含「道行加成 · 神识根基」—— 它直接加在境界基础值上，
+   * 于是每一世的起跑线被永久抬高，后续所有以神识为输入的乘区都被它放大。
+   */
   function shenshiBase(s) {
     const r = GAME.realms[Math.min(s.realm, GAME.realms.length - 1)];
-    return (r && r.shenshi) || 1;
+    const base = (r && r.shenshi) || 1;
+    // 道行 · 神识根基 是「点」，渡劫淬体是「百分比」—— 先加后乘，两者互不吞掉对方
+    return (base + perkValue(s, 'shenshi')) * (1 + tribulationBonus(s, 'shenshi'));
   }
 
-  /** 设备对神识的放大倍率（科技修仙设备越靠后越猛） */
+  /**
+   * 设备对神识的放大倍率（科技修仙设备越靠后越猛）。
+   * 转生衰减作用在这一份上 —— 只有 (m − 1) 是设备贡献，只对这一部分做幂衰减。
+   */
+  /**
+   * 设备对神识的放大倍率（科技修仙设备越靠后越猛）。
+   * v3.4 快照模型：与 deviceComputeEffective 同一套逻辑 ——
+   * 兵解时快照 raw 加成（baseShenshi），衰减只压快照那份，
+   * 之后新买的设备按原值累加进倍率。
+   */
   function shenshiDeviceMultiplier(s) {
-    let m = 1;
-    for (const dev of GAME.devices) {
-      if (!dev.shenshiBonus) continue;
-      const n = s.devices[dev.id] || 0;
-      if (n > 0) m += dev.shenshiBonus * n;
-    }
-    return m;
+    const rawBonus = rawShenshiBonus(s);
+    if (rawBonus <= 0) return 1;
+    const n = rebirthCount(s);
+    if (n <= 0) return 1 + rawBonus;
+    const st = rebirthState(s);
+    const hasSnap = typeof st.baseShenshi === 'number' && st.baseShenshi >= 0;
+    const base = (hasSnap && st.baseShenshi <= rawBonus) ? st.baseShenshi : rawBonus;
+    const capped = rebirthAttenuate(s, new D(base)).toNumber();
+    const growth = Math.max(0, rawBonus - base);
+    return 1 + capped + growth;
   }
 
-  /** 神识总量 = 境界基础 × 设备倍率 × (1 + 功法被动加成) */
+  /**
+   * 神识总量 = 境界基础 × 设备倍率 ×(1 + 功法被动加成)。
+   * **只用于界面展示**；实际乘区一律走 shenshiEffect 的分层公式，两者不混用。
+   */
   function totalShenshi(s) {
     const v = shenshiBase(s) * shenshiDeviceMultiplier(s) * (1 + passiveBonus(s, 'shenshi'));
     return Number.isFinite(v) && v > 0 ? v : 0;
+  }
+
+  /**
+   * 把神识拆成两份 —— 分层阻尼的基础。
+   *
+   * 为什么必须拆：神识 = 境界基础 × 设备倍率，两个来源性质完全不同。
+   *   境界那一份：随境界线性增长，也是「道行 · 神识根基」的载体，必须线性可感知。
+   *   设备那一份：玩家可以无限堆（shenshiBonus 从 0.5 一路跃升到 120），是数值爆炸的唯一来源。
+   * 拆开之后「境界管手感与道行回报、设备管规模上限」就解耦了，各自可独立调参。
+   */
+  function shenshiParts(s) {
+    const passive = 1 + passiveBonus(s, 'shenshi');
+    /** 境界那一份（含道行加成），线性因子的载体 */
+    const realmPart = shenshiBase(s) * passive;
+    /** 设备倍率（≥ 1，已被转生折扣作用过） */
+    const deviceMul = Math.max(1, shenshiDeviceMultiplier(s));
+    return { realmPart: realmPart, deviceMul: deviceMul, passive: passive };
+  }
+
+  /**
+   * 神识对某个乘区的**有效强度**（分层阻尼：境界线性 × 设备对数收敛）。
+   *
+   *     有效强度 = 境界神识 × perPointRealm × f(设备倍率)
+   *     f(m)     = 1 + deviceLogK × ln(m)              // m ≥ 1
+   *     乘区     = 1 + 有效强度
+   *
+   * 三个关键性质：
+   *   a) f(1) = 1 —— **无设备时与旧口径完全一致**，前期手感不变；
+   *   b) 设备按对数收敛 —— 后期不爆炸；
+   *   c) 境界神识仍是线性因子 —— 道行买来的永久提升不被稀释。
+   *
+   * 为什么不把两者相加：相加会让「低境界 + 大量设备」时设备那一份脱离境界约束，
+   * 反而比原线性口径更强（实测过：凡人 + 800 倍设备，相加给出 ×54，线性只有 ×17）。
+   * 乘法保留了原设计「神识 = 境界基础 × 设备倍率」的语义，只把设备那一项换成收敛函数。
+   */
+  function shenshiEffect(s, perPointRealm, deviceLogK) {
+    const p = shenshiParts(s);
+    const f = 1 + deviceLogK * Math.log(p.deviceMul);
+    const v = p.realmPart * perPointRealm * f;
+    return Number.isFinite(v) ? v : 0;
+  }
+
+  /** 神识对「实际算力」的乘区 —— 引擎与界面共用同一口径，避免显示与实际不符 */
+  function shenshiComputeMultiplier(s) {
+    const g = GAME.shenshi || {};
+    const v = 1 + shenshiEffect(s, num(g.computePerPointRealm, 0.02), num(g.computeDeviceLogK, 8));
+    return v > 0 ? v : 0;
+  }
+
+  /** 神识对「功法修炼速度」的乘区（修炼速度即灵气提升速度） */
+  function shenshiCultivateMultiplier(s) {
+    const g = GAME.shenshi || {};
+    const v = 1 + shenshiEffect(s, num(g.cultivatePerPointRealm, 0.02), num(g.cultivateDeviceLogK, 8));
+    return v > 0 ? v : 0;
+  }
+
+  // ============================================================
+  // 转生（兵解）
+  // ============================================================
+
+  function rebirthCfg() { return GAME.rebirth || {}; }
+
+  /** 转生状态（容错读取，老存档没有这个字段时给一份默认值） */
+  function rebirthState(s) {
+    if (!s) return { count: 0, dao: 0, daoTotal: 0, perks: {}, history: [] };
+    if (!s.rebirth) s.rebirth = { count: 0, dao: 0, daoTotal: 0, perks: {}, history: [] };
+    if (!s.rebirth.perks) s.rebirth.perks = {};
+    if (!Array.isArray(s.rebirth.history)) s.rebirth.history = [];
+    /**
+     * 转生衰减快照（v3.4）：兵解那一刻的设备存量。
+     *   baseCompute  兵解时 raw 设备算力（D）
+     *   baseShenshi  兵解时 raw 设备神识加成（m − 1，number）
+     * 衰减只作用于这份快照；**之后新买的设备全额累加** ——
+     * 否则「买多少设备属性栏都不动」，买设备这件事在转生后失去意义。
+     * 旧存档没有这两个字段时，在 hydrate 里补拍。
+     */
+    if (!s.rebirth.baseCompute) s.rebirth.baseCompute = null;
+    if (typeof s.rebirth.baseShenshi !== 'number') s.rebirth.baseShenshi = null;
+    return s.rebirth;
+  }
+
+  /** 已完成的兵解次数 */
+  function rebirthCount(s) {
+    return Math.max(0, Math.floor(rebirthState(s).count || 0));
+  }
+
+  /**
+   * 指定「已兵解次数」对应的转生**衰减指数**。
+   *
+   *   指数(0)  = 1.00                          ← 还没兵解过，原值
+   *   指数(n≥1) = min(base + perRun ×(n − 1), cap)
+   *
+   * ⚠️ 「0 次 = 原值」这一条是**必须**的。把 base 当成任何时刻的指数，
+   * 会让所有没兵解过的玩家一开始算力就被开方 —— 这个坑踩过一次。
+   */
+  function rebirthFactorAt(n) {
+    const c = rebirthCfg().deviceDiscount || {};
+    const base = num(c.base, 0.5);
+    const per = num(c.perRun, 0.03);
+    const cap = num(c.cap, 0.75);
+    const k = Math.max(0, Math.floor(num(n, 0)));
+    if (k <= 0) return 1;
+    const v = base + per * (k - 1);
+    // 抹掉浮点尾巴（0.5 + 0.03 → 0.53），界面直接显示时更干净
+    return Math.max(0.05, Math.min(cap, Math.round(v * 1e4) / 1e4));
+  }
+
+  // ============================================================
+  // 渡劫 —— 突破境界的门槛
+  // ============================================================
+
+  function tribulationCfg() { return GAME.tribulation || {}; }
+
+  function tribulationState(s) {
+    const t = s.tribulation;
+    if (!t || typeof t !== 'object') {
+      s.tribulation = { level: 0, attempts: 0, failures: 0, won: null, lost: null };
+    } else {
+      t.level = Math.max(0, Math.floor(num(t.level, 0)));
+      t.attempts = Math.max(0, Math.floor(num(t.attempts, 0)));
+      t.failures = Math.max(0, Math.floor(num(t.failures, 0)));
+      if (t.won === undefined) t.won = null;
+      if (t.lost === undefined) t.lost = null;
+    }
+    return s.tribulation;
+  }
+
+  /** 渡劫淬体层数（永久，跨兵解保留） */
+  function tribulationLevel(s) {
+    return Math.min(
+      Math.max(0, Math.floor(num(tribulationCfg().maxLevel, 40))),
+      tribulationState(s).level
+    );
+  }
+
+  /**
+   * 渡劫淬体提供的永久加成（按 key，与 `techniques.list[].passive` 同名同义）。
+   * 之所以沿用同一套键名：两套加成在同一个乘区里并排相加，
+   * 不需要再造一层「渡劫乘区」，也就不会出现两个乘区互相打架。
+   */
+  function tribulationBonus(s, key) {
+    const per = num((tribulationCfg().boon || {})[key], 0);
+    if (!per) return 0;
+    return tribulationLevel(s) * per;
+  }
+
+  /** 该境界的「基准算力」—— 渡劫准备度里算力冗余的参照点 */
+  function tribulationComputeBase(s) {
+    const arr = (tribulationCfg().prepare || {}).computeBase || [];
+    const v = arr[Math.min(s.realm, Math.max(0, arr.length - 1))];
+    return num(v, 1e2);
+  }
+
+  /** 已修满（被动常驻）的功法数量 —— 渡劫准备度的一项 */
+  function perfectedTechniqueCount(s) {
+    let n = 0;
+    for (const id of Object.keys(s.learned || {})) {
+      const rec = s.learned[id];
+      if (rec && rec.passive) n += 1;
+    }
+    return n;
+  }
+
+  /**
+   * 渡劫成功率，以及拆解出来的每一项加成（界面要逐项显示，不能只给一个总数 ——
+   * 玩家得知道「再堆一点算力就能多 3%」）。
+   *
+   *     成功率 = clamp(基础 + 算力冗余 + 功法造诣 + 道行底蕴, minRate, maxRate)
+   *
+   * 三项准备各自封顶，`maxRate` 也不给到 1 —— **渡劫永远有风险**，
+   * 否则整个系统就退化成一个需要多点一次的按钮。
+   */
+  function tribulationOdds(s) {
+    const cfg = tribulationCfg();
+    const p = cfg.prepare || {};
+    const rates = cfg.baseRate || [];
+    const idx = Math.min(s.realm, Math.max(0, rates.length - 1));
+    const base = num(rates[idx], 0.8);
+
+    // 算力冗余：每高出基准 10 倍 +computePerDecade
+    const c = s.realCompute.toNumber();
+    const cb = tribulationComputeBase(s);
+    const decades = (c > 0 && cb > 0) ? Math.log10(c / cb) : 0;
+    const computeAdd = Math.max(0, Math.min(
+      num(p.computeCap, 0.15), decades * num(p.computePerDecade, 0.03)
+    ));
+
+    // 功法造诣：每本修满的功法
+    const perfect = perfectedTechniqueCount(s);
+    const perfectAdd = Math.min(num(p.perfectCap, 0.10), perfect * num(p.perfectPer, 0.02));
+
+    // 道行底蕴：累计道行
+    const daoTotal = num(rebirthState(s).daoTotal, 0);
+    const daoAdd = Math.min(
+      num(p.daoCap, 0.08),
+      (daoTotal / Math.max(1, num(p.daoPer, 2000))) * num(p.daoPerBonus, 0.01)
+    );
+
+    const raw = base + computeAdd + perfectAdd + daoAdd;
+    const rate = Math.max(num(cfg.minRate, 0.05), Math.min(num(cfg.maxRate, 0.95), raw));
+
+    return {
+      realm: s.realm,
+      nextRealm: s.realm + 1,
+      base: base,
+      computeAdd: computeAdd,
+      perfectAdd: perfectAdd,
+      daoAdd: daoAdd,
+      decades: decades,
+      computeBase: cb,
+      perfectCount: perfect,
+      daoTotal: daoTotal,
+      rate: rate,
+    };
+  }
+
+  /** 灵气是否已满、且还有下一境界可渡 */
+  function tribulationReady(s) {    if (!tribulationCfg().implemented) return false;
+    const t = nextRealm(s);
+    if (!t || !t.next || !t.need) return false;
+    return s.qi.gte(t.need);
+  }
+
+  /**
+   * 渡劫结果的伪随机数。
+   *
+   * ⚠️ **不能用 Math.random()。** 前端每 100ms 跑一次 tick、服务端在离线结算里
+   * 也跑同一份 tick —— 两端必须算出同一个结果，否则屏幕上「渡劫失败、一切归零」
+   * 而服务器存档里还留着元婴，两边会永久打架（这个项目在转生那轮已经吃过一次
+   * 「两端各算一遍」的亏）。所以结果必须是**状态的纯函数**。
+   *
+   * 用 (境界, 已尝试次数, 淬体层数, 游戏内时间分钟数) 做散列：
+   *   - 同一份状态，两端算出的值一定相同；
+   *   - 每次尝试 `attempts` 都会 +1，所以失败之后再点一次得到的是**另一个**结果，
+   *     不存在「卡在必死的那一次」；
+   *   - 玩家无法在点之前预知结果（要预知就得复刻整个散列，而这并不可行 ——
+   *     更重要的是，知道了也改变不了什么，结果只由状态决定）。
+   */
+  function tribulationRoll(s) {
+    const st = tribulationState(s);
+    let h = 2166136261;
+    const feed = (x) => {
+      let v = Math.floor(num(x, 0)) >>> 0;
+      for (let i = 0; i < 4; i++) {
+        h ^= (v & 0xff);
+        h = Math.imul(h, 16777619) >>> 0;
+        v >>>= 8;
+      }
+    };
+    feed(s.realm);
+    feed(st.attempts);
+    feed(st.level);
+    feed(Math.floor((s.playTime || 0) / 60));
+    feed(rebirthCount(s) * 7919);
+    // 取 [0,1)
+    return (h >>> 0) / 4294967296;
+  }
+
+  /** 渡劫淬体的效果清单（界面用） */
+  function tribulationBoonSummary(s, level) {
+    const boon = tribulationCfg().boon || {};
+    const lv = (level === undefined) ? tribulationLevel(s) : Math.max(0, Math.floor(num(level, 0)));
+    const label = {
+      qiSpeed: '灵气吸收',
+      compute: '实际算力',
+      money: '工作金钱',
+      shenshi: '境界基础神识',
+      energyMax: '精力上限',
+      stone: '灵石产出',
+    };
+    const out = [];
+    for (const k of Object.keys(boon)) {
+      const per = num(boon[k], 0);
+      if (!per) continue;
+      out.push({
+        key: k,
+        name: label[k] || k,
+        per: per,
+        value: per * lv,
+      });
+    }
+    return out;
+  }
+
+  /** 渡劫面板要展示的全部信息（前端一次拿齐，不需要自己拼） */
+  function tribulationSummary(s) {
+    const cfg = tribulationCfg();
+    if (!cfg.implemented) return null;
+    const st = tribulationState(s);
+    const t = nextRealm(s);
+    const odds = tribulationOdds(s);
+    const maxLevel = Math.max(0, Math.floor(num(cfg.maxLevel, 40)));
+    return {
+      implemented: true,
+      level: tribulationLevel(s),
+      maxLevel: maxLevel,
+      attempts: st.attempts,
+      failures: st.failures,
+      /** 自动渡劫开关 */
+      auto: s.autoTribulation !== false,
+      /** 是否能立刻渡劫 */
+      ready: tribulationReady(s),
+      /** 已至最高境界（无劫可渡） */
+      atMax: !t || !t.next,
+      need: (t && t.need) ? t.need.toJSON() : null,
+      progress: s.realmProgress ? s.realmProgress.toNumber() : 0,
+      odds: odds,
+      boons: tribulationBoonSummary(s),
+      /** 下一次成功之后的层数 */
+      nextLevel: Math.min(maxLevel, tribulationLevel(s) + 1),
+      /** 最近一次结果（一次性提示） */
+      won: st.won,
+      lost: st.lost,
+      passiveRules: {
+        belowRealm: num((cfg.passiveRules || {}).belowRealm, 4),
+        fullWipeBelow: (cfg.passiveRules || {}).fullWipeBelow !== false,
+      },
+    };
+  }
+
+  /**
+   * 渡劫 —— 灵气满格时的唯一出口。
+   *
+   *   成功：消耗灵气、境界 +1、渡劫淬体 +1 层（永久），并补齐精力
+   *   失败：**被动兵解** —— 这一世作废。元婴以下连设备与功法一起清掉。
+   *
+   * 注意它**不产生随机数**（见 tribulationRoll 的注释），
+   * 所以前后端各自跑一次 tick 会得到完全一致的结局。
+   */
+  function doTribulation(s) {
+    const cfg = tribulationCfg();
+    if (!cfg.implemented) return { ok: false, msg: '渡劫系统未开放' };
+
+    const t = nextRealm(s);
+    if (!t || !t.next) return { ok: false, msg: '已至最高境界，无劫可渡' };
+    if (!t.need || s.qi.lt(t.need)) return { ok: false, msg: '灵气未满，引不动天劫' };
+
+    const st = tribulationState(s);
+    const odds = tribulationOdds(s);
+    st.attempts += 1;
+    st.won = null;
+    st.lost = null;
+
+    const roll = tribulationRoll(s);
+
+    if (roll >= odds.rate) {
+      // ---- 失败：被动兵解 ----
+      st.failures += 1;
+      const info = {
+        realm: s.realm,
+        realmName: realmName(s.realm),
+        rate: odds.rate,
+        roll: roll,
+        at: s.playTime,
+      };
+      const rb = doRebirth(s, 'passive');
+      st.lost = {
+        realm: info.realm,
+        realmName: info.realmName,
+        rate: info.rate,
+        fullWipe: !!rb.fullWipe,
+        dao: rb.dao || 0,
+        at: info.at,
+      };
+      return {
+        ok: true,
+        success: false,
+        rate: odds.rate,
+        roll: roll,
+        lostRealm: info.realm,
+        lostRealmName: info.realmName,
+        dao: rb.dao || 0,
+        fullWipe: !!rb.fullWipe,
+      };
+    }
+
+    // ---- 成功：境界 +1、淬体 +1 层 ----
+    const maxLevel = Math.max(0, Math.floor(num(cfg.maxLevel, 40)));
+    const oldMaxE = maxEnergy(s);
+    s.qi = s.qi.sub(t.need);
+    s.realm += 1;
+    st.level = Math.min(maxLevel, st.level + 1);
+    st.won = {
+      realm: s.realm,
+      realmName: realmName(s.realm),
+      level: st.level,
+      rate: odds.rate,
+      at: s.playTime,
+    };
+
+    // 境界抬升 → 精力上限变高 → 按新上限补一段（与旧自动突破的行为一致）
+    const newMaxE = maxEnergy(s);
+    if (s.energy < newMaxE) s.energy = Math.min(newMaxE, s.energy + (newMaxE - oldMaxE));
+
+    s.realmProgress = new D(0);
+    s.shenshi = totalShenshi(s);
+    s.realCompute = realComputeOf(s);
+
+    return {
+      ok: true,
+      success: true,
+      rate: odds.rate,
+      roll: roll,
+      realm: s.realm,
+      realmName: realmName(s.realm),
+      level: st.level,
+      maxLevel: maxLevel,
+      boons: tribulationBoonSummary(s),
+    };
+  }
+
+  /**
+   * 切换「自动渡劫」。
+   *
+   * 关掉之后，灵气满格也不会自己硬闯 —— 界面会停在「待渡劫」，
+   * 让玩家先把算力堆厚（算力冗余最多能把成功率抬 15 个百分点）再动手。
+   * 这是唯一一个能改变渡劫结果的玩家决策，所以开关必须显式存在。
+   */
+  function setAutoTribulation(s, on) {
+    s.autoTribulation = !!on;
+    return { ok: true, auto: s.autoTribulation };
+  }
+
+  /**
+   * 暂停 / 恢复游戏时间。
+   *
+   * 注意语义：停的是**游戏内时间**（工作进度、日期、行情推演的基础），
+   * 不是整个游戏 —— 精力恢复、算力投向、公司周期、功法修炼都挂现实时间，
+   * 照常推进。所以「暂停」是「我不赶时间了」，不是「世界冻结」。
+   */
+  function setTimePaused(s, paused) {
+    s.timePaused = !!paused;
+    return { ok: true, paused: s.timePaused };
+  }
+
+  /**
+   * 转生衰减 —— 兵解后「设备算力」与「设备神识倍率」被压掉几个数量级。
+   *
+   *     有效值 = min(原值 ^ 指数, 绝对上限)
+   *
+   * 为什么是幂而不是「乘一个比例」：见 game-config 的 rebirth.deviceDiscount 注释 ——
+   * 本作算力跨 16 个数量级，而境界阈值只到 5×10^10。实测线性折扣 0.35 下，
+   * 元婴玩家兵解后 **0.1 秒内就重新突破回元婴**。线性折扣对跨数量级的数值没有刹车力。
+   *
+   * 为什么还要再加一道绝对上限：开方只削「相对倍数」。实测开方之后算力仍有 2×10^7，
+   * 于是 2 秒又能回到元婴。绝对上限处理的是「前世设备越多、绝对值越高」——
+   * **不管前世多强，这一世都从同一水平线开始**，这才是转生该有的语义。
+   * 上限本身随兵解次数放宽（每世半个数量级），「越转越快」体现在那里。
+   *
+   * 为什么只作用在这两项：境界基础神识本来就归零重来（不需要再压）；
+   * 功法被动是永久资产（不压，否则「修满转常驻」的意义被削弱）。
+   *
+   * @param {boolean} useCap 是否夹绝对上限（设备算力夹；神识倍率不夹 ——
+   *                         它本来就被境界基础值线性缩放，境界归零已经压过一轮了）
+   */
+  function rebirthAttenuate(s, value, useCap) {
+    const n = rebirthCount(s);
+    if (n <= 0) return value;
+    if (!value || typeof value.gt !== 'function' || !value.gt(0)) return value;
+    let out = D.pow(value, new D(rebirthFactorAt(n)));
+    if (useCap) {
+      const capBase = num(rebirthCfg().deviceComputeCapBase, 0);
+      const capPer = num(rebirthCfg().deviceComputeCapPerRun, 0);
+      if (capBase > 0) {
+        const cap = capBase * Math.pow(10, capPer * (n - 1));
+        const capD = new D(cap);
+        if (out.gt(capD)) out = capD;
+      }
+    }
+    return out;
+  }
+
+  /** 当前生效的转生衰减指数（1 = 不衰减）。界面与引擎共用同一口径。 */
+  function rebirthDiscount(s) {
+    return rebirthFactorAt(rebirthCount(s));
+  }
+
+  /** 当前生效的转生算力上限（未兵解时为 0 = 不限制） */
+  function rebirthComputeCap(s) {
+    const n = rebirthCount(s);
+    if (n <= 0) return 0;
+    const capBase = num(rebirthCfg().deviceComputeCapBase, 0);
+    if (!(capBase > 0)) return 0;
+    return capBase * Math.pow(10, num(rebirthCfg().deviceComputeCapPerRun, 0) * (n - 1));
+  }
+
+  /**
+   * 设备算力的**有效值**（已应用转生衰减与上限）—— 界面与引擎共用。
+   *
+   * v3.4 快照模型：衰减只作用于「兵解那一刻的设备存量」（baseCompute），
+   * 之后新买的设备按原值全额累加：
+   *
+   *     有效算力 = min(快照存量 ^ f, cap) + max(0, 现在的存量 − 快照存量)
+   *
+   * 旧模型把「现在的存量」整体开方，导致兵解后买设备几乎不加算力
+   * （买 1.2e10 只多出 ~1.1e5 的一半）—— 属性栏「买多少都不动」就是这么来的。
+   */
+  function deviceComputeEffective(s) {
+    const raw = totalCompute(s);
+    const n = rebirthCount(s);
+    if (n <= 0) return raw;
+    const st = rebirthState(s);
+    const hasSnap = st.baseCompute && typeof st.baseCompute.gt === 'function';
+    // 兼容旧存档：没有快照（或快照比现在还大，理论不该发生）→ 以现在为基准补拍
+    const base = (hasSnap && !st.baseCompute.gt(raw)) ? st.baseCompute : raw;
+    const capped = rebirthAttenuate(s, base, true);
+    const growth = raw.gt(base) ? raw.sub(base) : new D(0);
+    return capped.add(growth);
+  }
+
+  /** 兵解时快照设备存量（在 doRebirth 的重置完成之后调用） */
+  function snapshotRebirthBase(s) {
+    const st = rebirthState(s);
+    st.baseCompute = totalCompute(s);
+    st.baseShenshi = rawShenshiBonus(s);
+  }
+
+  /** raw 设备神识加成（不含衰减，不含境界 / 功法 / 渡劫那几份） */
+  function rawShenshiBonus(s) {
+    let bonus = 0;
+    for (const dev of GAME.devices) {
+      if (!dev.shenshiBonus) continue;
+      const n = s.devices[dev.id] || 0;
+      if (n > 0) bonus += dev.shenshiBonus * n;
+    }
+    return bonus;
+  }
+
+  function perkById(id) {
+    return (rebirthCfg().perks || []).find((p) => p.id === id) || null;
+  }
+
+  /** 某项道行加成的当前等级 */
+  function perkLevel(s, id) {
+    return Math.max(0, Math.floor(rebirthState(s).perks[id] || 0));
+  }
+
+  /** 某项道行加成的当前累计效果（数值型） */
+  function perkValue(s, id) {
+    const p = perkById(id);
+    if (!p) return 0;
+    return perkLevel(s, id) * num(p.per, 0);
+  }
+
+  /** 升下一级需要的道行（已满级返回 0） */
+  function perkCost(s, id) {
+    const p = perkById(id);
+    if (!p) return 0;
+    const lv = perkLevel(s, id);
+    if (lv >= num(p.maxLevel, 0)) return 0;
+    return Math.ceil(num(p.cost, 0) * Math.pow(num(p.costGrowth, 1.8), lv));
+  }
+
+  /**
+   * 兵解可获得多少道行。
+   *
+   *   道行 = daoBase ×(1 + daoPerRun × 已兵解次数) ×(主动 1.0 / 被动 passiveDaoRatio)
+   *
+   * **刻意不含「资产总量」项**：否则玩家会先囤到天量资产再兵解，把转生变成
+   * 一次性的暴富操作，而不是一轮轮的节奏循环。收益只认境界与次数。
+   * 被动（渡劫失败）打三折：失败仍有收益以兑现「重启有得」，但显著低于主动兵解，
+   * 否则玩家会故意去渡劫失败刷道行。
+   */
+  function rebirthDaoGain(s, mode) {
+    const c = rebirthCfg();
+    const base = num(c.daoBase, 100);
+    const per = num(c.daoPerRun, 0.6);
+    const raw = base * (1 + per * rebirthCount(s));
+    const ratio = (mode === 'passive') ? num(c.passiveDaoRatio, 0.3) : 1;
+    return Math.max(0, Math.floor(raw * ratio));
+  }
+
+  /** 是否达到兵解门槛（二次确认属于界面层的事） */
+  function rebirthUnlocked(s) {
+    if (!rebirthCfg().implemented) return false;
+    const need = rebirthCfg().unlock || {};
+    return (s ? s.realm : 0) >= num(need.realm, 4);
+  }
+
+  function rebirthLockedReason(s) {
+    if (!rebirthCfg().implemented) return '转生系统未开放';
+    if (rebirthUnlocked(s)) return '';
+    const need = rebirthCfg().unlock || {};
+    return '需达到「' + realmName(num(need.realm, 4)) + '」才能兵解';
+  }
+
+  /**
+   * 兵解 —— 结束这一世，换取道行。
+   *
+   * 重置清单（与 config 的 rebirth.wipe 对齐）：
+   *   归零：境界 · 灵气 · 灵石 · 金钱 · 精力 · 投向分配 · 档位 · 当前工作
+   *   清空：公司（注册 / 产线 / 仓库 / 库存 / 全部统计）· 股市（持仓 / 成本 / 流 / 统计）
+   *   保留：功法本体 · 熟练度段位 · 被动常驻 · 工作履历 · 设备（吃转生折扣）·
+   *         playTime 与 gameSeconds（行情时钟与日期绝不允许倒退，否则抛压 / 冲击结算会错乱）
+   *
+   * @param {string} mode 'active' 主动兵解 | 'passive' 被动（渡劫失败，道行打三折）
+   */
+  /**
+   * 兵解 —— 主动与被动走的是同一段代码，差别只在**清到什么程度**。
+   *
+   *   主动（mode='active'）  需境界 ≥ 元婴；按 `rebirth.wipe` 清资产，保留功法/设备/履历
+   *   被动（mode='passive'） 渡劫失败强制触发，无境界要求；道行打三折；
+   *                          且当 `realm < tribulation.passiveRules.belowRealm`
+   *                          （元婴）时**额外清掉功法与设备**，等于这一世彻底白干
+   *
+   * 每个开关都挂在配置上（`rebirth.wipe` / `rebirth.passiveExtraWipe` /
+   * `tribulation.passiveRules`），改口径只动配置。
+   * 清单本身写在 game-config 的 `rebirth.wipe` 注释里，改代码前先对照那份清单，
+   * 避免又出现「新加了一个资源字段但忘了在兵解里清掉」。
+   */
+  function doRebirth(s, mode) {
+    const cfg = rebirthCfg();
+    if (!cfg.implemented) return { ok: false, msg: '转生系统未开放' };
+
+    const passive = (mode === 'passive');
+    if (!passive && !rebirthUnlocked(s)) {
+      return { ok: false, msg: rebirthLockedReason(s) || '尚未达到兵解条件' };
+    }
+
+    const wipe = cfg.wipe || {};
+    const rules = tribulationCfg().passiveRules || {};
+    const extra = cfg.passiveExtraWipe || {};
+    const belowRealm = num(rules.belowRealm, 4);
+    /**
+     * 被动兵解在元婴之下要「全清」。
+     * 注意方向：这是**在标准清空之外再加码**，不是替代 ——
+     * 元婴及以上的失败仍然保留设备与功法，只是道行打三折。
+     */
+    const fullWipe = passive
+      && rules.fullWipeBelow !== false
+      && num(s.realm, 0) < belowRealm;
+
+    const gain = rebirthDaoGain(s, mode);
+    const before = {
+      realm: s.realm,
+      realmName: realmName(s.realm),
+      money: s.money.toJSON(),
+      deviceCompute: totalCompute(s).toJSON(),
+    };
+
+    // ---- 1. 道行结算（先结，后面的重置不会动它）----
+    const st = rebirthState(s);
+    st.count += 1;
+    st.dao += gain;
+    st.daoTotal += gain;
+    st.history.push({
+      n: st.count,
+      realm: before.realm,
+      realmName: before.realmName,
+      dao: gain,
+      money: before.money,
+      gameSeconds: s.gameSeconds,
+      mode: passive ? 'passive' : 'active',
+      fullWipe: fullWipe,
+    });
+    // 历史只留最近 20 条，避免长线存档无限膨胀
+    if (st.history.length > 20) st.history = st.history.slice(-20);
+
+    // ---- 2. 修仙线（永远清）----
+    s.realm = 0;
+    s.qi = new D(0);
+    s.realmProgress = new D(0);
+    // 「最近一次渡劫结果」属于上一世，别让它跨世提示
+    const tst = tribulationState(s);
+    tst.won = null;
+    tst.lost = null;
+
+    // ---- 3. 功法 ----
+    // 默认只清熟练度进度（段位决定被动是否常驻，被动本身是永久资产）；
+    // 被动全清时会连本体一起抹掉。
+    if (fullWipe && extra.techniques !== false) {
+      s.learned = {};
+      s.technique = null;
+      s.cultivating = true;
+    } else if (wipe.techniqueProgress !== false) {
+      for (const id of Object.keys(s.learned)) {
+        const rec = s.learned[id];
+        if (rec) rec.mastery = 0;
+      }
+    }
+
+    // ---- 4. 本世累积的算力加成也要归零 ----
+    // aiBonus 是「AI 领域」逐 tick 累积出来的算力增量，性质上属于「这一世攒下的产能」，
+    // 与设备存量无关。不清它的话，兵解后 realCompute = 衰减后的设备算力 + 巨额 aiBonus，
+    // 照样秒回元婴 —— 这是「转生刹车失灵」的第二个来源（第一个是设备算力没压数量级）。
+    if (wipe.computeBonus !== false || fullWipe) {
+      s.aiBonus = new D(0);
+      s.investedCompute = new D(0);
+    }
+
+    // ---- 5. 设备（只有被动全清才会抹）----
+    if (fullWipe && extra.devices !== false) {
+      for (const dev of GAME.devices) s.devices[dev.id] = 0;
+    }
+
+    // ---- 6. 硬通货 ----
+    if (wipe.currency !== false || fullWipe) {
+      s.money = new D(GAME.base.startMoney);
+      s.spiritStone = new D(0);
+    }
+
+    // ---- 7. 投向分配与累计产出（回到「全修仙」，锁定项由 setAllocation 自动归零）----
+    if (wipe.invest !== false || fullWipe) {
+      for (const inv of GAME.investments) s.produced[inv.id] = new D(0);
+      setAllocation(s, {});
+    }
+
+    // ---- 8. 工作 ----
+    // 履历（jobDone / totalJobs）默认保留 —— 否则每一世都要重跑一整条升职链，
+    // 而那条链的解锁条件里带着「工作完成次数」，重跑一次要几十小时。
+    if (wipe.job !== false) {
+      s.jobId = GAME.jobs.length ? GAME.jobs[0].id : null;
+      s.jobProgress = 0;
+      s.working = true;
+    }
+    if (rules.keepJobHistory === false) {
+      for (const j of GAME.jobs) s.jobDone[j.id] = 0;
+      s.totalJobs = 0;
+      s.rushCount = 0;
+    }
+
+    // ---- 9. 公司：全清 ----
+    if (wipe.company !== false || fullWipe) {
+      const c = s.company;
+      c.founded = false;
+      c.foundedDay = null;
+      c.lines = {};
+      c.pending = {};
+      c.warehouseLevel = 0;
+      c.stock = {};
+      c.cycleProgress = 0;
+      c.cycles = 0;
+      c.autoSell = true;
+      c.goodsSold = {};
+      c.totalRevenue = new D(0);
+      c.totalUpkeep = new D(0);
+      c.pressure = {};
+      c.soldThisPeriod = {};
+      c.producedThisPeriod = {};
+      c.lastPeriod = {};
+      // 重新铺满「每条线 0 台」与「每种商品 0 件」的骨架
+      for (const l of GAME.company.lines) c.lines[l.id] = 0;
+      for (const g of GAME.company.goods) {
+        c.stock[g.id] = 0;
+        c.goodsSold[g.id] = 0;
+        c.pressure[g.id] = 0;
+        c.soldThisPeriod[g.id] = 0;
+        c.producedThisPeriod[g.id] = 0;
+        c.lastPeriod[g.id] = 0;
+      }
+    }
+
+    // ---- 10. 股市：全清 ----
+    if (wipe.stock !== false || fullWipe) {
+      const k = s.stock;
+      k.shares = {};
+      k.flow = {};
+      k.cost = {};
+      k.lastPeriod = {};
+      k.realized = new D(0);
+      k.totalFee = new D(0);
+      k.totalTrades = 0;
+      for (const x of GAME.stock.stocks) {
+        k.shares[x.id] = 0;
+        k.flow[x.id] = 0;
+        k.cost[x.id] = new D(0);
+      }
+    }
+
+    // ---- 11. 时间与派生量 ----
+    // 档位回落到最初一档（autoTier 保持开启，渡劫成功后会自动跟上）
+    if (wipe.timeTier !== false) {
+      s.timeTier = GAME.time.defaultTier;
+      s.autoTier = true;
+    }
+    // 快照兵解时的设备存量：转生衰减只压这份快照，
+    // 这一世之后新买的设备全额累加（买多少算力涨多少）。
+    snapshotRebirthBase(s);
+    // 注意：gameSeconds 与 playTime **绝不允许倒退** —— 前者是日期，后者是行情时钟
+    s.shenshi = totalShenshi(s);
+    s.realCompute = realComputeOf(s);
+    s.energy = maxEnergy(s);
+
+    return {
+      ok: true,
+      dao: gain,
+      count: st.count,
+      mode: passive ? 'passive' : 'active',
+      fullWipe: fullWipe,
+      discount: rebirthDiscount(s),
+      lost: before,
+    };
+  }
+
+  /**
+   * 用道行升一级永久加成。
+   * 每项都有硬上限（config.perks[].maxLevel）—— 转生是无限循环，没有上限的长线一定失控。
+   */
+  function buyPerk(s, id) {
+    const p = perkById(id);
+    if (!p) return { ok: false, msg: '加成不存在' };
+    const lv = perkLevel(s, id);
+    const maxLv = num(p.maxLevel, 0);
+    if (lv >= maxLv) return { ok: false, msg: '「' + p.name + '」已达上限 ' + maxLv + ' 级' };
+    const cost = perkCost(s, id);
+    const st = rebirthState(s);
+    if ((st.dao || 0) < cost) {
+      return { ok: false, msg: '道行不足（需要 ' + cost + '，当前 ' + Math.floor(st.dao || 0) + '）' };
+    }
+    st.dao = Math.floor(st.dao - cost);
+    st.perks[id] = lv + 1;
+    // 有些加成会改乘区，立刻刷新派生量
+    s.shenshi = totalShenshi(s);
+    s.realCompute = realComputeOf(s);
+    return { ok: true, id: id, name: p.name, level: lv + 1, cost: cost, daoLeft: st.dao };
+  }
+
+  /** 转生概览（界面与接口层共用） */
+  function rebirthSummary(s) {
+    const cfg = rebirthCfg();
+    if (!cfg.implemented) return null;
+    const st = rebirthState(s);
+    const perks = (cfg.perks || []).map((p) => {
+      const lv = perkLevel(s, p.id);
+      const maxLv = num(p.maxLevel, 0);
+      return {
+        id: p.id, name: p.name, desc: p.desc || '',
+        level: lv, maxLevel: maxLv, maxed: lv >= maxLv,
+        per: num(p.per, 0), unit: p.unit || '',
+        cost: perkCost(s, p.id),
+        /** 当前生效的总效果 */
+        value: lv * num(p.per, 0),
+      };
+    });
+    return {
+      implemented: true,
+      count: st.count,
+      dao: Math.floor(st.dao || 0),
+      daoTotal: Math.floor(st.daoTotal || 0),
+      discount: rebirthDiscount(s),
+      unlocked: rebirthUnlocked(s),
+      lockedReason: rebirthLockedReason(s),
+      /**
+       * 面板是否展开。
+       * 注意与 unlocked 的区别：unlocked 是「现在能不能执行兵解」（境界 ≥ 元婴），
+       * 而 visible 是「该不该给玩家看道行面板」—— 兵解之后境界会掉回凡人，
+       * 如果面板跟着锁上，玩家就看不到自己的道行、也花不掉它。
+       */
+      visible: rebirthUnlocked(s) || st.count > 0,
+      /** 现在兵解能拿多少道行 */
+      daoGain: rebirthDaoGain(s, 'active'),
+      /** 被动（渡劫失败）能拿多少 —— 主动的三折 */
+      daoGainPassive: rebirthDaoGain(s, 'passive'),
+      passiveRatio: num(cfg.passiveDaoRatio, 0.3),
+      /** 下一次兵解之后的衰减指数（用同一个函数算，避免界面与引擎给出两个数） */
+      nextDiscount: rebirthFactorAt(st.count + 1),
+      perks: perks,
+      history: st.history.slice(-8),
+    };
+  }
+
+  // ---- 道行加成落到「非转生」参数上的那几项（离线 / 股市费率）----
+  // 这三项原先写死在 GAME.offline / GAME.stock 里，现在由道行加成抬高/降低，
+  // 也顺手把手册里「离线收益可通过升级提高」那条久未实现的设计接通了。
+
+  /** 离线收益系数（基础 0.30 + 道行 · 离线延展，夹到 1.0） */
+  function offlineRatio(s) {
+    const c = GAME.offline || {};
+    const v = num(c.ratio, 0.3) + perkValue(s, 'offlineRatio');
+    return Math.max(0, Math.min(1, v));
+  }
+
+  /** 离线封顶时长（小时）= 基础 48 + 道行 · 离线恒长 */
+  function offlineMaxHours(s) {
+    const c = GAME.offline || {};
+    return Math.max(1, num(c.maxHours, 48) + perkValue(s, 'offlineHours'));
+  }
+
+  /** 股市单边手续费 = 基础 0.5% − 道行 · 市场人脉（保底 0.01%） */
+  function stockFee(s) {
+    const base = num(stockCfg().fee, 0.005);
+    const v = base - perkValue(s, 'marketFee');
+    return v > 0.0001 ? v : 0.0001;
   }
 
   // ============================================================
@@ -892,12 +2004,96 @@
   }
 
   /** 某功法当前解锁条件是否满足（除「第一本需先有设备」外的通用条件） */
+  /**
+   * 归一化功法的成就条件。
+   * 配置里允许两种写法（等价）：
+   *   cond: { devicesOwned: 2 }                 ← 紧凑式：键 = 类型，值 = 参数
+   *   cond: { type: 'devicesOwned', n: 2 }      ← 展开式
+   * 归一化后统一为展开式，判定与文案都只认这一种。
+   */
+  function techCondOf(tech) {
+    const raw = tech && tech.cond;
+    if (!raw || typeof raw !== 'object') return null;
+    if (raw.type) return raw;
+    const keys = Object.keys(raw);
+    if (keys.length !== 1) return null;
+    const type = keys[0];
+    const v = raw[type];
+    switch (type) {
+      case 'marketRevenue': case 'stockRealized': return { type: type, amount: v };
+      case 'pressurePeak':                        return { type: type, peak: v };
+      case 'warehouse':                           return { type: type, level: v };
+      default:                                    return { type: type, n: v };
+    }
+  }
+
+  /**
+   * 功法解锁条件是否达成（v3.4 扩展）。
+   *
+   * 两条路径：
+   *   a) 境界解锁 —— legacy 字段 `realm`（+ 可选 `compute`），除「天」级外
+   *      每个稀有度至少一本走这条路；
+   *   b) 行为成就 —— `cond: { type: ... }`，稀有度越高条件越苛刻
+   *      （首次赚钱 → 累计金额 → 操纵市场 / 兵解 / 渡劫…）。
+   *
+   * 所有条件都是**状态的纯函数读数**：不用随机、不依赖 UI，
+   * stepTick 与服务器各跑一份时判定必然一致。
+   */
   function techUnlockConditionMet(s, tech) {
     if (!tech) return false;
     if (s.realm < (tech.realm || 0)) return false;
     const need = tech.compute || 0;
     if (need > 0 && realComputeOf(s).lt(need)) return false;
-    return true;
+    const c = techCondOf(tech);
+    if (!c) return true;
+
+    const jobs = s.totalJobs || 0;
+    const devCount = (function () {
+      let n = 0;
+      for (const k of Object.keys(s.devices || {})) n += s.devices[k] || 0;
+      return n;
+    })();
+    const company = s.company || {};
+    const stock = s.stock || {};
+
+    switch (c.type) {
+      case 'jobsDone':      return jobs >= c.n;
+      case 'devicesOwned':  return devCount >= c.n;
+      case 'marketProfit':  return company.totalRevenue ? company.totalRevenue.gt(0) : false;
+      case 'marketRevenue': return company.totalRevenue ? company.totalRevenue.gte(c.amount) : false;
+      case 'stockProfit':   return stock.realized ? stock.realized.gt(0) : false;
+      case 'stockRealized': return stock.realized ? stock.realized.gte(c.amount) : false;
+      case 'trades':        return (stock.totalTrades || 0) >= c.n;
+      case 'pressurePeak':  return (company.peakPressure || 0) >= c.peak;
+      case 'companyCycles': return (company.cycles || 0) >= c.n;
+      case 'warehouse':     return (company.warehouseLevel || 0) >= c.level;
+      case 'tribulation':   return tribulationLevel(s) >= c.n;
+      case 'rebirth':       return rebirthCount(s) >= c.n;
+      case 'compute':       return realComputeOf(s).gte(c.n);
+      default:              return false;
+    }
+  }
+
+  /** 成就条件的**文案**（图鉴与锁定原因共用） */
+  function techCondText(tech) {
+    const c = techCondOf(tech);
+    if (!c) return '';
+    switch (c.type) {
+      case 'jobsDone':      return '完成工作 ≥ ' + c.n + ' 次';
+      case 'devicesOwned':  return '持有设备 ≥ ' + c.n + ' 台';
+      case 'marketProfit':  return '在市场赚到第一笔钱';
+      case 'marketRevenue': return '市场累计卖出收入 ≥ ' + fmtBig(c.amount);
+      case 'stockProfit':   return '在股市赚到第一笔钱';
+      case 'stockRealized': return '股市累计实现盈亏 ≥ ' + fmtBig(c.amount);
+      case 'trades':        return '股市成交 ≥ ' + c.n + ' 笔';
+      case 'pressurePeak':  return '市场抛压曾达到 ' + Math.round(c.peak * 100) + '%（清仓砸盘的痕迹）';
+      case 'companyCycles': return '公司运转 ≥ ' + c.n + ' 个生产周期';
+      case 'warehouse':     return '仓库扩容至 ' + c.level + ' 级';
+      case 'tribulation':   return '渡劫淬体 ≥ ' + c.n + ' 层';
+      case 'rebirth':       return '兵解 ≥ ' + c.n + ' 次';
+      case 'compute':       return '实际算力 ≥ ' + fmtBig(c.n);
+      default:              return '';
+    }
   }
 
   /** 未习得的原因（前端展示用） */
@@ -906,6 +2102,10 @@
     if (s.realm < (tech.realm || 0)) return '需达到「' + realmName(tech.realm) + '」';
     const need = tech.compute || 0;
     if (need > 0 && realComputeOf(s).lt(need)) return '需算力达到 ' + fmtBig(need);
+    const c = tech.cond;
+    if (c && !techUnlockConditionMet(s, tech)) {
+      return '条件：' + (techCondText(tech) || '未知的功法条件');
+    }
     return '';
   }
 
@@ -919,7 +2119,7 @@
   /** 习得一本功法（内部） */
   function grantTechnique(s, id) {
     if (s.learned[id]) return false;
-    s.learned[id] = { mastery: 0, tier: 0, passive: false };
+    s.learned[id] = { mastery: 0, tier: 0, passive: false, exp: 0, level: 0 };
     if (!s.technique) s.technique = id;
     return true;
   }
@@ -973,10 +2173,14 @@
   }
 
   /** 修炼速度（熟练度 / 现实秒）—— 受神识增幅，而修炼速度就是灵气提升速度 */
+  /**
+   * 功法修炼速度 = 基础速度 × 神识乘区（分层口径，与算力共用同一套系数）。
+   * 修炼速度就是灵气提升速度 —— 于是「神识 → 算力」与「神识 → 修炼」两条路
+   * 由同一套阻尼约束，不会出现「堵了一条、另一条照样爆」。
+   */
   function cultivateSpeed(s) {
     const c = GAME.techniques.cultivate;
-    const sh = totalShenshi(s);
-    return c.pointsPerSecond * (1 + sh * c.shenshiBonusPerPoint);
+    return num(c.pointsPerSecond, 1) * shenshiCultivateMultiplier(s);
   }
 
   /** 参悟一次的灵气消耗 = 当前境界突破所需灵气 × 比例 */
@@ -994,12 +2198,72 @@
   }
 
   /** 功法等级：由算力换算，无上限 */
+  /**
+   * 功法等级（v3.5）：**每本独立**，存在 `learned[id].level`，由经验累积升级，
+   * 不再由总算力全局换算 —— 否则「换一本功法 = 换一个等级」，玩家没法选择主修。
+   */
   function techLevel(s, tech) {
     if (!tech || !s.learned[tech.id]) return 0;
-    const c = realComputeOf(s).toNumber();
-    if (!(c > 0)) return 0;
-    const lv = Math.floor(Math.log10(1 + c) * GAME.techniques.level.logCoef);
-    return lv > 0 ? lv : 0;
+    const rec = s.learned[tech.id];
+    return rec.level > 0 ? rec.level : 0;
+  }
+
+  /** 功法经验配置（缺失给安全默认值） */
+  function techExpCfg() {
+    return GAME.techniques.level || {};
+  }
+
+  /** 升到 lv+1 级需要的经验 */
+  function techExpNeed(lv) {
+    const c = techExpCfg();
+    return num(c.expBase, 30) * Math.pow(num(c.expGrowth, 1.35), Math.max(0, lv || 0));
+  }
+
+  /**
+   * 挂机基础经验速率（exp / 现实秒）= expPerLog10 × log10(1 + 实际算力)。
+   * 算力跨 16 个数量级，取对数后是 0~16 的温和数字 —— 算力越高升得越快，
+   * 但不会出现「算力翻倍等级翻倍」的爆炸；配合 expGrowth 的指数需求，
+   * 等级成长是「越往后越慢、但永远在走」。
+   */
+  function techBaseExpRate(s) {
+    const c = techExpCfg();
+    const comp = realComputeOf(s).toNumber();
+    if (!(comp > 0)) return 0;
+    return num(c.expPerLog10, 1) * Math.log10(1 + comp);
+  }
+
+  /**
+   * 某本功法当前的经验速率 —— **只有当前修炼的那本 > 0**。
+   * 挂机基础（随算力）+ 功法算力投入（随投向份额）。
+   */
+  function techExpRateOf(s, tech) {
+    if (!tech || s.technique !== tech.id) return 0;
+    let rate = techBaseExpRate(s);
+    const inv = GAME.investments.find((i) => i.id === 'technique');
+    if (inv && investmentAvailable(s, inv)) {
+      rate += investOutput(s, inv).toNumber() * num(techExpCfg().expPerInvest, 1);
+    }
+    return rate;
+  }
+
+  /**
+   * 累加功法经验并处理升级（可一段 tick 连升多级）。返回升了的级数。
+   * 经验只进 `id` 这一本 —— 当前修炼哪本，哪本吃经验。
+   */
+  function addTechExp(s, id, gain) {
+    const rec = s.learned[id];
+    if (!rec || !(gain > 0)) return 0;
+    rec.exp = (rec.exp || 0) + gain;
+    let ups = 0;
+    let guard = 0;
+    while (guard++ < 1000) {
+      const need = techExpNeed(rec.level || 0);
+      if (rec.exp < need) break;
+      rec.exp -= need;
+      rec.level = (rec.level || 0) + 1;
+      ups += 1;
+    }
+    return ups;
   }
 
   /** 某功法主属性强度（灵气吸收速度加成，纯小数）。随等级与稀有度提升，无上限 */
@@ -1008,7 +2272,14 @@
     const r = rarityById(tech.rarity);
     const base = r ? r.mainQiSpeed : 0;
     const lv = techLevel(s, tech);
-    return base * (1 + lv * GAME.techniques.level.mainPerLevel);
+    // 熟练度段位也吃主属性：入门 0.5 → 圆满 1.0。
+    // 没有这一层，段位在修满（拿被动）之前只给一行文字，修炼毫无正反馈。
+    const m = GAME.techniques.masteryMain || {};
+    const mBase = num(m.base, 0.5);
+    const mPer = num(m.perTier, 0.1);
+    const rec = s.learned[tech.id];
+    const tier = rec ? Math.max(0, Math.min(5, Math.floor(num(rec.tier, 0)))) : 0;
+    return base * (1 + lv * GAME.techniques.level.mainPerLevel) * (mBase + mPer * tier);
   }
 
   /** 功法列表 + 各自状态（前端渲染用） */
@@ -1037,6 +2308,22 @@
         passiveActive: rec ? rec.passive : false,
         mainQiSpeed: rec ? techMainQiSpeed(s, t) : 0,
         lockedReason: rec ? '' : techLockedReason(s, t),
+        /** v3.5：独立经验进度（图鉴与功法阁都用） */
+        exp: rec ? (rec.exp || 0) : 0,
+        expNeed: rec ? techExpNeed(rec.level || 0) : 0,
+        expRate: rec ? techExpRateOf(s, t) : 0,
+        /** 成就条件的展示文案（图鉴用；境界/算力解锁的功法为空串） */
+        condText: techCondText(t),
+        /** 图鉴用完整解锁文案：境界 / 算力 / 行为成就三合一 */
+        unlockText: (function () {
+          const parts = [];
+          if (t.realm) parts.push('境界 · ' + realmName(t.realm));
+          if (t.compute) parts.push('算力 ≥ ' + fmtBig(t.compute));
+          const ct = techCondText(t);
+          if (ct) parts.push(ct);
+          if (!t.realm && !t.compute && !t.cond) parts.push('拥有第一台个人电脑');
+          return parts.join('　+　');
+        })(),
       };
     });
   }
@@ -1064,7 +2351,7 @@
     const owned = s.devices[dev.id] || 0;
     const base = new D(dev.cost).mul(D.pow(new D(dev.costGrowth), owned));
     const q = 1 + passiveBonus(s, 'deviceCost');
-    return base.mul(s.costDiscount).mul(q > 0 ? q : 0.01);
+    return base.mul(hardwareCostFactor(s, dev)).mul(q > 0 ? q : 0.01);
   }
 
   /** 计算某设备的灵石单价（科技修仙设备的双造价） */
@@ -1099,10 +2386,18 @@
    * 实际算力 —— 设备算力 + AI 加成，再乘神识乘区与功法被动乘区。
    * 神识放大了算力的「效果」，但不改变设备本身的算力。
    */
+  /**
+   * 实际算力 = (设备算力 × 转生衰减 + AI 加成) × 神识乘区 ×(1 + 功法被动算力加成)。
+   *
+   * 两处刻意：
+   *   a) 转生衰减只作用于**设备算力** —— AI 加成是「投向产出」，不是设备产能，不衰减。
+   *   b) 神识乘区走 shenshiComputeMultiplier 的分层公式（境界线性 × 设备对数收敛），
+   *      不再用「神识总量 × 固定系数」—— 那个口径在后期会爆炸。
+   */
   function realComputeOf(s) {
-    const base = D.add(totalCompute(s), s.aiBonus);
-    const shenshiMul = 1 + totalShenshi(s) * GAME.shenshi.computeBonusPerPoint;
-    const passiveMul = 1 + passiveBonus(s, 'compute');
+    const base = D.add(deviceComputeEffective(s), s.aiBonus);
+    const shenshiMul = shenshiComputeMultiplier(s);
+    const passiveMul = (1 + passiveBonus(s, 'compute')) * (1 + tribulationBonus(s, 'compute'));
     return base.mul(shenshiMul).mul(passiveMul);
   }
 
@@ -1112,7 +2407,11 @@
    * 精力耗尽、无法工作时，只有设备还在产钱。
    */
   function autoIncome(s) {
-    const base = D.add(totalCompute(s), s.aiBonus);
+    // 走 deviceComputeEffective：设备被动收益与「实际算力」共用同一份转生衰减。
+    // 早先这里直接读 totalCompute（原值），于是兵解之后 realCompute 掉下去了、
+    // 但挂机金钱收入还是兵解前的量级 —— 玩家几分钟就能把设备全买回来，
+    // 主线等于没重来。凡是「由设备算力派生出来的产出」都必须吃同一份衰减。
+    const base = D.add(deviceComputeEffective(s), s.aiBonus);
     if (base.lte(0)) return new D(0);
     const scaled = D.pow(base, GAME.base.incomeExponent);
     return scaled.mul(GAME.base.autoIncomePerCompute);
@@ -1132,15 +2431,18 @@
     const tech = currentTech(s);
     if (tech) m += techMainQiSpeed(s, tech);
 
-    m *= 1 + totalShenshi(s) * GAME.techniques.cultivate.shenshiBonusPerPoint;
+    // 神识乘区（分层口径）—— 与修炼速度同源，避免两处各有一套系数而漂移
+    m *= shenshiCultivateMultiplier(s);
 
-    const inv = GAME.investments.find((i) => i.id === 'technique');
-    if (inv && investmentAvailable(s, inv)) {
-      const out = investOutput(s, inv);
-      if (out.gt(0)) m += out.toNumber();
-    }
+    // 道行 · 灵气亲和：永久 +8% / 级，加在主循环最核心的环节上
+    m *= 1 + perkValue(s, 'qiSpeed');
+
+    // v3.5：「功法算力投入」不再直接加灵气倍率 —— 它的产出换算成**功法经验**，
+    // 只喂当前修炼的那本（见 stepTick 的功法经验段）。倍率由功法等级自己长。
 
     m *= 1 + passiveBonus(s, 'allOutput');
+    // 渡劫淬体 · 灵气吸收：每渡过一次 +6%，乘在主循环最核心的环节上
+    m *= 1 + tribulationBonus(s, 'qiSpeed');
     return m > 0 ? m : 0;
   }
 
@@ -1149,16 +2451,43 @@
     return GAME.investments.filter((inv) => investmentAvailable(s, inv));
   }
 
+  /**
+   * 是否已习得**任意**功法。
+   *
+   * 注意与 `s.technique` 的区别：那个字段是「当前正在修炼的那一本」。
+   * 早先「功法增幅」的解锁判定写的是 `!!s.technique`，于是出现两种错：
+   *   a) 玩家明明已经习得几本功法、只是没在修炼（s.technique 被置空），
+   *      界面却提示「未习得功法」；
+   *   b) 兵解之后 s.technique 归零，条目跟着锁上，而功法本体其实还在。
+   * 可用性应该只看「有没有学会」，不看「在不在修」。
+   */
+  function hasAnyTechnique(s) {
+    if (!s || !s.learned) return false;
+    for (const id of Object.keys(s.learned)) {
+      if (s.learned[id]) return true;
+    }
+    return false;
+  }
+
   /** 某投向是否所有条件都满足 */
   function investmentAvailable(s, inv) {
     if (!inv.locked) return true;
-    // 「功法增幅」需要先习得功法
-    if (inv.id === 'technique') return GAME.techniques.implemented && !!s.technique;
+    // 「功法增幅」需要先习得功法（任意一本，不必正在修炼）
+    if (inv.id === 'technique') return !!GAME.techniques.implemented && hasAnyTechnique(s);
     // 「工业产能」需要先成立公司 —— 没工厂就没有产能可分配
     if (inv.id === 'industry') {
       return !!GAME.company.implemented && companyFounded(s);
     }
     return false;
+  }
+
+  /** 某项投向的锁定原因（前端直接用，避免把「未成立公司」写成「未习得功法」） */
+  function investmentLockReason(s, inv) {
+    if (investmentAvailable(s, inv)) return '';
+    if (inv.lockReason) return inv.lockReason;
+    if (inv.id === 'technique') return '未习得功法';
+    if (inv.id === 'industry') return '未成立公司';
+    return '未解锁';
   }
 
   /**
@@ -1175,14 +2504,71 @@
     return effective.mul(inv.rate);
   }
 
-  /** 计算 hardware 投资带来的新折扣 */
-  function computeDiscount(s) {
-    const inv = GAME.investments.find((i) => i.id === 'hardware');
-    if (!inv) return 1;
-    const out = investOutput(s, inv);
-    if (out.lte(0)) return 1;
-    const d = 1 / (1 + out.toNumber());
-    return Math.max(inv.cap, d);
+  /**
+   * 投向的**可读产出** —— 换成本方向自己的量纲，专门给界面用。
+   *
+   * 为什么必须单独有这么一个函数：`investOutput` 返回的是「中间量」，
+   * 每个方向的量纲都不一样（修仙是灵气、AI 是算力增量、功法是倍率加项）。
+   * 早先界面直接 `fmt(investOutput) + ' / 秒'`，于是修仙方向显示的是
+   * **没乘灵气倍率的裸值** —— 玩家看到「28.9/秒」对着五百万的突破阈值，
+   * 自然觉得「这条线废了」，而实际入账要高几十倍。显示口径错比数值错更误导人。
+   *
+   *   修仙 → 灵气 / 现实秒（含灵气倍率；未习得功法时为 0，那本来就是硬门槛）
+   *   AI   → 算力 / 现实秒（已乘 aiToCompute）
+   *   金融 → 金钱 / 现实秒
+   *   硬件 → 累积议价值的**每秒增长**（不是折扣本身 —— 折扣按设备价稀释，
+   *          没有单一数字，界面用 hardwareCostFactor 按设备算）
+   *   功法 → 功法经验 / 现实秒（v3.5：只喂当前修炼的那本）
+   *   工业 → 工业算力池的规模
+   */
+  function investOutputRate(s, inv) {
+    const out = investOutput(s, inv).toNumber();
+    const unit = inv.unit || '';
+    if (unit === 'qi') return out * qiMultiplier(s);
+    if (unit === 'compute') return out * num(inv.aiToCompute, 0);
+    if (unit === 'discount') return out;
+    if (unit === 'techexp') return out * techExpCfg().expPerInvest;
+    if (unit === 'industrial') return industrialComputePool(s).toNumber();
+    return out;
+  }
+
+  /**
+   * hardware 累积折扣参数（v3.5）。配置缺失时给安全默认值。
+   */
+  function hardwareAccumCfg() {
+    const inv = GAME.investments.find((i) => i.id === 'hardware') || {};
+    const a = inv.accum || {};
+    return {
+      maxRed: num(a.maxRed, 0.6),
+      dilution: num(a.dilution, 0.5),
+    };
+  }
+
+  /** 累积议价值（D） */
+  function investedHardwareOf(s) {
+    return (s.investedHardware && typeof s.investedHardware.gt === 'function')
+      ? s.investedHardware : new D(0);
+  }
+
+  /**
+   * 单台设备的**造价系数**（1 = 原价，最低 1 − maxRed）。
+   *
+   *   折扣比例 = maxRed × X / (X + 该设备现价 × dilution)
+   *
+   * 用设备**自己的现价**做稀释基准：同样的累积值，对便宜设备接近软上限、
+   * 对贵设备几乎不打折 —— 「跟随设备价格稀释」，后期不会免费，
+   * 但只要持续投入，累积值总会追上当前档位的设备价。
+   * 灵石造价不参与折扣（灵石是另一条资源线，见 deviceStoneCost）。
+   */
+  function hardwareCostFactor(s, dev) {
+    const cfg = hardwareAccumCfg();
+    const X = investedHardwareOf(s).toNumber();
+    if (!(cfg.maxRed > 0) || !(X > 0) || !dev) return 1;
+    const owned = s.devices[dev.id] || 0;
+    const cost = new D(dev.cost).mul(D.pow(new D(dev.costGrowth), owned)).toNumber();
+    if (!(cost > 0)) return 1;
+    const red = cfg.maxRed * X / (X + cost * cfg.dilution);
+    return Math.max(1 - cfg.maxRed, 1 - red);
   }
 
   // ============================================================
@@ -1283,25 +2669,36 @@
     return f;
   }
 
-  /** 商品的变价周期（游戏秒）：科技类逐年，修仙类每 10 年 */
-  function goodsPeriodSeconds(good) {
-    return Math.max(1, (good.periodYears || 1) * SEC_PER_YEAR);
+  /**
+   * 行情时钟 —— 市场与股市的「期」都按**现实秒**计。
+   *
+   * 用 playTime（现实秒累计）而不是 gameSeconds：时间档位只该加速工作，
+   * 不该加速行情。否则档 4（1 秒 = 1 游戏月）下 1 游戏年只剩 12 现实秒，
+   * 抛压与股市冲击 4 期就衰减干净，「砸盘被压价 / 大单砸自己」的代价被档位抹掉。
+   */
+  function marketClock(s) {
+    return (s && s.playTime) || 0;
   }
 
-  /** 商品当前处于第几期 */
-  function goodsPeriod(good, gameSeconds) {
-    return Math.floor(Math.max(0, gameSeconds || 0) / goodsPeriodSeconds(good));
+  /** 商品的变价周期（**现实秒**）：科技类 60 秒，修仙类 600 秒 */
+  function goodsPeriodSeconds(good) {
+    return Math.max(1, good.periodSeconds || 60);
+  }
+
+  /** 商品当前处于第几期（按现实时间推进，与时间档位无关） */
+  function goodsPeriod(good, realSeconds) {
+    return Math.floor(Math.max(0, realSeconds || 0) / goodsPeriodSeconds(good));
   }
 
   /** 商品当前市价 */
-  function goodsPrice(good, gameSeconds) {
+  function goodsPrice(good, realSeconds) {
     if (!good) return new D(0);
-    return new D(good.basePrice).mul(goodsPriceFactor(good, goodsPeriod(good, gameSeconds)));
+    return new D(good.basePrice).mul(goodsPriceFactor(good, goodsPeriod(good, realSeconds)));
   }
 
   /** 相对上一期的涨跌：'up' / 'down' / 'flat' */
-  function goodsTrend(good, gameSeconds) {
-    const p = goodsPeriod(good, gameSeconds);
+  function goodsTrend(good, realSeconds) {
+    const p = goodsPeriod(good, realSeconds);
     if (p <= 0) return 'flat';
     const cur = goodsPriceFactor(good, p);
     const prev = goodsPriceFactor(good, p - 1);
@@ -1310,10 +2707,10 @@
     return 'flat';
   }
 
-  /** 距下次变价还剩多少游戏秒 */
-  function goodsNextChangeIn(good, gameSeconds) {
+  /** 距下次变价还剩多少现实秒 */
+  function goodsNextChangeIn(good, realSeconds) {
     const len = goodsPeriodSeconds(good);
-    const rem = Math.max(0, gameSeconds || 0) % len;
+    const rem = Math.max(0, realSeconds || 0) % len;
     return len - rem;
   }
 
@@ -1336,6 +2733,7 @@
       out.push({
         period: p,
         price: new D(good.basePrice).mul(goodsPriceFactor(good, p)),
+        /** 该期起点的时间戳（现实秒，与 marketClock 同口径） */
         t: p * len,
       });
     }
@@ -1345,12 +2743,12 @@
   /**
    * 以当前时间为基准，取前 past 期 ~ 后 future 期的走势（含当前期）。
    *
-   * 注意一个开局边界：修仙类商品每 10 游戏年才变一次价，游戏刚开始时序列里
+   * 注意一个开局边界：修仙类商品每 600 现实秒才变一次价，游戏刚开始时序列里
    * 只有「第 0 期」一个点，连不成线，折线图会整个空白。所以当窗口退化成单期
    * 时，向后补一期 —— 让图上至少有一条从基准价出发的线段。
    */
-  function goodsWindow(good, gameSeconds, past, future) {
-    const p = goodsPeriod(good, gameSeconds);
+  function goodsWindow(good, realSeconds, past, future) {
+    const p = goodsPeriod(good, realSeconds);
     const from = Math.max(0, p - (past || 0));
     let to = p + (future || 0);
     if (to <= from) to = from + 1;
@@ -1430,7 +2828,7 @@
   function marketImpactAt(s, good, period) {
     const pr = pressureOf(s, good.id);
     if (pr <= 0) return 1;
-    const cur = goodsPeriod(good, (s && s.gameSeconds) || 0);
+    const cur = goodsPeriod(good, marketClock(s));
     if (period < cur) return 1;
     const eff = pr * Math.pow(marketDecay(), period - cur);
     const impact = 1 - eff * (marketCfg().maxDrop || 0);
@@ -1449,20 +2847,21 @@
    *
    * 第三项是产业链传导：上游行业的商品涨了，本行业的售价按 pricePass 打折跟涨。
    * 传 s 才会算传导（不传就只算行情，用于纯价格序列推导）。
+   * realSeconds 省略时按 0 算（第 0 期 = 开市价）。
    */
-  function naturalPrice(good, gameSeconds, s) {
+  function naturalPrice(good, realSeconds, s) {
     if (!good) return new D(0);
-    const t = (gameSeconds === undefined || gameSeconds === null) ? 0 : gameSeconds;
+    const t = (realSeconds === undefined || realSeconds === null) ? 0 : realSeconds;
     const base = new D(good.basePrice).mul(goodsPriceFactor(good, goodsPeriod(good, t)));
     if (!s) return base;
     return base.mul(industryPriceIndex(s, good.industry));
   }
 
   /** 带上抛压与行业传导之后的市价 —— 前端展示与结算都应该用这个 */
-  function goodsPriceWith(s, good, gameSeconds) {
+  function goodsPriceWith(s, good, realSeconds) {
     if (!good) return new D(0);
-    const t = (gameSeconds === undefined || gameSeconds === null)
-      ? ((s && s.gameSeconds) || 0) : gameSeconds;
+    const t = (realSeconds === undefined || realSeconds === null)
+      ? marketClock(s) : realSeconds;
     const period = goodsPeriod(good, t);
     const natural = new D(good.basePrice).mul(goodsPriceFactor(good, period))
       .mul(s ? industryPriceIndex(s, good.industry) : 1);
@@ -1475,7 +2874,7 @@
   function marketDropRatio(s, good) {
     // 必须带 s：自然价含行业传导，不传 s 会算出「没有传导的自然价」，
     // 折价率就不再是纯粹的抛压幅度了。
-    const natural = naturalPrice(good, s.gameSeconds, s);
+    const natural = naturalPrice(good, marketClock(s), s);
     if (natural.lte(0)) return 0;
     const now = goodsPriceWith(s, good);
     const r = natural.sub(now).div(natural).toNumber();
@@ -1504,7 +2903,7 @@
 
   /** 以当前期为基准、前后各若干期的带抛压走势 */
   function goodsWindowWith(s, good, past, future) {
-    const p = goodsPeriod(good, (s && s.gameSeconds) || 0);
+    const p = goodsPeriod(good, marketClock(s));
     const from = Math.max(0, p - (past || 0));
     let to = p + (future || 0);
     if (to <= from) to = from + 1;
@@ -1537,7 +2936,7 @@
     const acc = { goods: 0, peak: 0, settled: {} };
 
     for (const g of GAME.company.goods) {
-      const cur = goodsPeriod(g, s.gameSeconds);
+      const cur = goodsPeriod(g, marketClock(s));
       const last = Math.max(0, Math.floor((c.lastPeriod && c.lastPeriod[g.id]) || 0));
       if (cur <= last) continue;
 
@@ -1558,6 +2957,8 @@
       acc.settled[g.id] = { pressure: pr, add: add, periods: n };
       if (pr > acc.peak) acc.peak = pr;
     }
+    // 记录历史最高抛压（只增不减）——「操控市场」类功法成就的达成凭据
+    if (acc.peak > (c.peakPressure || 0)) c.peakPressure = acc.peak;
     return acc;
   }
 
@@ -1571,7 +2972,7 @@
       const p = pressureOf(s, g.id);
       if (p > peak) peak = p;
       const drop = marketDropRatio(s, g);
-      const period = goodsPeriod(g, s.gameSeconds);
+      const period = goodsPeriod(g, marketClock(s));
       // 当前「未结算窗口」跨了几期 —— 用来把累计计数换算成每期均值
       const win = Math.max(1, period - Math.max(0, Math.floor((s.company.lastPeriod && s.company.lastPeriod[g.id]) || 0)));
       const soldRaw = (s.company.soldThisPeriod && s.company.soldThisPeriod[g.id]) || 0;
@@ -1590,7 +2991,7 @@
         // 抛压完全恢复到可忽略还需要几期
         recoverIn: p > 0 && d > 0 && d < 1 ? Math.ceil(Math.log(0.02) / Math.log(d)) : 0,
         price: goodsPriceWith(s, g),
-        naturalPrice: naturalPrice(g, s.gameSeconds, s),
+        naturalPrice: naturalPrice(g, marketClock(s), s),
         nextPeriod: period + 1,
       };
     });
@@ -1731,8 +3132,28 @@
 
   let _indDepth = 0;
 
-  /** 某行业当前的「价格倍数」= 该行业全部商品 现价/基准价 的平均值（1 = 平价） */
+  /**
+   * 某行业当前的「价格倍数」= 该行业全部商品 现价/基准价 的平均值（1 = 平价）。
+   *
+   * ⚠️ 这里的算法必须**显式把行业指数传进去**，不能直接调 `goodsPriceWith`。
+   *
+   * 原因：`goodsPriceWith` 内部会再调 `industryPriceIndex(本行业)` →
+   * `industryUpstreamRatio` → `industryPriceRatio(本行业)` → 又一个 `goodsPriceWith`……
+   * 每层展开成「6 件商品 × 上游数」，而深度守卫放到 8 层，实际展开量是 6^8 量级。
+   * 实测：修仙下游行业（洞天，基准价 4.5e10）单次推导 2.2ms —— 股市页每帧要对
+   * 50 只股票各推导一次自然价，于是整页被拖到 300ms 以上。**这就是「股市页卡顿」的根因**，
+   * 不是 DOM 也不是图表：是核心层的一个指数级自引用。
+   *
+   * 改成显式传 index 之后，递归只沿「本行业 → 它的上游」这条 DAG 向上走
+   * （上下游按 tier 严格递增，测试里有 noCycle 断言），一次调用只剩
+   * 「上游行业数 × 6 件商品」次运算。
+   */
   function industryPriceRatio(s, industryId) {
+    return industryPriceRatioWith(s, industryId, industryPriceIndex(s, industryId));
+  }
+
+  /** industryPriceRatio 的实际实现：index 由调用方给出，切断自引用 */
+  function industryPriceRatioWith(s, industryId, index) {
     const list = goodsOfIndustry(industryId);
     if (!list.length) return 1;
     if (_indDepth > 8) return 1;
@@ -1740,7 +3161,14 @@
     let sum = 0;
     try {
       for (const g of list) {
-        sum += goodsPriceWith(s, g).div(new D(g.basePrice)).toNumber();
+        const period = goodsPeriod(g, marketClock(s));
+        let p = new D(g.basePrice)
+          .mul(goodsPriceFactor(g, period))
+          .mul(index)
+          .mul(marketImpactAt(s, g, period));
+        const floor = marketFloorPrice(g);
+        if (p.lt(floor)) p = floor;
+        sum += p.div(new D(g.basePrice)).toNumber();
       }
     } finally {
       _indDepth -= 1;
@@ -2094,7 +3522,7 @@
     if (!companyFounded(s)) return null;
     if (!(dt > 0)) return null;
 
-    const eff = offline ? GAME.offline.ratio : 1;
+    const eff = offline ? offlineRatio(s) : 1;
     if (offline && GAME.offline.companyWhileOffline === false) return null;
 
     const c = s.company;
@@ -2213,14 +3641,14 @@
     return Math.max(1, Math.floor(stock.depth || 1));
   }
 
-  /** 股票的变价周期（游戏秒） */
+  /** 股票的变价周期（**现实秒**，与商品市场同一套口径） */
   function stockPeriodSeconds(stock) {
-    return Math.max(1, (stock.periodYears || 1) * SEC_PER_YEAR);
+    return Math.max(1, stock.periodSeconds || 60);
   }
 
-  /** 股票当前处于第几期 */
-  function stockPeriod(stock, gameSeconds) {
-    return Math.floor(Math.max(0, gameSeconds || 0) / stockPeriodSeconds(stock));
+  /** 股票当前处于第几期（按现实时间推进，与时间档位无关） */
+  function stockPeriod(stock, realSeconds) {
+    return Math.floor(Math.max(0, realSeconds || 0) / stockPeriodSeconds(stock));
   }
 
   /**
@@ -2339,10 +3767,10 @@
   }
 
   /** 不受玩家成交影响的「自然价」 */
-  function stockNaturalPrice(s, stock, gameSeconds) {
+  function stockNaturalPrice(s, stock, realSeconds) {
     if (!stock) return new D(0);
-    const t = (gameSeconds === undefined || gameSeconds === null)
-      ? ((s && s.gameSeconds) || 0) : gameSeconds;
+    const t = (realSeconds === undefined || realSeconds === null)
+      ? marketClock(s) : realSeconds;
     return stockNaturalAtPeriod(s, stock, stockPeriod(stock, t));
   }
 
@@ -2350,17 +3778,17 @@
   function stockImpactAtPeriod(s, stock, period) {
     const flow = stockFlow(s, stock.id);
     if (flow === 0) return 1;
-    const cur = stockPeriod(stock, (s && s.gameSeconds) || 0);
+    const cur = stockPeriod(stock, marketClock(s));
     if (period < cur) return 1;
     const dec = Math.pow(stockFlowDecay(), period - cur);
     return stockImpactAt(s, stock, stockShares(s, stock.id), flow * dec);
   }
 
   /** 当前成交价 = 自然价 × 冲击系数，并兜一道绝对下限 */
-  function stockPrice(s, stock, gameSeconds) {
+  function stockPrice(s, stock, realSeconds) {
     if (!stock) return new D(0);
-    const t = (gameSeconds === undefined || gameSeconds === null)
-      ? ((s && s.gameSeconds) || 0) : gameSeconds;
+    const t = (realSeconds === undefined || realSeconds === null)
+      ? marketClock(s) : realSeconds;
     const nat = stockNaturalAtPeriod(s, stock, stockPeriod(stock, t));
     const px = nat.mul(stockImpact(s, stock));
     const fl = nat.mul(stockCfg().floor || 0);
@@ -2369,7 +3797,7 @@
 
   /** 相对上一期的行情涨跌：'up' / 'down' / 'flat'（只看自然价，不看自己的冲击） */
   function stockTrend(s, stock) {
-    const p = stockPeriod(stock, (s && s.gameSeconds) || 0);
+    const p = stockPeriod(stock, marketClock(s));
     if (p <= 0) return 'flat';
     const cur = stockNaturalAtPeriod(s, stock, p).toNumber();
     const prev = stockNaturalAtPeriod(s, stock, p - 1).toNumber();
@@ -2378,10 +3806,28 @@
     return 'flat';
   }
 
-  /** 距下次变价还剩多少游戏秒 */
-  function stockNextChangeIn(stock, gameSeconds) {
+  /**
+   * 下一期的预计涨跌幅（%），给事件通知栏的「行情前瞻」用。
+   *
+   * 价格是确定性的（由「股票序号 + 期数」散列推导），所以下一期**能算出来** ——
+   * 这不是预测，是把已经定好的未来念出来。返回 null 表示算不出（新上市 / 配置缺失）。
+   *
+   * 刻意只看自然价、不含玩家自己的冲击：前瞻播报的是「行情」，不是「你的仓位」。
+   */
+  function stockForecastPct(s, stock) {
+    if (!stock || !s || !stockCfg().implemented) return null;
+    const p = stockPeriod(stock, marketClock(s));
+    const cur = stockNaturalAtPeriod(s, stock, p).toNumber();
+    if (!(cur > 0)) return null;
+    const next = stockNaturalAtPeriod(s, stock, p + 1).toNumber();
+    if (!Number.isFinite(next)) return null;
+    return (next / cur - 1) * 100;
+  }
+
+  /** 距下次变价还剩多少现实秒 */
+  function stockNextChangeIn(stock, realSeconds) {
     const len = stockPeriodSeconds(stock);
-    const rem = Math.max(0, gameSeconds || 0) % len;
+    const rem = Math.max(0, realSeconds || 0) % len;
     return len - rem;
   }
 
@@ -2405,7 +3851,7 @@
 
   /** 以当前期为基准、前后各若干期的走势（含当前期） */
   function stockWindow(s, stock, past, future) {
-    const p = stockPeriod(stock, (s && s.gameSeconds) || 0);
+    const p = stockPeriod(stock, marketClock(s));
     const from = Math.max(0, p - (past || 0));
     let to = p + (future || 0);
     if (to <= from) to = from + 1;
@@ -2431,7 +3877,21 @@
    * @returns {object} { ok, msg, shares, unitPrice, gross, fee, total, impact, natural, tooSmall }
    */
   function stockBuyQuote(s, stock, shares) {
-    const cfg = stockCfg();
+    if (!stock) return { ok: false, msg: '股票不存在' };
+    return stockBuyQuoteWith(s, stock, shares,
+      stockNaturalPrice(s, stock), stockFee(s), stockCfg());
+  }
+
+  /**
+   * stockBuyQuote 的实际实现：`nat` / `fee` 由调用方传入。
+   *
+   * 为什么要拆出来：`stockMaxBuy` 是一次二分查找（最多几十次迭代），
+   * 而自然价与手续费在整个查找过程中**完全不变**。早先每次迭代都重新推导
+   * 一遍自然价 —— 那是一条「行情因子 × 行业传导 × 公司联动」的链，
+   * 单次就要几十微秒，乘上迭代数就是毫秒级。股市页每帧要对 50 只股票各来一次，
+   * 每帧 30ms+ —— 这是「股市页卡顿」的第二个根因（第一个是行业传导的自引用）。
+   */
+  function stockBuyQuoteWith(s, stock, shares, nat, feeRate, cfg) {
     if (!stock) return { ok: false, msg: '股票不存在' };
     const want = Math.floor(Number(shares) || 0);
     if (!(want > 0)) return { ok: false, msg: '数量必须大于 0' };
@@ -2442,11 +3902,10 @@
       return { ok: false, msg: '超过流通盘上限（最多持有 ' + depth + ' 股）' };
     }
 
-    const nat = stockNaturalPrice(s, stock);
     const impact = stockImpactAt(s, stock, have + want, stockFlow(s, stock.id) + want);
     const unitPrice = nat.mul(impact);
     const gross = unitPrice.mul(want);
-    const fee = gross.mul(cfg.fee || 0);
+    const fee = gross.mul(feeRate);
     const total = gross.add(fee);
     return {
       ok: true, shares: want, unitPrice: unitPrice, gross: gross, fee: fee, total: total,
@@ -2471,7 +3930,7 @@
     const impact = stockImpactAt(s, stock, have - want, stockFlow(s, stock.id) - want);
     const unitPrice = nat.mul(impact);
     const gross = unitPrice.mul(want);
-    const fee = gross.mul(cfg.fee || 0);
+    const fee = gross.mul(stockFee(s));
     return {
       ok: true, shares: want, unitPrice: unitPrice, gross: gross, fee: fee,
       net: gross.sub(fee), impact: impact, natural: nat,
@@ -2492,19 +3951,23 @@
     let lo = 0;
     let hi = Math.max(0, depth - have);
     if (hi <= 0) return 0;
-    const first = stockBuyQuote(s, stock, 1);
-    if (!first.ok || first.total.gt(s.money)) return 0;
+    // 自然价与手续费在整个二分过程中不变 —— 提出来，别在每次迭代里重算
+    const nat = stockNaturalPrice(s, stock);
+    const feeRate = stockFee(s);
+    const cfg = stockCfg();
+    const q1 = stockBuyQuoteWith(s, stock, 1, nat, feeRate, cfg);
+    if (!q1.ok || q1.total.gt(s.money)) return 0;
 
     let guard = 0;
-    while (lo < hi && guard++ < 200) {
+    while (lo < hi && guard++ < 64) {
       const mid = Math.floor((lo + hi + 1) / 2);
-      const q = stockBuyQuote(s, stock, mid);
+      const q = stockBuyQuoteWith(s, stock, mid, nat, feeRate, cfg);
       if (q.ok && q.total.lte(s.money)) lo = mid;
       else hi = mid - 1;
     }
     guard = 0;
     while (lo > 0 && guard++ < 8) {
-      const q = stockBuyQuote(s, stock, lo);
+      const q = stockBuyQuoteWith(s, stock, lo, nat, feeRate, cfg);
       if (q.ok && q.total.lte(s.money)) break;
       lo -= 1;
     }
@@ -2593,7 +4056,7 @@
     const acc = { stocks: 0, peak: 0, settled: {} };
 
     for (const st of GAME.stock.stocks) {
-      const cur = stockPeriod(st, s.gameSeconds);
+      const cur = stockPeriod(st, marketClock(s));
       const last = Math.max(0, Math.floor((c.lastPeriod && c.lastPeriod[st.id]) || 0));
       if (cur <= last) continue;
 
@@ -2637,7 +4100,7 @@
       const cost = stockCost(s, st.id);
       const value = price.mul(shares);
       const pnl = shares > 0 ? value.sub(cost) : new D(0);
-      const period = stockPeriod(st, s.gameSeconds);
+      const period = stockPeriod(st, marketClock(s));
 
       // 「清仓可变现」——按真实卖出的报价算（含冲击与手续费）。
       // 它一定小于等于按现价算的市值：市值里含着你自己的买入冲击溢价，
@@ -2648,7 +4111,7 @@
         id: st.id, name: st.name, code: st.code, link: st.link || null,
         kind: st.kind || 'tech', sector: st.sector || null, business: st.business || '',
         basePrice: st.basePrice, depth: stockDepth(st),
-        periodYears: st.periodYears || 1,
+        periodSeconds: stockPeriodSeconds(st),
         period: period, nextPeriod: period + 1,
         price: price, naturalPrice: natural,
         /** 市值 = 现价 × 流通盘 —— 榜单排序的依据 */
@@ -2663,7 +4126,7 @@
         liquidateImpact: liq ? liq.impact : 1,
         flow: stockFlow(s, st.id),
         trend: stockTrend(s, st),
-        nextChangeIn: stockNextChangeIn(st, s.gameSeconds),
+        nextChangeIn: stockNextChangeIn(st, marketClock(s)),
         maxBuy: stockMaxBuy(s, st),
         unlocked: stockUnlocked(s),
       };
@@ -2691,7 +4154,7 @@
     }).slice(0, boardSize);
 
     return {
-      fee: cfg.fee || 0,
+      fee: stockFee(s),
       minOrder: cfg.minOrder || 0,
       flowDecay: stockFlowDecay(),
       maxRise: cfg.maxRise || 0,
@@ -2729,17 +4192,19 @@
    * 单段推进（内部使用）。dt 为现实秒，已被外层切分。
    * @returns {object} 本段收益
    */
-  function stepTick(s, dt, offline) {
-    const ratio = offline ? GAME.offline.ratio : 1;
+  function stepTick(s, dt, offline, autoTribulation) {
+    const ratio = offline ? offlineRatio(s) : 1;
     const speed = gameSecondsPerRealSecond(s);
+    /** 本段 tick 内是否允许自动渡劫（默认允许；浏览器端会显式关掉） */
+    const canTribulate = autoTribulation !== false;
 
     // 1. 游戏内时间推进
     const dtGame = dt * speed;
     s.gameSeconds += dtGame;
 
-    // 2. 精力恢复（现实时间，与档位无关）
+    // 2. 精力恢复（现实时间，与档位无关；**速度随境界提升**，见 energyRegen）
     const maxE = maxEnergy(s);
-    s.energy = Math.min(maxE, s.energy + dt * GAME.energy.regenPerSecond);
+    s.energy = Math.min(maxE, s.energy + dt * energyRegen(s));
 
     // 3. 神识 / 实际算力（每段先刷新，保证后续投向产出用的是最新值）
     s.shenshi = totalShenshi(s);
@@ -2750,14 +4215,18 @@
 
     // 5. 工作推进与结算
     const work = advanceWork(s, dtGame);
-    const moneyPassive = 1 + passiveBonus(s, 'money');
+    const moneyPassive = (1 + passiveBonus(s, 'money')) * (1 + tribulationBonus(s, 'money'));
     const allOut = 1 + passiveBonus(s, 'allOutput');
+    /** 灵石产出乘区（渡劫淬体 · 灵石产出） */
+    const stoneMul = 1 + tribulationBonus(s, 'stone');
     const qiMul = qiMultiplier(s);
 
     if (work.done > 0) {
       s.money = s.money.add(work.money.mul(ratio).mul(moneyPassive).mul(allOut));
       if (qiMul > 0 && work.spirit.gt(0)) s.qi = s.qi.add(work.spirit.mul(ratio).mul(qiMul));
-      if (allOut > 0 && work.stone.gt(0)) s.spiritStone = s.spiritStone.add(work.stone.mul(ratio).mul(allOut));
+      if (allOut > 0 && work.stone.gt(0)) {
+        s.spiritStone = s.spiritStone.add(work.stone.mul(ratio).mul(allOut).mul(stoneMul));
+      }
     }
 
     // 6. 设备被动收益
@@ -2765,7 +4234,7 @@
     s.money = s.money.add(auto);
 
     // 7. 科技修仙设备的灵石产出
-    const stoneOut = deviceStoneOutput(s).mul(dt * ratio).mul(allOut);
+    const stoneOut = deviceStoneOutput(s).mul(dt * ratio).mul(allOut).mul(stoneMul);
     if (stoneOut.gt(0)) s.spiritStone = s.spiritStone.add(stoneOut);
 
     // 8. 算力投向产出
@@ -2773,6 +4242,7 @@
     let financeGain = new D(0);
     let aiGain = new D(0);
 
+    let techExpFromInvest = 0;
     for (const inv of GAME.investments) {
       const out = investOutput(s, inv).mul(dt * ratio);
       if (out.lte(0)) continue;
@@ -2781,7 +4251,14 @@
       if (inv.id === 'finance') financeGain = financeGain.add(out);
       else if (inv.id === 'xiuxian') qiGain = qiGain.add(out);
       else if (inv.id === 'ai') aiGain = aiGain.add(out);
-      // 'technique' 的产出是倍率，已在 qiMultiplier 内生效，不再累加资源
+      else if (inv.id === 'hardware') {
+        // v3.5：hardware 产出累积进议价值 —— 永久压低设备造价。
+        // 拉没进度条只停止增长、不清空（见 hardwareCostFactor）。
+        s.investedHardware = investedHardwareOf(s).add(out);
+      } else if (inv.id === 'technique') {
+        // v3.5：功法算力投入的产出换算成功法经验（只喂当前修炼的那本）
+        techExpFromInvest += out.toNumber() * num(techExpCfg().expPerInvest, 1);
+      }
     }
 
     s.money = s.money.add(financeGain.mul(allOut));
@@ -2814,31 +4291,49 @@
       if (gain > 0) addMastery(s, s.technique, gain);
     }
 
-    // 11. hardware 折扣
-    s.costDiscount = computeDiscount(s);
-
-    // 12. 境界进度（允许一段 tick 内连续突破多级）—— 消耗灵气
-    let guard = 0;
-    let target = nextRealm(s);
-    while (target && target.need && s.qi.gte(target.need) && guard < 100) {
-      s.qi = s.qi.sub(target.need);
-      s.realm += 1;
-      // 突破后精力上限提高，当前精力按新上限补齐一部分
-      const newMax = maxEnergy(s);
-      if (s.energy < newMax) s.energy = Math.min(newMax, s.energy + (newMax - maxE));
-      guard += 1;
-      target = nextRealm(s);
-    }
-    if (target && target.need) {
-      s.realmProgress = s.qi.div(target.need);
-    } else {
-      s.realmProgress = new D(1);
+    // 10b. 功法经验（v3.5）—— **不依赖 cultivating 开关**：挂机就涨，
+    //      算力越高越快，只喂当前修炼的那本；兵解不清等级。
+    //      投向那份已在第 8 步算好（techExpFromInvest），这里补挂机基础。
+    if (s.technique) {
+      const expGain = techBaseExpRate(s) * dt * ratio + techExpFromInvest;
+      if (expGain > 0) addTechExp(s, s.technique, expGain);
     }
 
-    // 13. 突破后可能出现新的时间档位，自动跟随最高已解锁档位
-    if (s.timeTier < maxUnlockedTier(s) && s.autoTier !== false) {
-      s.timeTier = maxUnlockedTier(s);
+    // 12. 境界进度 —— 灵气满格之后**必须渡劫**才能升境（不再自动突破）
+    //
+    // 渡劫结果由 tribulationRoll 从「境界 / 已尝试次数 / 淬体层数 / 游戏内时间」
+    // 确定性推导，所以前端与服务端各跑一次 tick 会得到同一个结局。
+    //   · canTribulate = false（浏览器端）：只累进度条，把「要不要渡」留给界面，
+    //     实际渡劫走 /api/action 的服务端权威路径。
+    //   · 自动渡劫成功 → 继续尝试下一境（一段 tick 内可连渡）
+    //   · 自动渡劫失败 → 被动兵解，这一世已结束，本段 tick 立即停手，
+    //     否则会在同一段里拿着全新的状态反复硬闯。
+    if (canTribulate && s.autoTribulation !== false) {
+      if (tribulationCfg().implemented) {
+        let guard = 0;
+        while (tribulationReady(s) && guard < 8) {
+          const tr = doTribulation(s);
+          guard += 1;
+          if (!tr.ok || !tr.success) break;
+        }
+      }
     }
+
+    {
+      const target = nextRealm(s);
+      if (target && target.need) {
+        s.realmProgress = s.qi.div(target.need);
+        if (s.realmProgress.gt(1)) s.realmProgress = new D(1);
+      } else {
+        s.realmProgress = new D(1);
+      }
+    }
+
+    // 13. 时间档位完全由玩家在顶栏用四键控制（◀ / ▶⏸ / ▶▶ / ▶▶▶），
+    //     **不再自动跟随最高档**。早先有「autoTier 自动跳到最高已解锁档」的逻辑，
+    //     那时档 2 要炼气才解锁，跟着跳还算合理；现在「常速」从凡人就可用了，
+    //     自动跟随会让凡人开局就被顶到 1 秒 = 1 小时，凡人期的每一步都不再可感知。
+    //     想要最快，按一下 ▶▶▶ 就到 —— 明确的手动动作比隐式的自动跟随好。
 
     s.playTime += dt;
 
@@ -2885,7 +4380,10 @@
     let guard = 0;
     while (remain > 0 && guard < 100000) {
       const step = Math.min(remain, STEP_REAL_SECONDS);
-      const r = stepTick(s, step, offline);
+      // 渡劫是否允许在这段 tick 内自动触发。
+      // 浏览器端传 tribulation:false —— 它把渡劫留给服务端权威操作；
+      // 服务端（/api/load 的离线结算、/api/action 的前置推进）保持默认开启。
+      const r = stepTick(s, step, offline, opts.tribulation !== false);
       acc.money = acc.money.add(r.money);
       acc.spirit = acc.spirit.add(r.spirit);
       acc.stone = acc.stone.add(r.stone);
@@ -3058,7 +4556,7 @@
   function previewOffline(s, seconds, offline) {
     if (offline === undefined) offline = true;
     const capped = offline
-      ? Math.min(seconds, GAME.offline.maxHours * 3600)
+      ? Math.min(seconds, offlineMaxHours(s) * 3600)
       : seconds;
     const tmp = hydrate(serialize(s));
     const res = tick(tmp, capped, { offline: offline });
@@ -3104,18 +4602,21 @@
     maxEnergy,
     // 神识
     shenshiBase, shenshiDeviceMultiplier, totalShenshi,
+    shenshiParts, shenshiEffect, shenshiComputeMultiplier, shenshiCultivateMultiplier,
     // 工作
     jobById, jobDurationSeconds, jobDoneCount, jobUnlocked, lockedReason,
     jobIncome, setJob, setWorking, rushJob, advanceWork,
     // 功法
     techById, rarityById, masteryTierOf, masteryInfo, currentTech, techRecord,
-    techLearned, techUnlockConditionMet, techLockedReason, firstTechUnlocked,
+    techLearned, techUnlockConditionMet, techLockedReason, techCondText, firstTechUnlocked,
+    techExpCfg, techExpNeed, techBaseExpRate, techExpRateOf, addTechExp,
     learnTechniques, addMastery, cultivateSpeed, comprehendCost, comprehendGain,
     techLevel, techMainQiSpeed, techniqueList, passiveBonus,
     // 科技
     deviceCost, deviceStoneCost, totalCompute, deviceStoneOutput, realComputeOf,
     autoIncome, qiMultiplier,
-    allocatableInvestments, investmentAvailable, investOutput, computeDiscount,
+    allocatableInvestments, investmentAvailable, investmentLockReason,
+    investOutput, investOutputRate, hardwareCostFactor, investedHardwareOf, hasAnyTechnique,
     // 修仙
     realmInfo, nextRealm, techniqueUnlocked, spiritAllowed, fmtBig,
     // 公司（产业）
@@ -3140,10 +4641,24 @@
     stockPeriodSeconds, stockPeriod, stockFactor, stockLinkFactor,
     stockShares, stockFlow, stockCost, stockAvgCost, stockHeldRatio,
     stockImpact, stockImpactAt, stockNaturalPrice, stockPrice, stockTrend,
-    stockNextChangeIn, stockSeries, stockWindow,
+    stockNextChangeIn, stockSeries, stockWindow, stockForecastPct,
     stockHoldingValue, stockHoldingPnl,
     stockBuyQuote, stockSellQuote, stockMaxBuy,
     buyStock, sellStock, syncStocks, stockSummary,
+    // 行情时钟（现实秒）—— 前端算「距变价」进度条等要用
+    marketClock,
+    // 转生（兵解）
+    rebirthCfg, rebirthState, rebirthCount, rebirthDiscount, rebirthFactorAt,
+    rebirthAttenuate, rebirthComputeCap, deviceComputeEffective, rebirthSummary,
+    rebirthDaoGain, rebirthUnlocked, rebirthLockedReason, doRebirth,
+    perkById, perkLevel, perkValue, perkCost, buyPerk,
+    // 渡劫（突破境界的门槛）
+    tribulationCfg, tribulationState, tribulationLevel, tribulationBonus,
+    tribulationComputeBase, perfectedTechniqueCount, tribulationOdds,
+    tribulationReady, tribulationRoll, tribulationBoonSummary, tribulationSummary,
+    doTribulation, setAutoTribulation, energyRegen, setTimePaused,
+    // 道行加成落到的几个参数（离线 / 股市费率）
+    offlineRatio, offlineMaxHours, stockFee,
     // 主循环
     tick, buyDevice, setAllocation, setTechnique, setCultivating, comprehend,
     foundCompany, buyLine, upgradeWarehouse, sellGoods, setAutoSell,

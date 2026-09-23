@@ -26,9 +26,31 @@
   let chartStock = null;
   // 行情列表是否展开全部 50 家（默认只列市值前 10）
   let showAllStocks = false;
+  // 功法阁视图：'owned' 只显示已拥有（默认）| 'codex' 图鉴（全部 + 解锁条件）
+  let techView = 'owned';
+  // 功法列表 DOM 的重建签名 = 已拥有 id 串。变化才重建，其余帧只改数值。
+  let techListSig = '';
   // 每只股票的交易数量。必须缓存下来：列表每 100ms 重绘一次，
   // 若每次都用配置里的默认值回写输入框，玩家刚敲进去的数字会被冲掉。
   const stockQty = Object.create(null);
+  /**
+   * 买卖报价缓存。key = (期数 | 净买入流 | 持仓 | 手数 | 最小成交额)，
+   * 报价只由这几项决定；金钱只影响「够不够买」那一次比较，不进 key。
+   * 行情不动就一帧都不用重算 —— 报价要走行业传导链，50 只股票全量重算每帧要几毫秒。
+   */
+  const stockQuoteCache = Object.create(null);
+  /** 迷你走势图缓存。价格按「期」变，期内 SVG 是静止的，没换期就不重建。 */
+  const stockSparkCache = new Map();
+
+  /**
+   * 只在值变化时才写 DOM。
+   * 100ms 一帧的重绘里，绝大多数字段的值根本没变 —— 直接赋值也会让浏览器
+   * 把对应节点标记为脏、重新做样式与布局。先比对再写，是这里最便宜的一档优化。
+   */
+  function setT(el, prop, value) {
+    if (!el) return;
+    if (el[prop] !== value) el[prop] = value;
+  }
   let lastLocalTick = 0;
   let lastServerSave = 0;
   let saveTimer = null;
@@ -115,6 +137,15 @@
     const h = Math.floor(sec / 3600);
     const m = Math.floor((sec % 3600) / 60);
     return h + ' 时 ' + m + ' 分';
+  }
+
+  /** 变价周期（现实秒）→ 简洁文案："60 秒" / "10 分钟" / "1 小时" */
+  function fmtPeriod(sec) {
+    sec = Math.max(1, Math.round(Number(sec) || 0));
+    if (sec < 60) return sec + ' 秒';
+    if (sec % 3600 === 0) return (sec / 3600) + ' 小时';
+    if (sec % 60 === 0) return (sec / 60) + ' 分钟';
+    return fmtRealDuration(sec);
   }
 
   function fmtCount(n) {
@@ -241,17 +272,17 @@
   /**
    * 生成一段价格走势 SVG。
    * @param {object} good        商品配置
-   * @param {number} gameSeconds 当前游戏内时间
+   * @param {number} realClock   行情时钟（现实秒累计 = state.playTime）
    * @param {string} trend       'up' | 'down' | 'flat'（决定线条颜色，涨红跌绿）
    * @param {number} past        往前取几期
    * @param {number} future      往后推演几期（0 = 只画已发生）
    * @param {number} height      viewBox 高度
    */
-  function priceChartSVG(good, gameSeconds, trend, past, future, height) {
+  function priceChartSVG(good, realClock, trend, past, future, height) {
     const series = Core.goodsWindowWith(state, good, past, future);
     if (!series || series.length < 2) return '';
 
-    const curPeriod = Core.goodsPeriod(good, gameSeconds);
+    const curPeriod = Core.goodsPeriod(good, realClock);
     const vals = series.map((p) => p.price.toNumber());
     const baseVal = Number(good.basePrice) || vals[0];
 
@@ -337,11 +368,11 @@
    *   当前期与未来期按 flowDecay 逐期回到自然价 —— 于是玩家能一眼看出
    *   「行情本应值多少」以及「是我自己的买卖把它推歪了多少」。
    */
-  function stockChartSVG(stock, gameSeconds, trend, past, future, height) {
+  function stockChartSVG(stock, realClock, trend, past, future, height) {
     const series = Core.stockWindow(state, stock, past, future);
     if (!series || series.length < 2) return '';
 
-    const curPeriod = Core.stockPeriod(stock, gameSeconds);
+    const curPeriod = Core.stockPeriod(stock, realClock);
     const vals = series.map((p) => p.price.toNumber());
     const baseVal = Number(stock.basePrice) || vals[0];
 
@@ -567,6 +598,168 @@
   }
 
   // ============================================================
+  // 事件通知栏
+  // ============================================================
+
+  /**
+   * 页面最上方的播报条。
+   *
+   * 设计取舍：**事件在客户端生成，不进存档。**
+   * 所有事件的来源（自动卖出入账、投向调整、功法突破、渡劫、境界突破）
+   * 都能在两次渲染之间从 state 的差值里读出来 —— 公司收入看 totalRevenue 的增量、
+   * 段位看 learned[id].tier、境界看 realm。做成客户端观察器，就完全不用动
+   * 存档结构与后端防作弊清单（那些字段每一个都要配套「只增 / 夹取」逻辑）。
+   * 代价是刷新页面后历史清空 —— 通知本来就是「现在正在发生什么」，不是账本。
+   */
+  const EV_MAX = 40;
+  const events = [];
+  let lastEventAt = Date.now();
+  let evSeq = 0;
+  /** 观察快照：与上一帧比较用 */
+  const evSnap = {
+    realm: -1, techTiers: {}, learnedSet: null, revenue: null, autoSold: 0, alloc: {},
+  };
+  /** 自动卖出入账的聚合窗口：攒 6 秒报一次，不然每个生产周期（20s 内多次）都刷屏 */
+  let sellAccum = new (window.Decimal || Object)();
+  let sellAccumSince = 0;
+  const SELL_WINDOW_MS = 6000;
+  /** 多久没有新事件就开始播行情前瞻 */
+  const IDLE_FORECAST_MS = 20000;
+
+  function pushEvent(text, kind) {
+    const now = Date.now();
+    events.unshift({
+      id: ++evSeq, text: text, kind: kind || 'info',
+      at: now, game: Core.fmtGameDate(state.gameSeconds),
+    });
+    if (events.length > EV_MAX) events.length = EV_MAX;
+    lastEventAt = now;
+    renderEventBar();
+  }
+
+  function renderEventBar() {
+    const e = events[0];
+    if (!e) return;
+    const txtEl = $('ui-ev-text');
+    if (txtEl) txtEl.textContent = e.text;
+    const dot = $('ui-ev-dot');
+    if (dot) dot.className = 'ev-dot ' + (e.kind || 'info');
+    const cnt = $('ui-ev-count');
+    if (cnt) {
+      cnt.hidden = events.length <= 1;
+      cnt.textContent = events.length > 1 ? ('+' + (events.length - 1)) : '';
+    }
+  }
+
+  function renderEventHistory() {
+    const box = $('ev-history');
+    if (!box) return;
+    if (!events.length) {
+      box.innerHTML = '<div class="ev-row dim">还没有消息</div>';
+      return;
+    }
+    box.innerHTML = events.slice(0, 12).map((e) =>
+      '<div class="ev-row"><span class="ev-t">' + esc(e.game) + '</span>' +
+      '<span class="ev-m ' + (e.kind || 'info') + '">' + esc(e.text) + '</span></div>'
+    ).join('');
+  }
+
+  /**
+   * 两次渲染之间观察 state 的差值，生成事件。
+   * 在 tick 循环里每帧调用 —— 所有比较都是 O(小常数)。
+   */
+  function observeEvents() {
+    if (!state) return;
+    // 诊断计数器（保留）：播报不工作时，先看这三个数 —— 调用了多少帧、
+    // 距上次事件多久、前瞻函数给出什么。不用再猜「是不是没接线」。
+    window.__evDbg = window.__evDbg || { frames: 0, since: 0, forecast: null };
+    window.__evDbg.frames += 1;
+    window.__evDbg.since = Date.now() - lastEventAt;
+
+    // ---- 境界突破 ----
+    if (evSnap.realm >= 0 && state.realm > evSnap.realm) {
+      pushEvent('境界突破 → ' + realmNameOf(state.realm) +
+        '（全项基础加成提升，精力上限与恢复速度提高）', 'good');
+    }
+    evSnap.realm = state.realm;
+
+    // ---- 习得新功法（v3.4：功法扩到 41 本，习得值得播一条）----
+    {
+      const keys = Object.keys(state.learned || {});
+      if (evSnap.learnedSet) {
+        for (const id of keys) {
+          if (!evSnap.learnedSet[id]) {
+            const t = Core.techById(id);
+            if (t) pushEvent('习得功法：《' + t.name + '》（' + t.school + '）', 'good');
+          }
+        }
+      }
+      evSnap.learnedSet = {};
+      for (const id of keys) evSnap.learnedSet[id] = true;
+    }
+
+    // ---- 功法突破（熟练度段位提升）----
+    for (const id of Object.keys(state.learned || {})) {
+      const rec = state.learned[id];
+      if (!rec) continue;
+      const prev = evSnap.techTiers[id];
+      if (prev === undefined) { evSnap.techTiers[id] = rec.tier; continue; }
+      if (rec.tier > prev) {
+        const t = Core.techById(id);
+        const seg = Core.masteryInfo(rec.tier);
+        if (t) pushEvent('功法突破：《' + t.name + '》熟练度达到「' + seg.name + '」'
+          + (rec.passive ? '，被动已常驻' : ''), 'good');
+      }
+      evSnap.techTiers[id] = rec.tier;
+    }
+
+    // ---- 公司自动卖出入账（按窗口聚合）----
+    const rev = state.company && state.company.totalRevenue;
+    if (rev && rev.gt && evSnap.revenue && rev.gt(evSnap.revenue)) {
+      const d = rev.sub(evSnap.revenue);
+      sellAccum = sellAccum.add(d);
+      if (!sellAccumSince) sellAccumSince = Date.now();
+    }
+    evSnap.revenue = (state.company && state.company.totalRevenue) || null;
+    if (sellAccumSince && Date.now() - sellAccumSince >= SELL_WINDOW_MS) {
+      if (sellAccum.gt(0)) {
+        pushEvent('货物售出：入账 ' + fmt(sellAccum) + ' 金钱', 'money');
+      }
+      sellAccum = new (window.Decimal || Object)(0);
+      sellAccumSince = 0;
+    }
+
+    // ---- 投向比例调整 ----
+    const alloc = state.alloc || {};
+    for (const k of Object.keys(alloc)) {
+      const prev = evSnap.alloc[k];
+      const cur = alloc[k];
+      if (prev === undefined) { evSnap.alloc[k] = cur; continue; }
+      if (Math.abs(cur - prev) >= 0.005) {   // 变动 ≥ 0.5 个百分点才报
+        const inv = GAME.investments.find((i) => i.id === k);
+        if (inv) {
+          pushEvent('投向调整：' + inv.name + ' ' +
+            (cur > prev ? '+' : '−') + Math.abs((cur - prev) * 100).toFixed(0) +
+            '%（现为 ' + Math.round(cur * 100) + '%）', 'info');
+        }
+      }
+      evSnap.alloc[k] = cur;
+    }
+
+    // ---- 空闲播报：一段时间没有新事件，随机挑一家公司播下期预计涨跌 ----
+    if (Date.now() - lastEventAt >= IDLE_FORECAST_MS && GAME.stock &&
+        GAME.stock.implemented && GAME.stock.stocks.length) {
+      const st = GAME.stock.stocks[Math.floor(Math.random() * GAME.stock.stocks.length)];
+      const f = Core.stockForecastPct(state, st);
+      window.__evDbg.forecast = f;
+      if (f !== null) {
+        pushEvent('行情前瞻：' + st.name + '（' + st.code + '）下期预计 ' +
+          (f > 0 ? '+' : '') + f.toFixed(1) + '%', f > 0 ? 'good' : 'jade');
+      }
+    }
+  }
+
+  // ============================================================
   // 静态结构渲染（只做一次）
   // ============================================================
 
@@ -605,7 +798,7 @@
       '<div class="co-good-main">' +
         '<div class="co-good-title">' + esc(g.name) +
           '<span class="co-line-tag ' + kind + '">' + kindName + '</span>' +
-          '<span class="co-line-tag">每 ' + g.periodYears + ' 年变价</span>' +
+          '<span class="co-line-tag">每 ' + fmtPeriod(g.periodSeconds) + '变价</span>' +
         '</div>' +
         '<div class="co-good-meta" data-role="gmeta"></div>' +
         '<div class="co-press hidden" data-role="gpress">' +
@@ -661,26 +854,24 @@
   function pad2(n) { return n < 10 ? '0' + n : String(n); }
 
   function renderStatic() {
-    // ---- 时间档位 ----
-    $('tier-list').innerHTML = GAME.time.tiers.map((t) => {
-      const locked = state.realm < t.unlockRealm;
-      const needName = (GAME.realms[t.unlockRealm] || {}).name || '?';
-      return '<div class="tier-item' + (locked ? ' locked' : '') + '" data-tier="' + t.tier + '">' +
-        '<span class="t-name">' + esc(t.name) + '</span>' +
-        '<span class="t-label">' + esc(t.label) + '</span>' +
-        '<span class="t-lock">' + (locked ? esc(needName + '解锁') : '　') + '</span>' +
-      '</div>';
-    }).join('');
+    // 时间档位不再铺成列表 —— 顶栏的四键（◀ / ▶⏸ / ▶▶ / ▶▶▶）就是全部入口，
+    // 具体倍率看 clock-tier 上的数字。列表形式会让人以为那是「四套并存的档」。
 
-    $('tier-list').addEventListener('click', (e) => {
-      const item = e.target.closest('[data-tier]');
-      if (!item) return;
-      pickTier(parseInt(item.dataset.tier, 10));
-    });
+    // ---- 时间流速四键（顶栏）----
+    $('btn-tc-slower').addEventListener('click', tcSlower);
+    $('btn-tc-play').addEventListener('click', tcPlayPause);
+    $('btn-tc-faster').addEventListener('click', tcFaster);
+    $('btn-tc-max').addEventListener('click', tcMax);
 
-    $('chk-auto-tier').addEventListener('change', (e) => {
-      setAutoTier(e.target.checked);
-    });
+    // ---- 事件通知栏：点击展开 / 收起历史 ----
+    const evBar = $('event-bar');
+    if (evBar) {
+      evBar.addEventListener('click', () => {
+        const box = $('ev-history');
+        const open = box.classList.toggle('hidden');
+        if (!open) renderEventHistory();
+      });
+    }
 
     // ---- 工作列表 ----
     $('job-list').innerHTML = GAME.jobs.map((job, i) => {
@@ -739,22 +930,26 @@
     });
 
     // ---- 投向列表 ----
+    // 注意：这里**不能**用配置里的 `inv.locked` 决定置灰 —— 那只是「这一类需要条件」
+    // 的初始标记，真正的可用性由 Core.investmentAvailable 判定（功法算力投入要习得功法、
+    // 工业产能要成立公司），而且会在游戏过程中变化。锁定文案也要跟着变：
+    // 早先写死成「未习得功法」，工业产能未成立公司时也显示「未习得功法」，
+    // 玩家会以为自己做错了什么。两者都在 renderInvestPage 里逐帧校正。
     $('inv-list').innerHTML = GAME.investments.map((inv) => {
-      const locked = !!inv.locked;
-      return '<div class="inv-item' + (locked ? ' disabled' : '') + '" data-inv="' + inv.id + '">' +
+      return '<div class="inv-item" data-inv="' + inv.id + '">' +
         '<div class="inv-top">' +
           '<span class="inv-name">' + esc(inv.name) +
-            (locked ? '<span class="inv-lock-tag">未习得功法</span>' : '') + '</span>' +
+            '<span class="inv-lock-tag" data-role="locktag" hidden></span></span>' +
           '<span class="inv-pct" data-role="pct">0%</span>' +
         '</div>' +
         '<div class="inv-desc">' + esc(inv.desc) + '　<span style="color:var(--text-faint)">' +
           esc(inv.period) + '</span></div>' +
         '<div class="inv-controls">' +
-          '<input type="range" min="0" max="100" step="5" value="0" data-role="range"' +
-            (locked ? ' disabled' : '') + '>' +
+          '<input type="range" min="0" max="100" step="5" value="0" data-role="range">' +
         '</div>' +
         '<div class="inv-out">' +
-          '<span>产出：<span class="gain" data-role="out">0</span></span>' +
+          '<span><span data-role="outlabel">产出</span>：' +
+            '<span class="gain" data-role="out">0</span></span>' +
           '<span data-role="total">累计 0</span>' +
         '</div>' +
       '</div>';
@@ -768,26 +963,71 @@
     });
 
     // ---- 功法阁列表 ----
-    $('tech-list').innerHTML = GAME.techniques.list.map((t) => {
-      const r = GAME.techniques.rarities.find((x) => x.id === t.rarity) || {};
-      return '<div class="tech-item" data-tech="' + t.id + '">' +
-        '<span class="tech-rarity" data-rarity="' + esc(t.rarity) + '">' +
-          esc(r.name || '?') + '</span>' +
-        '<div class="tech-item-main">' +
-          '<div class="tech-item-title">' + esc(t.name) +
-            '<span class="tech-item-school">' + esc(t.school) + '</span></div>' +
-          '<div class="tech-item-desc">' + esc(t.desc) + '</div>' +
-          '<div class="tech-item-stats" data-role="tstats"></div>' +
-        '</div>' +
-        '<div class="tech-item-right" data-role="tright"></div>' +
-      '</div>';
-    }).join('');
-
+    // v3.4：列表只显示**已拥有**的功法，且随习得动态重建（见 renderTechniquePage）。
+    // 静态阶段不写内容 —— boot 时 state 已有，但之后每学会一本都要补行，
+    // 与其两头维护，不如把构建收敛到一个函数、按签名缓存。
     $('tech-list').addEventListener('click', (e) => {
       const item = e.target.closest('[data-tech]');
       if (!item || item.classList.contains('locked')) return;
       selectTechnique(item.dataset.tech);
     });
+
+    // ---- 已得 / 图鉴 视图切换 ----
+    const ownBtn = $('btn-tech-owned');
+    const codexBtn = $('btn-tech-codex');
+    if (ownBtn && codexBtn) {
+      const setView = (v) => {
+        techView = v;
+        techListSig = '';          // 强制下一帧重建
+        ownBtn.classList.toggle('ghost', v === 'codex');
+        codexBtn.classList.toggle('ghost', v === 'owned');
+        $('tech-list').classList.toggle('hidden', v === 'codex');
+        $('tech-codex').classList.toggle('hidden', v !== 'codex');
+        renderAll();
+      };
+      ownBtn.addEventListener('click', () => setView('owned'));
+      codexBtn.addEventListener('click', () => setView('codex'));
+    }
+
+    // ---- 功法图鉴：全部功法按稀有度分组，缺哪本、条件是什么一眼看全 ----
+    $('tech-codex').innerHTML = GAME.techniques.rarities.map((r) => {
+      const rows = GAME.techniques.list.filter((t) => t.rarity === r.id);
+      if (!rows.length) return '';
+      return '<div class="codex-group">' +
+        '<div class="codex-group-head">' +
+          '<span class="tech-rarity" data-rarity="' + esc(r.id) + '">' + esc(r.name) + '</span>' +
+          '<span class="codex-group-meta">主属性基值 ×' + r.mainQiSpeed + ' · 共 ' +
+            rows.length + ' 本</span>' +
+        '</div>' +
+        rows.map((t) => {
+          const pl = Object.keys(t.passive || {}).map((k) =>
+            esc(PASSIVE_LABEL[k] || k) + ' ' + fmtSignedPct(t.passive[k])).join('　');
+          // 解锁条件是配置派生的静态文案，直接嵌进 HTML —— 图鉴一切就有内容，
+          // owned 态由 CSS（.codex-item.owned .codex-cond）隐藏。
+          let cond;
+          if (t.cond) {
+            cond = '解锁：' + esc(Core.techCondText(t) || '未知条件');
+          } else if (t.realm || t.compute) {
+            const parts = [];
+            if (t.realm) parts.push('境界 · ' + esc(realmNameOf(t.realm)));
+            if (t.compute) parts.push('算力 ≥ ' + esc(Core.fmtBig(t.compute)));
+            cond = '解锁：' + parts.join('　+　');
+          } else {
+            cond = '解锁：拥有第一台个人电脑';   // 九章算经（firstUnlock）
+          }
+          return '<div class="codex-item" data-codex="' + t.id + '">' +
+            '<div class="tech-item-main">' +
+              '<div class="tech-item-title">' + esc(t.name) +
+                '<span class="tech-item-school">' + esc(t.school) + '</span></div>' +
+              '<div class="tech-item-desc">' + esc(t.desc) + '</div>' +
+              '<div class="codex-cond" data-role="ccond">' + cond + '</div>' +
+              '<div class="codex-passive">' + (pl || '<span class="off">无被动</span>') + '</div>' +
+            '</div>' +
+            '<div class="codex-state" data-role="cstate"></div>' +
+          '</div>';
+        }).join('') +
+      '</div>';
+    }).join('');
 
     // ---- 公司：生产线（每条线买下后，每一台都能单独选产物、调产能）----
     $('co-line-list').innerHTML = GAME.company.lines.map((l) => {
@@ -993,6 +1233,7 @@
     renderTop();
     renderTiers();
     renderRealmPage();
+    renderTribulationPage();
     renderWorkPage();
     renderTechPage();
     renderInvestPage();
@@ -1003,6 +1244,7 @@
     if (currentTab === 'market' || !firstRenderDone) renderMarketPage();
     if (currentTab === 'stock' || !firstRenderDone) renderStockPage();
     renderTechniquePage();
+    renderRebirthPage();
     firstRenderDone = true;
   }
   let firstRenderDone = false;
@@ -1033,39 +1275,29 @@
     const stoneRate = Core.deviceStoneOutput(state);
     setText('ui-spirit-sub', stoneRate.gt(0) ? fmtRate(stoneRate) : '购修仙设备');
 
-    const shBonusPct = Core.totalShenshi(state) * GAME.shenshi.computeBonusPerPoint * 100;
+    // 神识对算力的加成显示「实际乘区」而不是「总量 × 固定系数」——
+    // 后者在后期会明显偏大（分层阻尼后神识总量与实际乘区已经不是一个口径）
+    const shBonusPct = (Core.shenshiComputeMultiplier(state) - 1) * 100;
     setText('ui-shenshi-sub', '算力 +' + shBonusPct.toFixed(1) + '%');
 
     setText('ui-realm-top',  info.name);
     setText('ui-realm-prog', target.need ? pct(state.realmProgress) : '圆满');
 
-    // 游戏内时钟
+    // 游戏内时钟 + 时间流速四键状态
     setText('ui-clock', Core.fmtGameDate(state.gameSeconds));
-    setText('ui-clock-tier', Core.tierInfo(state.timeTier).label);
+    setText('ui-clock-tier', state.timePaused ? '已暂停' : Core.tierInfo(state.timeTier).label);
+    renderClockControls();
   }
 
+  /** 时间流速说明（境界页）—— 四键已搬到顶栏，这里只留当前档位与解锁提示 */
   function renderTiers() {
-    const items = $('tier-list').querySelectorAll('.tier-item');
-    for (let i = 0; i < items.length; i++) {
-      const t = parseInt(items[i].dataset.tier, 10);
-      const locked = state.realm < (GAME.time.tiers.find((x) => x.tier === t) || {}).unlockRealm;
-      items[i].classList.toggle('locked', locked);
-      items[i].classList.toggle('active', state.timeTier === t);
-    }
-
-    $('chk-auto-tier').checked = !!state.autoTier;
-    $('ui-tier-current').textContent = Core.tierInfo(state.timeTier).label;
-
+    setText('ui-tier-current',
+      (state.timePaused ? '已暂停' : Core.tierInfo(state.timeTier).label));
     const maxT = Core.maxUnlockedTier(state);
-    const cur = Core.tierInfo(state.timeTier);
-    if (state.realm >= GAME.realms.length - 1) {
-      $('ui-tier-hint').textContent = '已是最高档';
-    } else {
-      const nextLocked = GAME.time.tiers.find((x) => x.tier === maxT + 1);
-      $('ui-tier-hint').textContent = nextLocked
-        ? ('下一档：' + nextLocked.label + '（' + (GAME.realms[nextLocked.unlockRealm] || {}).name + '解锁）')
-        : '已是最高档';
-    }
+    const nextLocked = GAME.time.tiers.find((x) => x.tier === maxT + 1);
+    setText('ui-tier-hint', nextLocked
+      ? ('下一档：' + nextLocked.label + '（' + realmNameOf(nextLocked.unlockRealm) + '解锁）')
+      : '已解锁全部档位');
   }
 
   function renderRealmPage() {
@@ -1098,8 +1330,10 @@
 
   function renderWorkPage() {
     const job = Core.jobById(state.jobId);
-    const maxE = Core.maxEnergy(state);
-    const regen = GAME.energy.regenPerSecond;
+    // 精力一律按整数显示：上限带功法被动 / 渡劫淬体的百分比乘区，会出现 660.0000001
+    // 这类浮点尾巴，显示成小数只会让人困惑。计算照旧用全精度，只在显示层取整。
+    const maxE = Math.round(Core.maxEnergy(state));
+    const regen = Core.energyRegen(state);
 
     // ---- 精力 ----
     const eRatio = maxE > 0 ? Math.max(0, Math.min(1, state.energy / maxE)) : 0;
@@ -1107,7 +1341,8 @@
     fill.style.width = (eRatio * 100).toFixed(1) + '%';
     fill.classList.toggle('low', eRatio <= GAME.energy.lowRatio);
     $('ui-energy-val').textContent = Math.floor(state.energy) + ' / ' + maxE;
-    $('ui-energy-rate').textContent = '+' + regen.toFixed(1) + ' / 秒';
+    const regenTxt = regen % 1 === 0 ? String(regen) : regen.toFixed(1);
+    $('ui-energy-rate').textContent = '+' + regenTxt + ' / 秒';
 
     if (job) {
       $('ui-energy-next').textContent = '每份工作消耗 ' + job.energy + ' 点';
@@ -1261,9 +1496,10 @@
       }
 
       const discEl = el.querySelector('[data-role="disc"]');
-      if (state.costDiscount < 0.999) {
+      const costFactor = Core.hardwareCostFactor(state, dev);
+      if (costFactor < 0.999) {
         discEl.classList.remove('hidden');
-        discEl.textContent = '折 ' + (state.costDiscount * 100).toFixed(0) + '%';
+        discEl.textContent = '折 ' + ((1 - costFactor) * 100).toFixed(0) + '%';
       } else {
         discEl.classList.add('hidden');
       }
@@ -1274,6 +1510,41 @@
     }
   }
 
+  /**
+   * 投向的显示口径。
+   *
+   * 每个方向的产出量纲都不一样，必须**换成本方向的单位**再显示：
+   * 直接显示 investOutput（中间量）会让玩家以为「修仙方向每秒只给几十点灵气」，
+   * 而实际入账还要乘灵气倍率（功法主属性 × 神识 × 功法投向），能差一两个数量级。
+   */
+  function investDisplay(inv) {
+    const unit = inv.unit || '';
+    const rate = Core.investOutputRate(state, inv);
+    if (unit === 'qi') {
+      // 灵气是硬门槛：没有功法就没有灵气。这时显示「需先习得功法」比显示 0 更有用。
+      if (!Core.spiritAllowed(state)) return { label: '灵气 / 秒', text: '需先习得功法' };
+      return { label: '灵气 / 秒', text: fmt(new D(rate)) };
+    }
+    if (unit === 'compute') return { label: '算力 / 秒', text: '+' + fmt(new D(rate)) };
+    if (unit === 'money') return { label: '金钱 / 秒', text: '+' + fmt(new D(rate)) };
+    if (unit === 'discount') {
+      // v3.5：累积制 —— 显示「累积值 + 每秒增长」，折扣本身按设备逐台算（设备页「折 X%」）
+      const X = Core.investedHardwareOf(state);
+      return { label: '议价累积', text: fmt(X) + '（+' + fmt(new D(rate)) + ' / 秒）' };
+    }
+    if (unit === 'techexp') {
+      // 功法算力投入 → 经验/秒，只喂当前修炼的那本
+      const cur = Core.currentTech(state);
+      return cur
+        ? { label: '功法经验 / 秒', text: '+' + rate.toFixed(2) + ' → ' + cur.name }
+        : { label: '功法经验 / 秒', text: '0' };
+    }
+    return { label: '产出', text: fmt(new D(rate)) };
+  }
+
+  /** 这些投向的「产出」不是每秒资源，累计值没有意义，不显示 */
+  const INVEST_NO_TOTAL = { industrial: 1 };
+
   function renderInvestPage() {
     let allocSum = 0;
 
@@ -1283,6 +1554,15 @@
 
       const available = Core.investmentAvailable(state, inv);
       el.classList.toggle('disabled', !available);
+
+      // 锁定标签：文案由核心层给出（功法算力投入 = 未习得功法 / 工业产能 = 未成立公司），
+      // 条件满足后就地消失 —— 不能只在首次渲染时写死。
+      const tag = el.querySelector('[data-role="locktag"]');
+      if (tag) {
+        const reason = Core.investmentLockReason(state, inv);
+        tag.textContent = reason;
+        tag.hidden = !reason;
+      }
 
       const a = state.alloc[inv.id] || 0;
       if (available) allocSum += a;
@@ -1295,10 +1575,17 @@
 
       el.querySelector('[data-role="pct"]').textContent = available
         ? Math.round(a * 100) + '%' : '锁定';
-      el.querySelector('[data-role="out"]').textContent =
-        fmt(Core.investOutput(state, inv)) + ' / 秒';
-      el.querySelector('[data-role="total"]').textContent =
-        '累计 ' + fmt(state.produced[inv.id]);
+
+      const disp = investDisplay(inv);
+      el.querySelector('[data-role="outlabel"]').textContent = disp.label;
+      el.querySelector('[data-role="out"]').textContent = disp.text;
+
+      const totalEl = el.querySelector('[data-role="total"]');
+      if (INVEST_NO_TOTAL[inv.unit]) {
+        totalEl.textContent = '';
+      } else {
+        totalEl.textContent = '累计 ' + fmt(state.produced[inv.id]);
+      }
     }
 
     const sumEl = $('ui-alloc-sum');
@@ -1548,6 +1835,9 @@
   function renderMarketPage() {
     if (!GAME.company || !GAME.company.implemented) return;
     const founded = Core.companyFounded(state);
+    // id -> 商品配置。72 件商品逐行 find 是 O(n²)，每帧白扫五千多次 —— 用 Map 一次到位
+    const goodByIdMap = Object.create(null);
+    for (const g of GAME.company.goods) goodByIdMap[g.id] = g;
 
     // 走势图选中的商品：为空或已失效（配置改过）时回落到第一个
     if (!GAME.company.goods.some((g) => g.id === chartGood)) {
@@ -1610,12 +1900,12 @@
       const items = groups[gi].querySelectorAll('.co-good');
       for (let i = 0; i < items.length; i++) {
         const el = items[i];
-        const good = GAME.company.goods.find((x) => x.id === el.dataset.good);
+        const good = goodByIdMap[el.dataset.good];
         if (!good) continue;
 
         // 价格一律用带抛压的版本 —— 界面上看到的钱必须就是卖出能拿到的钱
         const price = Core.goodsPriceWith(state, good);
-        const trend = Core.goodsTrend(good, state.gameSeconds);
+        const trend = Core.goodsTrend(good, state.playTime);
         const pressure = Core.pressureOf(state, good.id);
         const drop = Core.marketDropRatio(state, good);
         if (pressure > peakPressure) peakPressure = pressure;
@@ -1625,45 +1915,63 @@
         const value = price.mul(stock);
         stockValue = stockValue.add(value);
 
-        el.querySelector('[data-role="gprice"]').textContent = fmt(price);
+        const period = Core.goodsPeriod(good, state.playTime);
+
+        setT(el.querySelector('[data-role="gprice"]'), 'textContent', fmt(price));
 
         // 涨红跌绿（中国习惯）
         const tEl = el.querySelector('[data-role="gtrend"]');
         const arrow = trend === 'up' ? '▲ 涨' : (trend === 'down' ? '▼ 跌' : '— 平');
-        tEl.className = 'trend ' + trend;
-        tEl.textContent = arrow + '　基准 ' + fmt(new D(good.basePrice));
+        setT(tEl, 'className', 'trend ' + trend);
+        setT(tEl, 'textContent', arrow + '　基准 ' + fmt(new D(good.basePrice)));
 
-        el.querySelector('[data-role="gmeta"]').innerHTML =
-          '距下次变价 ' + esc(Core.fmtGameDuration(Core.goodsNextChangeIn(good, state.gameSeconds))) +
-          '　累计卖出 ' + fmtCount(state.company.goodsSold[good.id] || 0) + ' 件';
+        setT(el.querySelector('[data-role="gmeta"]'), 'innerHTML',
+          '距下次变价 ' + esc(fmtRealDuration(Core.goodsNextChangeIn(good, state.playTime))) +
+          '　累计卖出 ' + fmtCount(state.company.goodsSold[good.id] || 0) + ' 件');
 
         // ---------- 抛压条 ----------
         const pressEl = el.querySelector('[data-role="gpress"]');
         if (pressEl) {
           pressEl.classList.toggle('hidden', pressure <= 0);
           const barEl = el.querySelector('[data-role="gpressbar"]');
-          if (barEl) barEl.style.width = Math.round(pressure * 100) + '%';
+          if (barEl) {
+            const w = Math.round(pressure * 100) + '%';
+            if (barEl.style.width !== w) barEl.style.width = w;
+          }
           const txtEl = el.querySelector('[data-role="gpresstxt"]');
           if (txtEl) {
-            txtEl.innerHTML = '已被压 −' + esc((drop * 100).toFixed(1)) + '%' +
-              '<span class="faint">　本应 ' + esc(fmt(Core.naturalPrice(good, state.gameSeconds, state))) +
-              '　卖出后下一期起跳</span>';
+            setT(txtEl, 'innerHTML', '已被压 −' + esc((drop * 100).toFixed(1)) + '%' +
+              '<span class="faint">　本应 ' + esc(fmt(Core.naturalPrice(good, state.playTime, state))) +
+              '　卖出后下一期起跳</span>');
           }
           pressEl.classList.toggle('warn', pressure >= ((GAME.company.market || {}).warnAt || 0.45));
         }
 
         el.classList.toggle('selected', good.id === chartGood);
 
-        // 行内迷你走势：只看已发生的期，不推演
+        // 行内迷你走势：只看已发生的期，不推演。
+        // 72 件商品各一张 SVG，期内静止 —— 按 (商品, 期, 有无抛压) 缓存，
+        // 没换期就不重建字符串、不让浏览器重新解析。
         const sparkEl = el.querySelector('[data-role="gspark"]');
-        if (sparkEl) sparkEl.innerHTML = priceChartSVG(good, state.gameSeconds, trend, 8, 0, 34);
+        if (sparkEl) {
+          const sKey = good.id + ':' + period + ':' + (pressure > 0 ? 1 : 0);
+          let svg = stockSparkCache.get(sKey);
+          if (svg === undefined) {
+            svg = priceChartSVG(good, state.playTime, trend, 8, 0, 34);
+            if (stockSparkCache.size > 300) stockSparkCache.clear();
+            stockSparkCache.set(sKey, svg);
+          }
+          if (sparkEl.innerHTML !== svg) sparkEl.innerHTML = svg;
+        }
 
         const nEl = el.querySelector('[data-role="gstock"]');
-        nEl.textContent = fmtCount(stock) + ' 件';
+        setT(nEl, 'textContent', fmtCount(stock) + ' 件');
         nEl.classList.toggle('zero', stock === 0);
-        el.querySelector('[data-role="gvalue"]').textContent = '市值 ' + fmt(value);
+        setT(el.querySelector('[data-role="gvalue"]'), 'textContent', '市值 ' + fmt(value));
 
-        el.querySelector('[data-role="gsell"]').disabled = !founded || stock <= 0;
+        const gs = el.querySelector('[data-role="gsell"]');
+        const gsd = !founded || stock <= 0;
+        if (gs.disabled !== gsd) gs.disabled = gsd;
       }
     }
 
@@ -1683,7 +1991,8 @@
         mktHint.textContent = '行情公开可看　·　成立公司后才能在市场里卖货';
       } else if (peakPressure <= 0) {
         mktHint.className = 'hint';
-        mktHint.textContent = '科技类逐年变价 · 修仙类每 10 年变价　·　无抛压';
+        const gp = (k) => fmtPeriod(((GAME.company.goods.find((x) => x.kind === k) || {}).periodSeconds) || 60);
+        mktHint.textContent = '科技类每 ' + gp('tech') + '变价 · 修仙类每 ' + gp('xiuxian') + '变价　·　无抛压';
       } else {
         const warnAt = (GAME.company.market || {}).warnAt || 0.45;
         mktHint.className = 'hint ' + (peakPressure >= warnAt ? 'err' : 'warn');
@@ -1697,27 +2006,26 @@
     const chartBody = $('mk-chart-body');
     if (cg && chartBody) {
       const span = 12;
-      const cTrend = Core.goodsTrend(cg, state.gameSeconds);
-      const cPeriod = Core.goodsPeriod(cg, state.gameSeconds);
-      const per = cg.periodYears || 1;
-      const yearOf = (n) => GAME.time.startYear + n * per;
+      const cTrend = Core.goodsTrend(cg, state.playTime);
+      const cPeriod = Core.goodsPeriod(cg, state.playTime);
+      const perSec = cg.periodSeconds || 60;
 
-      chartBody.innerHTML = priceChartSVG(cg, state.gameSeconds, cTrend, span, 8, 118);
+      chartBody.innerHTML = priceChartSVG(cg, state.playTime, cTrend, span, 8, 118);
       setText('ui-mk-chart-name', cg.name);
       setText('ui-mk-chart-tag',
-        esc(indName(cg.industry)) + ' · 每 ' + per + ' 年变价');
+        esc(indName(cg.industry)) + ' · 每 ' + fmtPeriod(perSec) + '变价');
 
       const cPrice = Core.goodsPriceWith(state, cg);
-      const cNatural = Core.naturalPrice(cg, state.gameSeconds, state);
+      const cNatural = Core.naturalPrice(cg, state.playTime, state);
       const cDrop = Core.marketDropRatio(state, cg);
       const cCost = Core.industryCostIndex(state, cg.industry);
       setText('ui-mk-chart-foot',
-        '时间轴 ' + yearOf(Math.max(0, cPeriod - span)) + ' ~ ' + yearOf(cPeriod + 8) +
-        ' 年（当前 ' + yearOf(cPeriod) + ' 年）　现价 ' + fmt(cPrice) +
+        '第 ' + Math.max(0, cPeriod - span) + ' ~ ' + (cPeriod + 8) +
+        ' 期（当前第 ' + cPeriod + ' 期）　现价 ' + fmt(cPrice) +
         (cDrop > 0.0005 ? '（自然价 ' + fmt(cNatural) + '，被抛压压低 ' + (cDrop * 100).toFixed(1) + '%）' : '') +
         '　基准 ' + fmt(new D(cg.basePrice)) +
         '　' + indName(cg.industry) + '成本 ×' + cCost.toFixed(2) +
-        '　距下次变价 ' + Core.fmtGameDuration(Core.goodsNextChangeIn(cg, state.gameSeconds)));
+        '　距下次变价 ' + fmtRealDuration(Core.goodsNextChangeIn(cg, state.playTime)));
     }
   }
 
@@ -1783,12 +2091,11 @@
     if (sel) {
       const st = Core.stockById(sel.id);
       const len = Core.stockPeriodSeconds(st);
-      const prog = len > 0 ? ((state.gameSeconds % len) / len) : 0;
+      const prog = len > 0 ? ((state.playTime % len) / len) : 0;
       $('ui-st-periodbar').style.width = (prog * 100).toFixed(1) + '%';
       $('ui-st-period-label').textContent =
-        '距离下次变价 ' + Core.fmtGameDuration(Core.stockNextChangeIn(st, state.gameSeconds));
-      $('ui-st-period').textContent = '第 ' + sel.period + ' 期 · ' +
-        (GAME.time.startYear + sel.period * (st.periodYears || 1)) + ' 年';
+        '距离下次变价 ' + fmtRealDuration(Core.stockNextChangeIn(st, state.playTime));
+      $('ui-st-period').textContent = '第 ' + sel.period + ' 期 · 每期 ' + fmtPeriod(len);
     }
 
     const peakEl = $('ui-st-peak');
@@ -1828,10 +2135,14 @@
       boardBtn.textContent = showAllStocks ? '只看市值前 10' : '显示全部 ' + sum.stocks.length + ' 家';
     }
 
+    // id -> 行对象。别用 Array.find：50 行 × 50 家的 O(n²) 每帧白扫两千多次。
+    const rowById = Object.create(null);
+    for (const x of sum.stocks) rowById[x.id] = x;
+
     const rows = $('st-list').querySelectorAll('.st-row');
     for (let i = 0; i < rows.length; i++) {
       const el = rows[i];
-      const row = sum.stocks.find((x) => x.id === el.dataset.stock);
+      const row = rowById[el.dataset.stock];
       if (!row) continue;
       const st = Core.stockById(row.id);
 
@@ -1845,18 +2156,18 @@
 
       const trend = row.trend;
       const tEl = el.querySelector('[data-role="sttrend"]');
-      tEl.className = 'trend ' + trend;
-      tEl.textContent = (trend === 'up' ? '▲ 涨' : (trend === 'down' ? '▼ 跌' : '— 平')) +
-        '　基准 ' + fmt(new D(row.basePrice));
+      setT(tEl, 'className', 'trend ' + trend);
+      setT(tEl, 'textContent', (trend === 'up' ? '▲ 涨' : (trend === 'down' ? '▼ 跌' : '— 平')) +
+        '　基准 ' + fmt(new D(row.basePrice)));
 
-      el.querySelector('[data-role="stprice"]').textContent = fmt(row.price);
+      setT(el.querySelector('[data-role="stprice"]'), 'textContent', fmt(row.price));
 
-      el.querySelector('[data-role="stmeta"]').innerHTML =
-        '距变价 ' + esc(Core.fmtGameDuration(row.nextChangeIn)) +
+      setT(el.querySelector('[data-role="stmeta"]'), 'innerHTML',
+        '距变价 ' + esc(fmtRealDuration(row.nextChangeIn)) +
         '　流通盘 ' + fmtCount(row.depth) + ' 股' +
         (rank > 0 ? '　市值 ' + esc(fmt(row.marketCap)) + ' · 第 ' + rank + ' 名' : '') +
         '　持仓占比 ' + esc(pct(row.heldRatio)) +
-        '　净买入流 ' + (row.flow > 0 ? '+' : '') + fmtCount(row.flow) + ' 股';
+        '　净买入流 ' + (row.flow > 0 ? '+' : '') + fmtCount(row.flow) + ' 股');
 
       // ---------- 冲击条 ----------
       const impEl = el.querySelector('[data-role="stimp"]');
@@ -1869,33 +2180,34 @@
         const barEl = el.querySelector('[data-role="stimpbar"]');
         if (barEl) {
           const full = pctv >= 0 ? (Number(sum.maxRise) || 1) : (Number(sum.maxDrop) || 1);
-          barEl.style.width = Math.round(Math.min(1, Math.abs(pctv) / full) * 100) + '%';
+          const w = Math.round(Math.min(1, Math.abs(pctv) / full) * 100) + '%';
+          if (barEl.style.width !== w) barEl.style.width = w;
         }
         const txtEl = el.querySelector('[data-role="stimptxt"]');
         if (txtEl) {
-          txtEl.innerHTML = (pctv >= 0 ? '买盘推高 +' : '卖盘压低 −') +
+          setT(txtEl, 'innerHTML', (pctv >= 0 ? '买盘推高 +' : '卖盘压低 −') +
             esc((Math.abs(pctv) * 100).toFixed(2)) + '%' +
             '<span class="faint">　自然价 ' + esc(fmt(row.naturalPrice)) +
-            '　逐期衰减回去</span>';
+            '　逐期衰减回去</span>');
         }
       }
 
       // ---------- 持仓 ----------
       const sEl = el.querySelector('[data-role="stshares"]');
-      sEl.textContent = fmtCount(row.shares) + ' 股';
+      setT(sEl, 'textContent', fmtCount(row.shares) + ' 股');
       sEl.classList.toggle('zero', row.shares <= 0);
-      el.querySelector('[data-role="stvalue"]').textContent = row.shares > 0
-        ? ('市值 ' + fmt(row.value)) : '未持仓';
+      setT(el.querySelector('[data-role="stvalue"]'), 'textContent', row.shares > 0
+        ? ('市值 ' + fmt(row.value)) : '未持仓');
 
       const pEl = el.querySelector('[data-role="stpnl"]');
       if (row.shares > 0) {
-        pEl.className = 'pnl ' + (row.liquidatePnl.isNeg() ? 'down' : 'up');
-        pEl.textContent = '可变现 ' + fmt(row.liquidateValue) + '　' +
+        setT(pEl, 'className', 'pnl ' + (row.liquidatePnl.isNeg() ? 'down' : 'up'));
+        setT(pEl, 'textContent', '可变现 ' + fmt(row.liquidateValue) + '　' +
           (row.liquidatePnl.isNeg() ? '' : '+') + fmt(row.liquidatePnl) +
-          '（' + fmtSignedPct(row.liquidatePnlRatio) + '）';
+          '（' + fmtSignedPct(row.liquidatePnlRatio) + '）');
       } else {
-        pEl.className = 'pnl';
-        pEl.textContent = '';
+        setT(pEl, 'className', 'pnl');
+        setT(pEl, 'textContent', '');
       }
 
       // ---------- 交易 ----------
@@ -1913,61 +2225,91 @@
         qtyEl.max = String(Math.max(1, row.depth));
       }
 
-      // 买入预览
-      const bq = Core.stockBuyQuote(state, st, qty);
+      // 买卖报价的输入只有「期数 / 净买入流 / 持仓 / 手数 / 最小成交额」。
+      // 报价要走行业传导链（不便宜），而这几项在绝大多数帧里根本不变 ——
+      // 按 key 缓存，行情没动就一帧都不用重算。（金钱只影响「够不够买」的判断，
+      // 那是后面一次比较，不进缓存键。）
+      const qKey = row.period + '|' + row.flow + '|' + row.shares + '|' + qty +
+        '|' + row.impactPct + '|' + sum.minOrder;
+      let qc = stockQuoteCache[row.id];
+      if (!qc || qc.key !== qKey) {
+        qc = {
+          key: qKey,
+          buy: Core.stockBuyQuote(state, st, qty),
+          sell: row.shares > 0
+            ? Core.stockSellQuote(state, st, Math.min(qty, row.shares)) : null,
+        };
+        stockQuoteCache[row.id] = qc;
+      }
+      const bq = qc.buy;
       const costEl = el.querySelector('[data-role="stcost"]');
       let buyOk = false;
       if (qty <= 0) {
-        costEl.className = 'st-trade-cost';
-        costEl.textContent = '输入股数';
+        setT(costEl, 'className', 'st-trade-cost');
+        setT(costEl, 'textContent', '输入股数');
       } else if (!bq.ok) {
-        costEl.className = 'st-trade-cost no';
-        costEl.textContent = bq.msg;
+        setT(costEl, 'className', 'st-trade-cost no');
+        setT(costEl, 'textContent', bq.msg);
       } else if (bq.tooSmall) {
-        costEl.className = 'st-trade-cost no';
-        costEl.textContent = '买额需 ≥ ' + fmt(new D(sum.minOrder));
+        setT(costEl, 'className', 'st-trade-cost no');
+        setT(costEl, 'textContent', '买额需 ≥ ' + fmt(new D(sum.minOrder)));
       } else if (bq.total.gt(state.money)) {
-        costEl.className = 'st-trade-cost no';
-        costEl.textContent = '买需 ' + fmt(bq.total) + ' · 金钱不足';
+        setT(costEl, 'className', 'st-trade-cost no');
+        setT(costEl, 'textContent', '买需 ' + fmt(bq.total) + ' · 金钱不足');
       } else {
-        costEl.className = 'st-trade-cost';
-        costEl.textContent = '买需 ' + fmt(bq.total) + ' · 均价 ' + fmt(bq.unitPrice);
+        setT(costEl, 'className', 'st-trade-cost');
+        setT(costEl, 'textContent', '买需 ' + fmt(bq.total) + ' · 均价 ' + fmt(bq.unitPrice));
         buyOk = true;
       }
 
       // 卖出预览（数量超过持仓时按持仓算，与内核的 clamp 一致）
       const sellable = Math.min(qty, row.shares);
-      const sq = sellable > 0 ? Core.stockSellQuote(state, st, sellable) : null;
+      const sq = qc.sell;
       const netEl = el.querySelector('[data-role="stnet"]');
       let sellOk = false;
       if (row.shares <= 0) {
-        netEl.className = 'st-trade-cost';
-        netEl.textContent = '未持仓';
+        setT(netEl, 'className', 'st-trade-cost');
+        setT(netEl, 'textContent', '未持仓');
       } else if (qty <= 0) {
-        netEl.className = 'st-trade-cost';
-        netEl.textContent = '输入股数';
+        setT(netEl, 'className', 'st-trade-cost');
+        setT(netEl, 'textContent', '输入股数');
       } else if (!sq || !sq.ok) {
-        netEl.className = 'st-trade-cost no';
-        netEl.textContent = (sq && sq.msg) || '无法卖出';
+        setT(netEl, 'className', 'st-trade-cost no');
+        setT(netEl, 'textContent', (sq && sq.msg) || '无法卖出');
       } else if (sq.tooSmall) {
-        netEl.className = 'st-trade-cost no';
-        netEl.textContent = '卖额需 ≥ ' + fmt(new D(sum.minOrder));
+        setT(netEl, 'className', 'st-trade-cost no');
+        setT(netEl, 'textContent', '卖额需 ≥ ' + fmt(new D(sum.minOrder)));
       } else {
-        netEl.className = 'st-trade-cost';
-        netEl.textContent = '卖得 ' + fmt(sq.net) +
+        setT(netEl, 'className', 'st-trade-cost');
+        setT(netEl, 'textContent', '卖得 ' + fmt(sq.net) +
           (sellable < qty ? '（按 ' + fmtCount(sellable) + ' 股）' : '') +
-          ' · 均价 ' + fmt(sq.unitPrice);
+          ' · 均价 ' + fmt(sq.unitPrice));
         sellOk = true;
       }
 
-      el.querySelector('[data-role="stbuy"]').disabled = !buyOk;
-      el.querySelector('[data-role="stsell"]').disabled = !sellOk;
-      el.querySelector('[data-role="stclose"]').disabled = row.shares <= 0;
-      el.querySelector('[data-role="stmax"]').disabled = row.maxBuy <= 0;
+      const bb = el.querySelector('[data-role="stbuy"]');
+      if (bb.disabled !== !buyOk) bb.disabled = !buyOk;
+      const bs = el.querySelector('[data-role="stsell"]');
+      if (bs.disabled !== !sellOk) bs.disabled = !sellOk;
+      const bc = el.querySelector('[data-role="stclose"]');
+      if (bc.disabled !== (row.shares <= 0)) bc.disabled = row.shares <= 0;
+      const bm = el.querySelector('[data-role="stmax"]');
+      if (bm.disabled !== (row.maxBuy <= 0)) bm.disabled = row.maxBuy <= 0;
 
-      // 行内迷你走势：只看已发生的期，不推演
+      // 行内迷你走势：只看已发生的期，不推演。
+      // 走势在「期」内是静止的（价格按期变），所以按 (股票, 期数, 有无冲击) 缓存 ——
+      // 没换期就完全不用重建 SVG 字符串，更不用让浏览器重新解析 50 段 SVG。
       const sparkEl = el.querySelector('[data-role="stspark"]');
-      if (sparkEl) sparkEl.innerHTML = stockChartSVG(st, state.gameSeconds, trend, 8, 0, 34);
+      if (sparkEl) {
+        const sKey = row.id + ':' + row.period + ':' + (row.flow !== 0 ? 1 : 0);
+        let svg = stockSparkCache.get(sKey);
+        if (svg === undefined) {
+          svg = stockChartSVG(st, state.playTime, trend, 8, 0, 34);
+          if (stockSparkCache.size > 300) stockSparkCache.clear();
+          stockSparkCache.set(sKey, svg);
+        }
+        if (sparkEl.innerHTML !== svg) sparkEl.innerHTML = svg;
+      }
     }
 
     // ---------- 行情概览提示 ----------
@@ -1986,23 +2328,354 @@
     const chartBody = $('st-chart-body');
     if (sel && chartBody) {
       const st = Core.stockById(sel.id);
-      chartBody.innerHTML = stockChartSVG(st, state.gameSeconds, sel.trend, 12, 8, 118);
+      // 大图与迷你图同一条缓存思路：期内静止，按 (股票, 期, 净买入流, 持仓) 缓存。
+      // 这张图有 20 个期点 + 自然价虚线，是整页最贵的一段 SVG，不缓存会每帧重建。
+      const cKey = sel.id + ':' + sel.period + ':' + sel.flow + ':' + sel.shares;
+      let csvg = stockSparkCache.get(cKey);
+      if (csvg === undefined) {
+        csvg = stockChartSVG(st, state.playTime, sel.trend, 12, 8, 118);
+        if (stockSparkCache.size > 300) stockSparkCache.clear();
+        stockSparkCache.set(cKey, csvg);
+      }
+      if (chartBody.innerHTML !== csvg) chartBody.innerHTML = csvg;
 
       setText('ui-st-chart-name', sel.name + '　' + sel.code);
       const good = sel.link ? Core.goodById(sel.link) : null;
       setText('ui-st-chart-tag',
-        (good ? '联动 · ' + good.name : '独立行情') + ' · 每 ' + (sel.periodYears || 1) + ' 年变价');
+        (good ? '联动 · ' + good.name : '独立行情') + ' · 每 ' + fmtPeriod(sel.periodSeconds) + '变价');
 
       let foot = '第 ' + Math.max(0, sel.period - 12) + ' ~ ' + (sel.period + 8) +
         ' 期（当前第 ' + sel.period + ' 期）　成交价 ' + fmt(sel.price) +
         '　自然价 ' + fmt(sel.naturalPrice) +
         '　基准 ' + fmt(new D(sel.basePrice)) +
-        '　距变价 ' + Core.fmtGameDuration(sel.nextChangeIn);
+        '　距变价 ' + fmtRealDuration(sel.nextChangeIn);
       if (Math.abs(sel.impactPct) > 1e-6) {
         foot += '　' + (sel.impactPct > 0 ? '你的买盘把成交价推高 ' : '你的卖盘把成交价压低 ') +
           (Math.abs(sel.impactPct) * 100).toFixed(2) + '%（会逐期衰减回去）';
       }
       setText('ui-st-chart-foot', foot);
+    }
+  }
+
+  // ============================================================
+  // 渡劫
+  // ============================================================
+
+  /** 境界名（核心层没有导出 realmName，这里直接从配置取，避免再造一份表） */
+  function realmNameOf(idx) {
+    const r = GAME.realms[idx];
+    return r ? r.name : ('境界 ' + idx);
+  }
+
+  /**
+   * 渡劫面板。
+   *
+   * 成功率必须**拆开显示**：只给一个总数，玩家不知道「再堆一点算力能不能换 3 个点」，
+   * 也就无从准备 —— 而「准备」是这个系统唯一的玩法。四项里有三项是玩家能主动提的：
+   * 算力冗余（买设备）、功法造诣（修满功法）、道行底蕴（累计转生）。
+   */
+  function renderTribulationPage() {
+    const cfg = GAME.tribulation;
+    if (!cfg || !cfg.implemented) return;
+    const s = Core.tribulationSummary(state);
+    if (!s) return;
+
+    const maxLv = s.maxLevel || 40;
+    setText('ui-tb-level', String(s.level));
+    setText('ui-tb-max', ' / ' + maxLv + ' 层');
+    setText('ui-tb-attempts', fmtCount(s.attempts));
+    setText('ui-tb-failures', fmtCount(s.failures));
+
+    const chk = $('chk-auto-tribulation');
+    if (chk && document.activeElement !== chk) chk.checked = s.auto !== false;
+
+    const atMax = s.atMax;
+    const ready = s.ready;
+    setText('ui-tb-rate', atMax ? '已至最高境界' : (s.odds.rate * 100).toFixed(1) + '%');
+    setText('ui-tb-hint', atMax
+      ? '已至元婴 —— 本作最高境界；再往前只能兵解重来'
+      : (ready ? '灵气已满 —— 可以渡劫了' : '灵气满格之后，须渡劫方能升境'));
+
+    const btn = $('btn-tribulation');
+    if (btn) {
+      btn.disabled = !ready;
+      btn.textContent = atMax ? '无劫可渡'
+        : (ready ? ('渡劫 → ' + realmNameOf(s.odds.nextRealm)) : '渡劫（灵气未满）');
+    }
+
+    // ---------- 成功率构成 ----------
+    const o = s.odds;
+    const P = cfg.prepare || {};
+    const rows = [
+      ['境界基础', o.base, 1],
+      ['算力冗余', o.computeAdd, P.computeCap || 0.15],
+      ['功法造诣', o.perfectAdd, P.perfectCap || 0.1],
+      ['道行底蕴', o.daoAdd, P.daoCap || 0.08],
+    ];
+    let html = rows.map((r) => {
+      const k = r[0], v = r[1], cap = r[2];
+      const w = cap > 0 ? Math.min(1, v / cap) : 0;
+      return '<div class="tb-odd-row">' +
+        '<span class="k">' + esc(k) + '</span>' +
+        '<span class="v ' + (v > 0 ? 'pos' : 'zero') + '">' +
+          (v > 0 ? '+' + (v * 100).toFixed(1) + '%' : '—') + '</span>' +
+        '<span class="bar"><i style="width:' + Math.round(w * 100) + '%"></i></span>' +
+      '</div>';
+    }).join('');
+    html += '<div class="tb-odd-row total">' +
+      '<span class="k">合计成功率</span>' +
+      '<span class="v">' + (o.rate * 100).toFixed(1) + '%</span>' +
+      '<span class="bar"><i style="width:' + Math.round(o.rate * 100) + '%"></i></span>' +
+    '</div>';
+    html += '<div class="dim" style="font-size:11px;margin-top:7px">' +
+      '算力冗余基准 ' + Core.fmtBig(o.computeBase) +
+      '（当前实际算力是它的 10^' + o.decades.toFixed(2) + ' 倍，每高 10 倍 +' +
+      ((P.computePerDecade || 0.03) * 100).toFixed(0) + '%）' +
+      '　已修满功法 ' + o.perfectCount + ' 本（上限 +' +
+      ((P.perfectCap || 0.1) * 100).toFixed(0) + '%）' +
+      '　累计道行 ' + fmtCount(o.daoTotal) +
+    '</div>';
+    if ($('ui-tb-odds').innerHTML !== html) $('ui-tb-odds').innerHTML = html;
+
+    // ---------- 渡劫淬体加成 ----------
+    const bl = s.boons.map((b) =>
+      '<span class="tb-boon">' + esc(b.name) +
+        ' <b>+' + (b.value * 100).toFixed(0) + '%</b>' +
+        '<span class="dim">（每层 +' + (b.per * 100).toFixed(0) + '%）</span></span>'
+    ).join('');
+    if ($('ui-tb-boons').innerHTML !== bl) $('ui-tb-boons').innerHTML = bl;
+  }
+
+  // ============================================================
+  // 兵解 · 转生
+  // ============================================================
+
+  /**
+   * 下一次兵解之后的转生折扣。
+   * 界面文案与确认弹窗共用，避免两处各算一遍导致数字不一致。
+   */
+  function nextRebirthFactor() {
+    return Core.rebirthFactorAt(Core.rebirthCount(state) + 1);
+  }
+
+  /** 当前有效设备算力（已应用转生衰减）—— 用于把「压掉几个数量级」讲成人话 */
+  function effectiveDeviceCompute() {
+    return Core.deviceComputeEffective(state);
+  }
+
+  /**
+   * 转生面板。
+   *
+   * 关键约定：这里**不自己算**道行、折扣、升级成本 —— 全部走 Core 的同名函数。
+   * 界面、引擎、服务端共用同一份口径，否则会出现「界面说能拿 100，服务端只给 60」
+   * 这类对不上账的问题（与市场价、股市报价同一条纪律）。
+   */
+  function renderRebirthPage() {
+    const rbCfg = GAME.rebirth;
+    if (!rbCfg || !rbCfg.implemented) return;
+
+    const unlocked = Core.rebirthUnlocked(state);
+    // 面板显示条件放宽：已兵解过就展开（兵解后境界会掉回凡人，
+    // 若面板跟着锁上，玩家既看不到道行也花不掉它）。
+    const visible = unlocked || Core.rebirthCount(state) > 0;
+    $('rb-lock').classList.toggle('hidden', visible);
+    $('rb-main').classList.toggle('hidden', !visible);
+
+    if (!visible) {
+      $('ui-rb-lock').textContent = Core.rebirthLockedReason(state) || '尚未达到兵解条件';
+      $('ui-rb-hint').textContent = '元婴之后，才有资格谈重塑';
+      return;
+    }
+
+    // 按钮：达不到门槛时禁用并说明原因（面板仍然展开，道行照花）
+    const rbBtnEl = $('btn-rebirth');
+    if (rbBtnEl) {
+      rbBtnEl.disabled = !unlocked;
+      rbBtnEl.textContent = unlocked ? '兵解转生' : (Core.rebirthLockedReason(state) || '尚不可兵解');
+    }
+
+    const st = Core.rebirthState(state);
+    const count = Core.rebirthCount(state);
+    const disc = Core.rebirthDiscount(state);
+    const dao = Math.floor(st.dao || 0);
+    const daoTotal = Math.floor(st.daoTotal || 0);
+    const gain = Core.rebirthDaoGain(state, 'active');
+    const gainPassive = Core.rebirthDaoGain(state, 'passive');
+
+    const discTxt = disc >= 1 ? '原值' : '^' + disc.toFixed(2);
+    setText('ui-rb-hint', '已兵解 ' + count + ' 次 · 设备算力衰减 ' + discTxt);
+    setText('ui-rb-count', String(count));
+    setText('ui-rb-dao', fmtCount(dao));
+    setText('ui-rb-daototal', fmtCount(daoTotal));
+    setText('ui-rb-disc', discTxt);
+    setText('ui-rb-gain', String(gain));
+    setText('ui-rb-gain-passive', String(gainPassive));
+
+    const nextGain = Math.floor((rbCfg.daoBase || 100) * (1 + (rbCfg.daoPerRun || 0.6) * (count + 1)));
+    setText('ui-rb-nextline',
+      '本次兵解后：设备算力被压至 ^' + nextRebirthFactor().toFixed(2) +
+      '，之后每次兵解可得 ' + nextGain + ' 道行以上');
+
+    // ---- 道行加成 ----
+    const dl = (rbCfg.perks || []).map((p) => {
+      const lv = Core.perkLevel(state, p.id);
+      const maxLv = p.maxLevel || 0;
+      const maxed = lv >= maxLv;
+      const cost = Core.perkCost(state, p.id);
+      const cur = lv * (p.per || 0);
+      const curTxt = p.unit === '%'
+        ? '+' + (cur * 100).toFixed(0) + '%'
+        : '+' + fmtNum(cur) + (p.unit || '');
+      return '<div class="rb-perk' + (maxed ? ' maxed' : '') + '">' +
+        '<div class="rb-perk-top">' +
+          '<span class="rb-perk-name">' + esc(p.name) + '</span>' +
+          '<span class="rb-perk-lv">Lv ' + lv + ' / ' + maxLv + '</span>' +
+        '</div>' +
+        '<div class="rb-perk-desc">' + esc(p.desc || '') + '</div>' +
+        '<div class="rb-perk-now">' + (lv > 0 ? '当前 ' + curTxt : '尚未激活') + '</div>' +
+        '<div class="rb-perk-bar"><i style="width:' +
+          (maxLv ? Math.round(lv / maxLv * 100) : 0) + '%"></i></div>' +
+        '<div class="rb-perk-foot">' +
+          '<span class="rb-perk-cost">' +
+            (maxed ? '已满级' : '升级需 ' + fmtCount(cost) + ' 道行') + '</span>' +
+          '<button class="btn" data-perk="' + p.id + '"' +
+            (maxed || dao < cost ? ' disabled' : '') + '>' + (maxed ? '满级' : '升级') + '</button>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+    if ($('rb-perk-list').innerHTML !== dl) $('rb-perk-list').innerHTML = dl;
+
+    // ---- 兵解记录 ----
+    const hist = (st.history || []).slice(-8).reverse();
+    const hl = hist.map((h) =>
+      '<div class="rb-hist">' +
+        '<span class="n">#' + h.n + '</span>' +
+        '<span class="r">' + esc(h.realmName || ('境界 ' + h.realm)) + '</span>' +
+        (h.mode === 'passive' ? '<span class="mode">渡劫失败</span>' : '') +
+        '<span class="d">+' + fmtCount(h.dao || 0) + ' 道行</span>' +
+        '<span class="m">' + esc(Core.fmtGameDate(h.gameSeconds || 0)) + '</span>' +
+      '</div>').join('');
+    if ($('rb-history').innerHTML !== hl) {
+      $('rb-history').innerHTML = hl || '<div class="dim" style="font-size:12px">尚未兵解过</div>';
+    }
+  }
+
+  /**
+   * 通用服务端操作（与 stockAction 走同一条 POST /api/action 通道）。
+   * 兵解与「买加成」都不属于股市操作，所以这里单独起一个中性的名字，
+   * 顺便避免以后有人误改 stockAction 时把兵解一起带坏。
+   */
+  async function rebirthAction(action, payload) {
+    if (!state) return null;
+    try {
+      const data = await api('/api/action', {
+        method: 'POST',
+        body: { action: action, payload: payload || {} },
+      });
+      if (data.state) {
+        state = Core.hydrate(data.state);
+        lastLocalTick = Date.now();
+        lastServerSave = Date.now();
+        dirty = true;
+      }
+      renderAll();
+      return data.result || {};
+    } catch (e) {
+      if (e.data && e.data.state) {
+        state = Core.hydrate(e.data.state);
+        lastLocalTick = Date.now();
+      }
+      toast(e.message, 'err');
+      renderAll();
+      return null;
+    }
+  }
+
+  /** 打开兵解确认弹窗 —— 必须列清「失去 / 保留 / 获得」三栏，这是不可撤销的操作 */
+  function openRebirthModal() {
+    if (!state) return;
+    if (!Core.rebirthUnlocked(state)) {
+      toast(Core.rebirthLockedReason(state) || '尚未达到兵解条件', 'err');
+      return;
+    }
+    const disc = Core.rebirthDiscount(state);
+    const gain = Core.rebirthDaoGain(state, 'active');
+
+    const lost = [
+      '境界与灵气 —— 退回 <b>凡人</b>，灵气清零、境界进度清零',
+      '金钱与灵石 —— 归零（回到起手 ' + fmtNum(GAME.base.startMoney) + ' 金钱）',
+      '投向配置与累计产出 —— 回到「全修仙」，累计统计清零',
+      '本世攒下的算力加成（AI 投向逐 tick 累出来的部分）',
+      '公司 —— 注册状态、生产线、仓库、库存与全部经营统计一并清空',
+      '股市 —— 持仓、成本与全部成交统计一并清空',
+      '功法熟练度进度 —— 段位与已修满的常驻被动保留',
+      '精力上限 —— 由 ' + fmtNum(Math.round(Core.maxEnergy(state))) + ' 回落',
+      '时间流速 —— 回落到档 1（渡劫成功后会自动跟上）',
+    ];
+    const keep = [
+      '功法 —— 本体、熟练度段位、已修满的常驻被动全保留（只清熟练度进度）',
+      '工作履历 —— 已完成次数保留，升职链不用重跑',
+      '设备 —— 全部保留，但算力被压至 <b>' + fmt(effectiveDeviceCompute()) +
+        '</b>（衰减指数 ' + (disc >= 1 ? '^1.00 原值' : '^' + disc.toFixed(2)) + '）',
+      '渡劫淬体 —— <b>' + Core.tribulationLevel(state) + ' 层</b>全项永久加成，跨兵解不丢',
+      '道行与所有永久加成',
+      '游戏内日期与行情时钟 —— 不会倒流',
+    ];
+    const gainList = [
+      '<b>' + gain + '</b> 道行（可累积，用于购买永久加成）',
+      '设备算力衰减下次放宽至 <b>^' + nextRebirthFactor().toFixed(2) + '</b>',
+      '此后每一世都以更高的境界基础神识与灵气速度起步',
+    ];
+
+    $('rb-lost-list').innerHTML = lost.map((t) => '<li>' + t + '</li>').join('');
+    $('rb-keep-list').innerHTML = keep.map((t) => '<li>' + t + '</li>').join('');
+    $('rb-gain-list').innerHTML = gainList.map((t) => '<li>' + t + '</li>').join('');
+    $('rebirth-modal').classList.remove('hidden');
+  }
+
+  function closeRebirthModal() {
+    $('rebirth-modal').classList.add('hidden');
+  }
+
+  /** 执行兵解（服务端权威） */
+  async function doRebirthNow() {
+    closeRebirthModal();
+    const r = await rebirthAction('rebirth', { mode: 'active' });
+    if (!r) return;
+    toast('兵解完成：第 ' + r.count + ' 世 · 获得 ' + fmtCount(r.dao) +
+      ' 道行 · 设备算力衰减 ^' + r.discount.toFixed(2));
+  }
+
+  /** 用道行升一级加成（服务端权威） */
+  async function buyRebirthPerk(id) {
+    const r = await rebirthAction('buyPerk', { perkId: id });
+    if (!r) return;
+    toast('「' + r.name + '」升至 Lv' + r.level + '，消耗 ' + fmtCount(r.cost) + ' 道行');
+  }
+
+  /**
+   * 刷新图鉴每一项的「已得 / 未得」与解锁条件文案。
+   * 静态构建后调用一次（默认视图也填好，图鉴切过去就有内容），
+   * 之后仅在已拥有集合变化时随 renderTechniquePage 再刷。
+   */
+  function refreshCodexStates(list) {
+    const els = $('tech-codex').querySelectorAll('[data-codex]');
+    for (let i = 0; i < els.length; i++) {
+      const el = els[i];
+      const t = list.find((x) => x.id === el.dataset.codex);
+      if (!t) continue;
+      el.classList.toggle('owned', t.learned);
+      const condEl = el.querySelector('[data-role="ccond"]');
+      const stateEl = el.querySelector('[data-role="cstate"]');
+      if (t.learned) {
+        condEl.textContent = '';
+        stateEl.textContent = '已得';
+        stateEl.className = 'codex-state got';
+      } else {
+        condEl.textContent = '解锁：' + (t.unlockText || '未知条件');
+        stateEl.textContent = '未得';
+        stateEl.className = 'codex-state not';
+      }
     }
   }
 
@@ -2036,6 +2709,15 @@
       $('ui-tech-desc').textContent = tech.desc;
       $('ui-tech-level').textContent = info ? info.level : 0;
       $('ui-tech-main').textContent = '+' + pct(info ? info.mainQiSpeed : 0);
+
+      // 功法经验（v3.5）：独立等级，挂机 + 投向持续喂经验
+      setText('ui-tech-exp-lv', 'Lv.' + (info ? info.level : 0));
+      const expNeed = info ? info.expNeed : 0;
+      const expProg = expNeed > 0 ? Math.max(0, Math.min(1, (rec.exp || 0) / expNeed)) : 0;
+      const expBar = $('ui-tech-exp-bar');
+      expBar.style.width = (expProg * 100).toFixed(1) + '%';
+      setText('ui-tech-exp-val', Math.floor(rec.exp || 0) + ' / ' + fmtCount(Math.ceil(expNeed)));
+      setText('ui-tech-exp-rate', '+' + (info ? info.expRate : 0).toFixed(2) + ' / 秒');
 
       // 熟练度（按当前段位内的进度显示，圆满后满格）
       const M = GAME.techniques.mastery;
@@ -2080,18 +2762,41 @@
       $('btn-toggle-cultivate').textContent = state.cultivating ? '停止修炼' : '继续修炼';
     }
 
-    // ---- 功法阁 ----
-    const items = $('tech-list').querySelectorAll('.tech-item');
-    for (let i = 0; i < items.length; i++) {
-      const el = items[i];
-      const t = list.find((x) => x.id === el.dataset.tech);
-      if (!t) continue;
+    // ---- 功法阁（只显示已拥有） / 图鉴 ----
+    // 列表按「已拥有 id 签名」缓存：学会新功法才重建 DOM，其余帧只刷新数值。
+    const ownedIds = list.filter((t) => t.learned).map((t) => t.id);
+    const ownedSig = ownedIds.join(',');
+    setText('ui-tech-count', ownedIds.length + ' / ' + list.length + ' 已得');
 
-      el.classList.toggle('locked', !t.learned);
-      el.classList.toggle('active', t.active);
+    if (techView === 'owned') {
+      if (ownedSig !== techListSig) {
+        techListSig = ownedSig;
+        const R = GAME.techniques.rarities;
+        $('tech-list').innerHTML = ownedIds.map((id) => {
+          const t = GAME.techniques.list.find((x) => x.id === id);
+          const r = R.find((x) => x.id === t.rarity) || {};
+          return '<div class="tech-item" data-tech="' + t.id + '">' +
+            '<span class="tech-rarity" data-rarity="' + esc(t.rarity) + '">' +
+              esc(r.name || '?') + '</span>' +
+            '<div class="tech-item-main">' +
+              '<div class="tech-item-title">' + esc(t.name) +
+                '<span class="tech-item-school">' + esc(t.school) + '</span></div>' +
+              '<div class="tech-item-desc">' + esc(t.desc) + '</div>' +
+              '<div class="tech-item-stats" data-role="tstats"></div>' +
+            '</div>' +
+            '<div class="tech-item-right" data-role="tright"></div>' +
+          '</div>';
+        }).join('');
+      }
+      const items = $('tech-list').querySelectorAll('.tech-item');
+      for (let i = 0; i < items.length; i++) {
+        const el = items[i];
+        const t = list.find((x) => x.id === el.dataset.tech);
+        if (!t) continue;
 
-      const statsEl = el.querySelector('[data-role="tstats"]');
-      if (t.learned) {
+        el.classList.toggle('active', t.active);
+
+        const statsEl = el.querySelector('[data-role="tstats"]');
         const pl = Object.keys(t.passive || {}).map((k) =>
           esc(PASSIVE_LABEL[k] || k) + ' ' + fmtSignedPct(t.passive[k])).join('　');
         statsEl.innerHTML =
@@ -2099,19 +2804,18 @@
           '<span>等级 ' + t.level + '</span>' +
           '<span>熟练度 ' + esc(t.masteryTierName) + '</span>' +
           (pl ? '<span>被动 ' + pl + '</span>' : '');
-      } else {
-        statsEl.innerHTML = '<span class="lock">' + esc(t.lockedReason || '尚未解锁') + '</span>';
-      }
 
-      const rightEl = el.querySelector('[data-role="tright"]');
-      let right = t.learned
-        ? '<div class="lv">Lv.' + t.level + '</div>'
-        : '<div class="lv">—</div>';
-      if (t.active) right += '<span class="tag active">修炼中</span>';
-      else if (t.passiveActive) right += '<span class="tag passive-on">被动常驻</span>';
-      else if (t.learned) right += '<span class="tag">可切换</span>';
-      else right += '<span class="tag">未习得</span>';
-      rightEl.innerHTML = right;
+        const rightEl = el.querySelector('[data-role="tright"]');
+        let right = '<div class="lv">Lv.' + t.level + '</div>';
+        if (t.active) right += '<span class="tag active">修炼中</span>';
+        else if (t.passiveActive) right += '<span class="tag passive-on">被动常驻</span>';
+        else right += '<span class="tag">可切换</span>';
+        rightEl.innerHTML = right;
+      }
+    } else if (ownedSig !== techListSig) {
+      // 图鉴：静态骨架已按稀有度分组建好，这里只刷新「已得 / 未得」与条件
+      techListSig = ownedSig;
+      refreshCodexStates(list);
     }
 
     // ---- 神识面板 ----
@@ -2120,9 +2824,9 @@
     $('ui-sh-base').textContent = fmtNum(Core.shenshiBase(state));
     $('ui-sh-dev').textContent = '×' + fmtNum(Core.shenshiDeviceMultiplier(state));
     $('ui-sh-compute').textContent =
-      '+' + (sh * GAME.shenshi.computeBonusPerPoint * 100).toFixed(1) + '%';
+      '+' + ((Core.shenshiComputeMultiplier(state) - 1) * 100).toFixed(1) + '%';
     $('ui-sh-cultivate').textContent =
-      '+' + (sh * GAME.techniques.cultivate.shenshiBonusPerPoint * 100).toFixed(1) + '%';
+      '+' + ((Core.shenshiCultivateMultiplier(state) - 1) * 100).toFixed(1) + '%';
 
     // ---- 常驻被动汇总 ----
     $('passive-list').innerHTML = PASSIVE_KEYS.map((k) => {
@@ -2187,12 +2891,119 @@
     syncNow();
   }
 
-  async function setAutoTier(on) {
+  // ============================================================
+  // 时间流速四键（顶栏 · 游戏时间旁）
+  // ============================================================
+  //
+  //   ◀    减速一档
+  //   ▶    常速（1 秒 = 1 小时）→ 再点变 ⏸ 暂停
+  //   ▶▶   加速一档
+  //   ▶▶▶  直接跳到已解锁的最高档（化神后是 1 秒 = 1 游戏年）
+  //
+  // 刻意不用「缓 / 常 / 疾」这类字当按钮文案 —— 速度用形状表达（箭头数），
+  // 具体倍率在旁边的 clock-tier 里看数字。
+
+  /** 已解锁档位按 tier 升序 */
+  function sortedTiers() {
+    return GAME.time.tiers.slice().sort((a, b) => a.tier - b.tier);
+  }
+
+  async function tcSlower() {
     if (!state) return;
-    Core.setAutoTier(state, on);
+    const tiers = sortedTiers().filter((t) => Core.tierUnlocked(state, t.tier));
+    const idx = tiers.findIndex((t) => t.tier === state.timeTier);
+    if (idx <= 0) {
+      toast('已经是最低速了', 'err');
+      return;
+    }
+    if (state.timePaused) {
+      state.timePaused = false;
+      dirty = true;
+    }
+    await pickTier(tiers[idx - 1].tier);
+  }
+
+  async function tcFaster() {
+    if (!state) return;
+    if (state.timePaused) {
+      state.timePaused = false;
+      dirty = true;
+      renderAll();
+      syncNow();
+      return;
+    }
+    const tiers = sortedTiers().filter((t) => Core.tierUnlocked(state, t.tier));
+    const idx = tiers.findIndex((t) => t.tier === state.timeTier);
+    const next = tiers[idx + 1];
+    if (!next) {
+      toast('已是当前境界的最高速', 'err');
+      return;
+    }
+    await pickTier(next.tier);
+  }
+
+  async function tcPlayPause() {
+    if (!state) return;
+    if (state.timePaused) {
+      // 恢复 → 回到常速
+      state.timePaused = false;
+      dirty = true;
+      const normal = GAME.time.normalTier || 2;
+      if (Core.tierUnlocked(state, normal)) {
+        await pickTier(normal);
+      } else {
+        toast('时间已恢复', 'ok');
+        renderAll();
+        syncNow();
+      }
+      return;
+    }
+    state.timePaused = true;
     dirty = true;
+    toast('游戏时间已暂停（精力 / 投向 / 公司 / 修炼照常）', 'ok');
     renderAll();
     syncNow();
+  }
+
+  async function tcMax() {
+    if (!state) return;
+    if (state.timePaused) {
+      state.timePaused = false;
+      dirty = true;
+    }
+    const maxT = Core.maxUnlockedTier(state);
+    if (state.timeTier === maxT && !state.timePaused) {
+      toast('已是最高速：' + Core.tierInfo(maxT).label, 'ok');
+      return;
+    }
+    await pickTier(maxT);
+  }
+
+  function renderClockControls() {
+    const play = $('btn-tc-play');
+    if (play) {
+      const paused = !!state.timePaused;
+      const want = paused ? '⏸' : '▶';
+      if (play.textContent !== want) play.textContent = want;
+      play.classList.toggle('paused', paused);
+      play.title = paused ? '恢复常速（1 秒 = 1 小时）' : '暂停游戏时间';
+    }
+    const maxT = Core.maxUnlockedTier(state);
+    const maxBtn = $('btn-tc-max');
+    if (maxBtn) {
+      maxBtn.classList.toggle('top', state.timeTier === maxT && !state.timePaused);
+      maxBtn.title = '最大速度：' + Core.tierInfo(maxT).label;
+    }
+    const faster = $('btn-tc-faster');
+    if (faster) {
+      const atTop = state.timeTier >= maxT && !state.timePaused;
+      faster.disabled = atTop;
+    }
+    const slower = $('btn-tc-slower');
+    if (slower) {
+      const tiers = sortedTiers().filter((t) => Core.tierUnlocked(state, t.tier));
+      slower.disabled = tiers.length < 2 || tiers[0].tier === state.timeTier;
+    }
   }
 
   async function buyDevice(deviceId) {
@@ -2216,7 +3027,7 @@
         return t ? '《' + t.name + '》' : id;
       }).join('、');
       setTimeout(() => {
-        toast('习得功法 ' + names + '　—　灵气、神识、功法增幅已解锁', 'ok');
+        toast('习得功法 ' + names + '　—　灵气、神识、功法算力投入已解锁', 'ok');
       }, 380);
     }
 
@@ -2478,6 +3289,12 @@
         '　均价 ' + fmt(D.fromJSON(r.unitPrice)) +
         '　支出 -' + fmt(D.fromJSON(r.total)), 'ok');
       stockQty[stockId] = r.shares;   // 手数保持，方便接着买
+      // 大单才上通知栏：成交额 ≥ 100 万 或 ≥ 手头金钱的一成，小额进出不刷屏
+      const total = D.fromJSON(r.total);
+      if (total.gte(1e6) || total.gte(state.money.mul(0.1))) {
+        pushEvent('股市大单：买入 ' + stock.name + '（' + stock.code + '）' +
+          fmtCount(r.shares) + ' 股 · 支出 ' + fmt(total), 'money');
+      }
     } else {
       const profit = D.fromJSON(r.profit);
       toast('卖出 ' + stock.name + ' ×' + fmtCount(r.shares) +
@@ -2486,6 +3303,12 @@
         '　本笔盈亏 ' + (profit.isNeg() ? '' : '+') + fmt(profit), 'ok');
       // 清仓后把数量还原成默认手数，下次开仓不用自己再填
       if (r.sharesAfter === 0) delete stockQty[stockId];
+      const big = D.fromJSON(r.net).gte(1e6);
+      if (big) {
+        pushEvent('股市大单：清出 ' + stock.name + '（' + stock.code + '）' +
+          fmtCount(r.shares) + ' 股 · 净得 ' + fmt(D.fromJSON(r.net)) +
+          '（' + (profit.isNeg() ? '亏 ' : '盈 ') + fmt(profit) + '）', 'money');
+      }
     }
   }
 
@@ -2516,20 +3339,71 @@
       let dt = (now - lastLocalTick) / 1000;
       lastLocalTick = now;
 
-      // 切后台久了再回来：按离线规则结算
+      // 本地 tick **刻意关掉自动渡劫**（tribulation:false）。
+      // 渡劫失败会触发被动兵解、连设备与功法一起清空，而这两样在服务端的
+      // /api/save 里是「只增不减」的 —— 本地先失败再回写，会被服务端原样补回来，
+      // 变成「界面归零、服务器还留着元婴」。所以渡劫统一走 /api/action 的服务端权威路径。
       if (dt > GAME.offline.thresholdSeconds) {
-        Core.tick(state, dt, { offline: true });
+        Core.tick(state, dt, { offline: true, tribulation: false });
         toast('检测到长时间未操作，按离线规则结算', 'ok');
       } else if (dt > 0) {
-        Core.tick(state, dt, { offline: false });
+        Core.tick(state, dt, { offline: false, tribulation: false });
       }
 
       renderAll();
+      // 事件观察器抛错不能拖垮主循环 —— 播报是锦上添花，不是主流程
+      try { observeEvents(); } catch (e) { console.warn('[事件栏]', e); }
+      // 不做的话挂机会永久停在满格进度条上，主线等于断了。
+      if (state.autoTribulation !== false && Core.tribulationReady(state)) {
+        tryTribulation();
+      }
 
       if (now - lastServerSave >= GAME.save.intervalMs) {
         syncNow();
       }
     }, GAME.ui.tickMs);
+  }
+
+  /**
+   * 请求服务端执行一次渡劫。节流 1.2 秒，避免「灵气刚好压在阈值上」时
+   * 每 100ms 发一次请求（失败会重置状态，成功的下一境也要等一小会儿）。
+   */
+  let lastTribulationAt = 0;
+  let tribulating = false;
+  async function tryTribulation() {
+    if (!state || tribulating) return;
+    const now = Date.now();
+    if (now - lastTribulationAt < 1200) return;
+    lastTribulationAt = now;
+    tribulating = true;
+    try {
+      // 先把本地进度推上去，避免服务端手里的灵气还差一点点而拒收
+      await syncNow(true);
+      const r = await rebirthAction('tribulation', {});
+      if (r && r.ok) announceTribulation(r);
+    } catch (e) {
+      toast(e.message || '渡劫失败', 'err');
+    } finally {
+      tribulating = false;
+    }
+  }
+
+  /** 渡劫结果的一次性提示 —— 成功/失败都要说清楚发生了什么 */
+  function announceTribulation(r) {
+    if (r.success) {
+      toast('渡劫成功：境界 → ' + (r.realmName || '') +
+        '　渡劫淬体 ' + r.level + ' 层（全项基础加成提升）', 'ok');
+      pushEvent('渡劫成功 → ' + (r.realmName || '') +
+        '　渡劫淬体 ' + r.level + ' 层，全项基础加成永久提升', 'good');
+      return;
+    }
+    let msg = '渡劫失败：' + (r.lostRealmName || '') + ' 境界崩解，被迫兵解';
+    if (r.fullWipe) msg += ' · 未及元婴，一切归零';
+    msg += '（+' + fmtCount(r.dao) + ' 道行）';
+    toast(msg, 'err');
+    pushEvent('渡劫失败：' + (r.lostRealmName || '') + ' → 被动兵解' +
+      (r.fullWipe ? '（未及元婴，设备与功法一并清空）' : '') +
+      '，获得 ' + fmtCount(r.dao) + ' 道行', 'err');
   }
 
   function stopLoop() {
@@ -2563,6 +3437,18 @@
       lastServerSave = Date.now();
       setSaveStatus('已同步', 'ok');
     } catch (e) {
+      // 服务端判定「客户端手里是过期存档」时会回传最新存档（典型场景：
+      // 另一个标签页已经兵解过，而这一页还拿着兵解前的 state 在定时回写）。
+      // 这种情况必须直接采用服务端版本，否则两边的公司 / 股市状态会互相覆盖。
+      if (e.data && e.data.state) {
+        state = Core.hydrate(e.data.state);
+        lastLocalTick = Date.now();
+        dirty = false;
+        setSaveStatus('已改用服务端存档', 'ok');
+        renderAll();
+        if (e.message) toast(e.message, 'err');
+        return;
+      }
       setSaveStatus('同步失败', 'err');
       console.warn('[存档失败]', e.message);
     } finally {
@@ -2605,6 +3491,68 @@
   // 「去调投向份额」—— 工业算力不足时最直接的出口
   const cpGoto = $('btn-co-cp-goto');
   if (cpGoto) cpGoto.addEventListener('click', () => switchTab('invest'));
+
+  // ---- 渡劫 ----
+  const tbBtn = $('btn-tribulation');
+  if (tbBtn) {
+    tbBtn.addEventListener('click', () => {
+      if (!state || !Core.tribulationReady(state)) {
+        toast('灵气未满，还引不动天劫', 'err');
+        return;
+      }
+      // 手动渡劫是玩家主动按下的高风险动作 —— 确认一次，避免误触
+      if (!window.confirm('确认渡劫？\n\n成功：境界提升，渡劫淬体 +1 层（全项永久加成）\n失败：被动兵解，这一世作废' +
+        (state.realm < ((GAME.tribulation.passiveRules || {}).belowRealm || 4)
+          ? '（未及元婴，设备与功法一并清空）' : '（道行打三折）'))) {
+        return;
+      }
+      lastTribulationAt = 0;   // 手动点击不受节流限制
+      tryTribulation();
+    });
+  }
+  const tbChk = $('chk-auto-tribulation');
+  if (tbChk) {
+    tbChk.addEventListener('change', async (e) => {
+      const on = !!e.target.checked;
+      if (state) state.autoTribulation = on;
+      dirty = true;
+      try {
+        await rebirthAction('setAutoTribulation', { on: on });
+      } catch (err) {
+        /* 服务端不可用时也让本地开关生效，下次保存会带上去 */
+      }
+      toast(on ? '已开启自动渡劫：灵气一满就硬闯' : '已关闭自动渡劫：灵气满格后等你手动渡', 'ok');
+      renderAll();
+    });
+  }
+
+  // ---- 兵解 · 转生 ----
+  const rbBtn = $('btn-rebirth');
+  if (rbBtn) rbBtn.addEventListener('click', openRebirthModal);
+  const rbCancel = $('btn-rebirth-cancel');
+  if (rbCancel) rbCancel.addEventListener('click', closeRebirthModal);
+  const rbConfirm = $('btn-rebirth-confirm');
+  if (rbConfirm) rbConfirm.addEventListener('click', doRebirthNow);
+  // 点遮罩关闭，点弹窗本体不关
+  const rbMask = $('rebirth-modal');
+  if (rbMask) {
+    rbMask.addEventListener('click', (e) => {
+      if (e.target === rbMask) closeRebirthModal();
+    });
+  }
+  // 道行加成列表是动态重绘的，用事件委托绑升级按钮
+  const rbPerks = $('rb-perk-list');
+  if (rbPerks) {
+    rbPerks.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-perk]');
+      if (btn && !btn.disabled) buyRebirthPerk(btn.dataset.perk);
+    });
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const m = $('rebirth-modal');
+    if (m && !m.classList.contains('hidden')) closeRebirthModal();
+  });
 
   // ---- 市场页（商品行情独立页，与公司页共用同一套卖出逻辑）----
   const mkSellAll = $('btn-mk-sell-all');

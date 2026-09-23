@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -29,6 +30,19 @@ db.exec(`
     updated_at  INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
+
+  -- 会话表：token 落盘，服务端重启后依然有效 —— 这是「登录一次免重复登录」的关键。
+  -- 早先用内存 Map 存 token，重启一次全部作废，前端 localStorage 里的 token 变成废票。
+  CREATE TABLE IF NOT EXISTS sessions (
+    token       TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    username    TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    seen_at     INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 `);
 
 const q = {
@@ -41,6 +55,18 @@ const q = {
     INSERT INTO saves (user_id, state, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
   `),
+  // ---- 会话 ----
+  getSession: db.prepare('SELECT * FROM sessions WHERE token = ?'),
+  putSession: db.prepare(`
+    INSERT INTO sessions (token, user_id, username, created_at, seen_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(token) DO UPDATE SET seen_at = excluded.seen_at
+  `),
+  delSession: db.prepare('DELETE FROM sessions WHERE token = ?'),
+  delUserSessions: db.prepare('DELETE FROM sessions WHERE user_id = ?'),
+  delStaleSessions: db.prepare('DELETE FROM sessions WHERE seen_at < ?'),
+  countSessions: db.prepare('SELECT COUNT(*) AS n FROM sessions'),
+  allSessions: db.prepare('SELECT * FROM sessions ORDER BY seen_at DESC LIMIT 20'),
 };
 
 function register(username, password) {
@@ -93,4 +119,56 @@ function getUser(userId) {
   return q.findUserById.get(userId) || null;
 }
 
-module.exports = { register, login, loadSave, saveGame, getUser, db };
+// ---------- 会话 ----------
+//
+// 为什么放数据库而不是内存 Map：内存 Map 在服务端每次重启时全部作废，
+// 而前端 localStorage 里的 token 是长期保存的 —— 结果是「每次重启服务端，
+// 所有人都要重新登录一次」。token 落盘之后，重启不再影响登录状态。
+
+/** 会话有效期（毫秒）—— 60 天。只要期间还在用就一直续期 */
+const SESSION_TTL_MS = 60 * 24 * 3600 * 1000;
+/** 续期节流：距上次续期不足 1 小时就不写库（否则每 15 秒一次自动保存都要 UPDATE） */
+const SESSION_TOUCH_MS = 3600 * 1000;
+
+function createSession(userId, username) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const now = Date.now();
+  q.putSession.run(token, userId, String(username), now, now);
+  return token;
+}
+
+/** 查会话并续期。返回 null 表示 token 不存在或已过期 */
+function getSession(token) {
+  if (!token) return null;
+  const row = q.getSession.get(String(token));
+  if (!row) return null;
+  const now = Date.now();
+  if (now - row.seen_at > SESSION_TTL_MS) {
+    q.delSession.run(row.token);
+    return null;
+  }
+  if (now - row.seen_at > SESSION_TOUCH_MS) {
+    q.putSession.run(row.token, row.user_id, row.username, row.created_at, now);
+  }
+  return { userId: row.user_id, username: row.username, created: row.created_at, token: row.token };
+}
+
+function deleteSession(token) {
+  if (token) q.delSession.run(String(token));
+}
+
+/** 清掉已过期的会话（启动时调用一次） */
+function purgeSessions() {
+  const r = q.delStaleSessions.run(Date.now() - SESSION_TTL_MS);
+  return r.changes || 0;
+}
+
+function sessionStats() {
+  return { total: q.countSessions.get().n, ttlDays: Math.round(SESSION_TTL_MS / 86400000) };
+}
+
+module.exports = {
+  register, login, loadSave, saveGame, getUser, db,
+  createSession, getSession, deleteSession, purgeSessions, sessionStats,
+  SESSION_TTL_MS,
+};

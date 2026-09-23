@@ -40,7 +40,12 @@ const r1 = Core.buyDevice(s, 'pc');
 ok('购买成功', r1.ok === true, r1.msg);
 ok('习得了功法', s.technique !== null, s.technique);
 ok('第一本是九章算经', s.technique === 'jiuzhang', s.technique);
-ok('learned 有 1 本', Object.keys(s.learned).length === 1, Object.keys(s.learned));
+// v3.4：成就条件功法（筹算小术 jobsDone=3 / 几何原本 jobsDone=15 等）在买电脑前
+// 可能已经达成条件，第一本入手后会被立即补发 —— 所以 learned 数 ≥ 1 即可，
+// 关键是「当前修炼的那本」必须是九章算经。
+ok('learned 至少 1 本且含九章算经',
+  Object.keys(s.learned).length >= 1 && !!s.learned.jiuzhang,
+  Object.keys(s.learned));
 const qiBefore = s.qi.toNumber();
 Core.tick(s, 600, {});
 ok('灵气开始增长', s.qi.toNumber() > qiBefore, qiBefore + ' → ' + s.qi.toNumber());
@@ -55,8 +60,132 @@ ok('境界基础神识来自配置', Core.shenshiBase(s) === 100, Core.shenshiBa
 const rawC = Core.totalCompute(s);
 const realC = Core.realComputeOf(s).toNumber();
 ok('实际算力 > 原始算力（神识乘区）', realC > rawC.toNumber(), rawC.toString() + ' → ' + realC);
-const expectMul = 1 + sh4 * GAME.shenshi.computeBonusPerPoint;
-ok('算力乘区符合公式', Math.abs(realC / rawC.toNumber() - expectMul) < 1e-6, expectMul);
+// 分层阻尼：境界那一份线性、设备那一份按对数收敛（见 game-config.shenshi）
+const parts = Core.shenshiParts(s);
+const expectMul = 1 + parts.realmPart * GAME.shenshi.computePerPointRealm
+  * (1 + GAME.shenshi.computeDeviceLogK * Math.log(parts.deviceMul));
+ok('算力乘区符合分层公式（境界线性 × 设备对数收敛）',
+  Math.abs(realC / rawC.toNumber() - expectMul) < 1e-6, expectMul);
+// f(1) = 1 —— 没有设备时与旧线性口径完全一致，前期手感不变
+const bare = Core.createState();
+bare.realm = 4;
+const bareMul = Core.shenshiComputeMultiplier(bare);
+ok('无设备时与旧口径一致（f(1) = 1）',
+  Math.abs(bareMul - (1 + Core.shenshiBase(bare) * GAME.shenshi.computePerPointRealm)) < 1e-9,
+  bareMul);
+
+console.log('\n[3b] 兵解 · 转生');
+{
+  const r = Core.createState();
+  ok('未达元婴时兵解被拒', Core.doRebirth(r).ok === false, Core.rebirthLockedReason(r));
+  ok('未兵解过时转生衰减指数 = 1（不能把 base 当成常驻指数）',
+    Core.rebirthDiscount(r) === 1, Core.rebirthDiscount(r));
+  ok('衰减指数序列：1 次 0.50 / 2 次 0.53 / 封顶 0.75',
+    Core.rebirthFactorAt(1) === 0.5 && Core.rebirthFactorAt(2) === 0.53
+    && Core.rebirthFactorAt(999) === 0.75,
+    [1, 2, 999].map(Core.rebirthFactorAt).join(' / '));
+
+  // 造一个「什么都有」的元婴存档，逐项验证兵解前后
+  r.realm = 4;
+  r.money = new D(1e15);
+  for (const d of GAME.devices) r.devices[d.id] = 5;
+  Core.foundCompany(r);
+  Core.buyLine(r, 'mine');
+  r.company.warehouseLevel = 5;
+  r.company.stock[GAME.company.goods[0].id] = 100;
+  r.company.cycles = 42;
+  r.stock.shares[GAME.stock.stocks[0].id] = 1000;
+  r.stock.cost[GAME.stock.stocks[0].id] = new D(5e4);
+  r.stock.realized = new D(1234);
+  r.learned['jiuzhang'] = { mastery: 5000, tier: 4, passive: true };
+  r.technique = 'jiuzhang';
+  r.qi = new D(1e9);
+  r.spiritStone = new D(999);
+  r.playTime = 12345;
+  r.gameSeconds = 67890;
+
+  const devBefore = r.devices.pc;
+  // 兵解前先记一次实际算力与设备算力，兵解后用来验证「转生折扣确实生效」
+  const realBefore = Core.realComputeOf(r).toNumber();
+  const devComputeBefore = Core.totalCompute(r).toNumber();
+  const gain = Core.rebirthDaoGain(r, 'active');
+  ok('道行只认境界与次数，不认资产总量', gain === 100, gain);
+  ok('被动兵解打三折前的原始值 = 100', Core.rebirthDaoGain(r, 'passive') === 30,
+    Core.rebirthDaoGain(r, 'passive'));
+
+  const res = Core.doRebirth(r);
+  ok('元婴可以兵解', res.ok === true, res.msg || '');
+
+  // —— 清空项 ——
+  ok('境界归零', r.realm === 0);
+  ok('灵气清零', r.qi.toNumber() === 0);
+  ok('金钱回到起手值', r.money.toNumber() === GAME.base.startMoney, r.money.toNumber());
+  ok('灵石清零', r.spiritStone.toNumber() === 0);
+  ok('公司注册状态被清', r.company.founded === false);
+  ok('生产线被清空', r.company.lines.mine === 0, JSON.stringify(r.company.lines.mine));
+  ok('仓库等级归零', r.company.warehouseLevel === 0);
+  ok('库存清空', Core.stockTotal(r) === 0, Core.stockTotal(r));
+  ok('公司累计统计归零', r.company.cycles === 0 && r.company.totalRevenue.toNumber() === 0);
+  ok('股市持仓清空', r.stock.shares[GAME.stock.stocks[0].id] === 0);
+  ok('股市统计归零', r.stock.totalTrades === 0 && r.stock.realized.toNumber() === 0);
+
+  // —— 保留项 ——
+  ok('设备保留', r.devices.pc === devBefore, r.devices.pc);
+  ok('功法本体保留', !!r.learned['jiuzhang']);
+  ok('熟练度进度清空', r.learned['jiuzhang'].mastery === 0);
+  ok('熟练度段位保留', r.learned['jiuzhang'].tier === 4, r.learned['jiuzhang'].tier);
+  ok('被动常驻保留', r.learned['jiuzhang'].passive === true);
+  ok('游戏内时间不倒退', r.gameSeconds === 67890, r.gameSeconds);
+  ok('行情时钟不倒退', r.playTime === 12345, r.playTime);
+
+  // —— 转生衰减 ——
+  ok('兵解后衰减指数 = 0.50', Core.rebirthDiscount(r) === 0.5, Core.rebirthDiscount(r));
+  ok('衰减按**数量级**生效（幂，不是乘法）—— 至少砍掉 6 个数量级',
+    Core.deviceComputeEffective(r).toNumber() < Core.totalCompute(r).toNumber() / 1e6,
+    Core.deviceComputeEffective(r).toString() + ' vs ' + Core.totalCompute(r).toString());
+  ok('设备数据本身不减（衰减只在计算时生效，不删玩家的设备）',
+    Core.totalCompute(r).toNumber() === devComputeBefore, Core.totalCompute(r).toNumber());
+  ok('兵解后实际算力显著下降（境界归零 + 转生衰减双重作用）',
+    Core.realComputeOf(r).toNumber() < realBefore * 1e-3,
+    Core.realComputeOf(r).toNumber() + ' < ' + (realBefore * 1e-3).toExponential(2));
+
+  // —— 道行 ——
+  ok('道行已入账', r.rebirth.dao === 100, r.rebirth.dao);
+  ok('累计道行只增', r.rebirth.daoTotal === 100, r.rebirth.daoTotal);
+  ok('兵解记录已写入', r.rebirth.history.length === 1);
+  ok('第二次兵解道行递增（100 → 160）',
+    Core.rebirthSummary(r).daoGain === 160, String(Core.rebirthSummary(r).daoGain));
+  ok('被动（渡劫失败）为主动的三折', Core.rebirthSummary(r).daoGainPassive === 48,
+    String(Core.rebirthSummary(r).daoGainPassive));
+
+  // —— 道行加成 ——
+  const b1 = Core.buyPerk(r, 'shenshi');
+  ok('可以买道行加成', b1.ok === true, b1.msg || '');
+  ok('买后境界基础神识 +5', Core.shenshiBase(r) === 1 + 5, Core.shenshiBase(r));
+  ok('等级已提升', Core.perkLevel(r, 'shenshi') === 1);
+  const b2 = Core.buyPerk(r, 'shenshi');   // 第二级 40×1.8 = 72 > 剩余 60
+  ok('道行不足时拒绝', b2.ok === false, b2.msg);
+  ok('不存在的加成被拒', Core.buyPerk(r, 'nope').ok === false);
+  ok('加成落到了精力上限上', Core.maxEnergy(r) === (GAME.realms[0].maxEnergy) * (
+    1 + Core.passiveBonus(r, 'energyMax')) * (1 + Core.perkValue(r, 'energyMax')),
+    Core.maxEnergy(r));
+
+  // —— 存档往返 ——
+  const back = Core.hydrate(Core.serialize(r));
+  ok('转生存档往返一致',
+    back.rebirth.count === 1 && back.rebirth.dao === r.rebirth.dao
+    && back.rebirth.perks.shenshi === 1, JSON.stringify(back.rebirth.perks));
+  ok('衰减参与存档往返', Core.rebirthDiscount(back) === 0.5, Core.rebirthDiscount(back));
+
+  // —— hydrate 夹取（防手改存档）——
+  const cheat = Core.serialize(r);
+  cheat.rebirth.perks.shenshi = 9999;
+  cheat.rebirth.dao = 1e9;
+  cheat.rebirth.daoTotal = 10;
+  const hc = Core.hydrate(cheat);
+  ok('加成等级被夹到硬上限', hc.rebirth.perks.shenshi === 8, hc.rebirth.perks.shenshi);
+  ok('未分配道行被夹到 daoTotal 以内', hc.rebirth.dao === 10, hc.rebirth.dao);
+}
 
 console.log('\n[4] 修炼涨熟练度 / 参悟消耗灵气换熟练度');
 s = Core.createState();
@@ -285,7 +414,7 @@ console.log('\n[10] 市场抛压（卖出影响下一期）');
   // 正常经营：产多少卖多少 → 不该被罚
   {
     const st = mk();
-    st.gameSeconds = per * 3 + 1;
+    st.playTime = per * 3 + 1;
     st.company.lastPeriod.component = 2;
     st.company.producedThisPeriod.component = 400;
     st.company.soldThisPeriod.component = 400;
@@ -297,11 +426,11 @@ console.log('\n[10] 市场抛压（卖出影响下一期）');
   // 砸库存 → 下一期压价
   {
     const st = mk();
-    st.gameSeconds = per * 3 + 1;
+    st.playTime = per * 3 + 1;
     st.company.lastPeriod.component = 2;
     st.company.producedThisPeriod.component = 0;
     st.company.soldThisPeriod.component = 900;
-    const natural = Core.naturalPrice(g, st.gameSeconds, st);
+    const natural = Core.naturalPrice(g, st.playTime, st);
     const before = Core.goodsPriceWith(st, g);
     ok('结算前价格 = 自然价', before.eq(natural), before.toString());
 
@@ -317,7 +446,7 @@ console.log('\n[10] 市场抛压（卖出影响下一期）');
 
     // 逐期恢复
     const p1 = Core.pressureOf(st, 'component');
-    st.gameSeconds += per;
+    st.playTime += per;
     Core.syncMarket(st);
     ok('无新抛售时压力按 decay 衰减',
       Math.abs(Core.pressureOf(st, 'component') - p1 * MK.decay) < 1e-9,
@@ -327,7 +456,7 @@ console.log('\n[10] 市场抛压（卖出影响下一期）');
     st.company.pressure.component = 1;
     let lowest = null;
     for (let p = 1; p <= 200; p++) {
-      st.gameSeconds = per * p + 1;
+      st.playTime = per * p + 1;
       const v = Core.goodsPriceWith(st, g);
       if (lowest === null || v.lt(lowest)) lowest = v;
     }
@@ -338,19 +467,19 @@ console.log('\n[10] 市场抛压（卖出影响下一期）');
   // 成交价必须用带抛压的市价
   {
     const st = mk();
-    st.gameSeconds = per * 4 + 1;
+    st.playTime = per * 4 + 1;
     st.company.pressure.component = 1;
     st.company.stock.component = 20;
     const r = Core.sellGoods(st, 'component');
     ok('成交价 = 带抛压的市价', r.price.eq(Core.goodsPriceWith(st, g)), r.price.toString());
-    ok('成交价低于自然价', r.price.lt(Core.naturalPrice(g, st.gameSeconds)),
-      r.price.toString() + ' < ' + Core.naturalPrice(g, st.gameSeconds).toString());
+    ok('成交价低于自然价', r.price.lt(Core.naturalPrice(g, st.playTime)),
+      r.price.toString() + ' < ' + Core.naturalPrice(g, st.playTime).toString());
   }
 
   // 存档往返 + 夹取
   {
     const st = mk();
-    st.gameSeconds = per * 5 + 1;
+    st.playTime = per * 5 + 1;
     st.company.pressure.component = 0.42;
     st.company.lastPeriod.component = 4;
     const b = Core.hydrate(JSON.parse(JSON.stringify(Core.serialize(st))));
@@ -365,7 +494,7 @@ console.log('\n[10] 市场抛压（卖出影响下一期）');
     ahead.company.lastPeriod.component = 99999;
     const ha = Core.hydrate(ahead);
     ok('超前 lastPeriod 被夹回当前期',
-      ha.company.lastPeriod.component <= Core.goodsPeriod(g, ha.gameSeconds),
+      ha.company.lastPeriod.component <= Core.goodsPeriod(g, ha.playTime),
       String(ha.company.lastPeriod.component));
   }
 }
@@ -399,7 +528,7 @@ console.log('\n[11] 股市（证券账户）');
   // 价格构成
   {
     const st = mk();
-    st.gameSeconds = 0;
+    st.playTime = 0;
     ok('第 0 期按基准价挂牌',
       Core.stockNaturalPrice(st, tianji).eq(new D(tianji.basePrice)),
       Core.stockNaturalPrice(st, tianji).toString());
@@ -482,13 +611,13 @@ console.log('\n[11] 股市（证券账户）');
   {
     const st = mk();
     Core.buyStock(st, tianji.id, 20000);
-    st.gameSeconds = per * 4 + 1;
+    st.playTime = per * 4 + 1;
     Core.syncStocks(st);
     const decay = SK.flowDecay;
     ok('flow = trunc(原值 × flowDecay^期数)',
       Core.stockFlow(st, tianji.id) === Math.trunc(20000 * Math.pow(decay, 4)),
       String(Core.stockFlow(st, tianji.id)));
-    st.gameSeconds = per * 40 + 1;
+    st.playTime = per * 40 + 1;
     Core.syncStocks(st);
     ok('多期之后流归零', Core.stockFlow(st, tianji.id) === 0);
     ok('冲击回归 1（成交价回到自然价）', Core.stockImpact(st, tianji) === 1);
@@ -514,14 +643,14 @@ console.log('\n[11] 股市（证券账户）');
     const chip = Core.goodById(chipsci.link);
     const cp = Core.stockPeriodSeconds(chipsci);
     const st = mk();
-    st.gameSeconds = cp * 5 + 60;
+    st.playTime = cp * 5 + 60;
     const base = Core.stockNaturalPrice(st, chipsci).toNumber();
-    const goodsBase = Core.goodsPrice(chip, st.gameSeconds).toNumber();
+    const goodsBase = Core.goodsPrice(chip, st.playTime).toNumber();
     const F = (goodsBase / chip.basePrice) * Core.industryPriceIndex(st, chip.industry);
 
     st.company.pressure[chip.id] = 0.1;
     const after = Core.stockNaturalPrice(st, chipsci).toNumber();
-    const I = Core.marketImpactAt(st, chip, Core.goodsPeriod(chip, st.gameSeconds));
+    const I = Core.marketImpactAt(st, chip, Core.goodsPeriod(chip, st.playTime));
     const w = SK.linkWeight;
     ok('商品被砸价时关联股票自然价同步下降', after < base,
       base.toFixed(2) + ' → ' + after.toFixed(2));
@@ -529,7 +658,7 @@ console.log('\n[11] 股市（证券账户）');
       Math.abs(after / base - (1 + (F * I - 1) * w) / (1 + (F - 1) * w)) < 1e-9);
     const clean = Core.createState();
     clean.realm = 1;
-    clean.gameSeconds = cp * 5 + 60;
+    clean.playTime = cp * 5 + 60;
     ok('无抛压时商品的行情波动也会传导',
       Math.abs(Core.stockLinkFactor(clean, chipsci, 5) - 1) > 1e-6,
       Core.stockLinkFactor(clean, chipsci, 5).toFixed(6));
@@ -573,7 +702,7 @@ console.log('\n[11] 股市（证券账户）');
     ahead.stock.lastPeriod[tianji.id] = 99999;
     const ha = Core.hydrate(ahead);
     ok('超前 lastPeriod 被夹回当前期',
-      ha.stock.lastPeriod[tianji.id] <= Core.stockPeriod(tianji, ha.gameSeconds),
+      ha.stock.lastPeriod[tianji.id] <= Core.stockPeriod(tianji, ha.playTime),
       String(ha.stock.lastPeriod[tianji.id]));
   }
 

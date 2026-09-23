@@ -101,6 +101,24 @@ function tryBuy(s) {
 
 // ---------- 主循环 ----------
 
+/**
+ * 出力争照 —— 突破那一刻，各投向每秒实际产出多少。
+ *
+ * 关心的是「灵气/现实秒」这一项：它是主线唯一的推进速度。
+ * 与「下一个境界还差多少」一比，就能看出某个境界会不会卡死。
+ */
+function snapshot(s) {
+  const out = {};
+  for (const inv of GAME.investments) out[inv.id] = C.investOutput(s, inv).toNumber();
+  return {
+    qiPerSec: out.xiuxian * C.qiMultiplier(s),
+    qiMul: C.qiMultiplier(s),
+    invest: out,
+    realCompute: s.realCompute.toNumber(),
+    money: s.money.toNumber(),
+  };
+}
+
 function run(hours, alloc) {
   const s = C.createState();
   C.setAllocation(s, alloc);
@@ -108,6 +126,13 @@ function run(hours, alloc) {
   const MAX = Math.floor(hours * 3600 / STEP);
   const realmAt = { 0: 0 };      // 境界 -> 达成时的现实秒
   const realmGame = { 0: 0 };    // 境界 -> 达成时的游戏秒
+  /**
+   * 境界 -> 达成瞬间的「出力争照」。
+   * 校准投向数值时最关键的一张表：**突破那一刻，你在同一份算力下
+   * 每秒能拿到多少灵气 / 金钱 / 算力增量**，以及距离下一个境界还差多少倍。
+   * 只看最终状态会漏掉「中期某个境界卡了几十小时」这种问题。
+   */
+  const realmSnap = {};
   const techAt = {};             // 功法 id -> 习得时的现实秒
   const techGame = {};
   const perfectAt = {};          // 功法 id -> 圆满（被动常驻）时的现实秒
@@ -133,6 +158,7 @@ function run(hours, alloc) {
     if (realmAt[s.realm] === undefined) {
       realmAt[s.realm] = t;
       realmGame[s.realm] = s.gameSeconds;
+      realmSnap[s.realm] = snapshot(s);
     }
     for (const id of Object.keys(s.learned)) {
       if (techAt[id] === undefined) { techAt[id] = t; techGame[id] = s.gameSeconds; }
@@ -143,7 +169,7 @@ function run(hours, alloc) {
     }
   }
 
-  return { s, t, realmAt, realmGame, techAt, techGame, perfectAt, devAt };
+  return { s, t, realmAt, realmGame, realmSnap, techAt, techGame, perfectAt, devAt };
 }
 
 function fmtT(sec) {
@@ -192,8 +218,31 @@ for (let i = 0; i < GAME.realms.length; i++) {
   );
 }
 
-// 2) 功法时间线
+// 1b) 每个境界的投产出力（校准投向数值用）
 console.log('');
+console.log('【投产出力 · 突破瞬间】');
+console.log(pad('境界', 12) + pad('灵气/现实秒', 16) + pad('灵气倍率', 14) +
+  pad('距下一境', 14) + '实际算力');
+console.log('-'.repeat(78));
+for (let i = 0; i < GAME.realms.length; i++) {
+  const snap = r.realmSnap[i];
+  if (!snap) continue;
+  const next = GAME.realms[i + 1];
+  let need = '—';
+  if (next) {
+    const secs = snap.qiPerSec > 0 ? (next.need / snap.qiPerSec) : Infinity;
+    need = (snap.qiPerSec > 0 ? fmtT(secs) : '∞');
+  }
+  console.log(
+    pad(GAME.realms[i].name, 12) +
+    pad(snap.qiPerSec.toExponential(2), 16) +
+    pad('×' + snap.qiMul.toFixed(1), 14) +
+    pad(need, 14) +
+    snap.realCompute.toExponential(2)
+  );
+}
+
+// 2) 功法时间线console.log('');
 console.log('【功法】');
 console.log(pad('功法', 20) + pad('稀有度', 10) + pad('习得(现实)', 14) + pad('圆满(现实)', 14));
 console.log('-'.repeat(78));

@@ -44,6 +44,17 @@
      ============================================================ -->
 <div id="game-screen" class="hidden">
 
+  <!-- 顶栏悬浮栈：事件通知栏 + 属性栏 + 页面导航，整体 sticky 固定在视口顶部 -->
+  <div class="top-stack">
+
+  <!-- 事件通知栏（页面最上方）：实时播报 + 空闲时随机行情前瞻 -->
+  <div id="event-bar" class="event-bar" title="点击展开历史消息">
+    <span class="ev-dot" id="ui-ev-dot"></span>
+    <span class="ev-text" id="ui-ev-text">修行开始。</span>
+    <span class="ev-count" id="ui-ev-count" hidden></span>
+    <div class="ev-history hidden" id="ev-history"></div>
+  </div>
+
   <!-- 顶栏 -->
   <header class="topbar">
     <div class="brand">算力修仙</div>
@@ -85,6 +96,13 @@
       <div class="clock">
         <span class="clock-date" id="ui-clock">2000年1月1日 00:00</span>
         <span class="clock-tier" id="ui-clock-tier">1 秒 = 10 分钟</span>
+        <!-- 时间流速四键：减速 / 播放-暂停 / 加速 / 最大速 -->
+        <span class="clock-ctrl" id="clock-ctrl">
+          <button class="clk-btn" id="btn-tc-slower" title="减速一档">◀</button>
+          <button class="clk-btn" id="btn-tc-play" title="常速（1 秒 = 1 小时）/ 暂停">▶</button>
+          <button class="clk-btn" id="btn-tc-faster" title="加速一档">▶▶</button>
+          <button class="clk-btn" id="btn-tc-max" title="最大速度">▶▶▶</button>
+        </span>
       </div>
       <span id="save-status">已同步</span>
       <span id="ui-username" style="color:var(--text)"></span>
@@ -110,6 +128,8 @@
       功法<span class="tab-badge" id="tab-technique-badge">未习得</span>
     </button>
   </nav>
+
+  </div><!-- /top-stack -->
 
   <main class="main">
 
@@ -163,21 +183,111 @@
         <div class="panel">
           <div class="panel-head">
             <h2>时间流速</h2>
-            <span class="hint" id="ui-tier-hint">境界越高，光阴越快</span>
+            <span class="hint" id="ui-tier-hint">顶栏可随时调整</span>
           </div>
           <div class="panel-body tight">
-            <div class="tier-list" id="tier-list"></div>
-            <label class="auto-tier-row">
-              <input type="checkbox" id="chk-auto-tier" checked>
-              <span>自动跟随最高已解锁档位</span>
-            </label>
             <div class="note-line" id="ui-tier-note">
               当前：<b id="ui-tier-current">1 秒 = 10 分钟</b>　
               <span class="dim">游戏内 1 月 = 30 天，1 年 = 12 月</span>
             </div>
+            <div class="note-line dim" style="font-size:12px">
+              时间流速的四个按钮就在顶栏的游戏时间旁：◀ 减速 · ▶ 常速/暂停 · ▶▶ 加速 · ▶▶▶ 最大速。
+              <b>1 秒 = 1 游戏年</b>这一档要<b>化神</b>之后才解锁 —— 超出元婴再给最高速，
+              终局循环里反复重爬才不至于每世都耗同样的挂机时间。
+            </div>
           </div>
         </div>
 
+      </div>
+
+      <!-- ---------- 渡劫（突破境界的门槛） ---------- -->
+      <div class="panel" id="tribulation-panel">
+        <div class="panel-head">
+          <h2>渡劫</h2>
+          <span class="hint" id="ui-tb-hint">灵气满格之后，须渡劫方能升境</span>
+        </div>
+
+        <div class="panel-body">
+          <div class="rb-stats">
+            <div class="rb-stat"><span class="k">渡劫淬体</span>
+              <span class="v gold"><span id="ui-tb-level">0</span><span class="u" id="ui-tb-max"> / 40 层</span></span></div>
+            <div class="rb-stat"><span class="k">本次成功率</span><span class="v" id="ui-tb-rate">—</span></div>
+            <div class="rb-stat"><span class="k">已渡劫</span><span class="v"><span id="ui-tb-attempts">0</span><span class="u"> 次</span></span></div>
+            <div class="rb-stat"><span class="k">失败</span><span class="v"><span id="ui-tb-failures">0</span><span class="u"> 次</span></span></div>
+          </div>
+
+          <div class="tb-block">
+            <div class="tb-block-head"><span>成功率构成</span>
+              <span class="dim">算力越厚越稳；上限 95%，渡劫永远有风险</span></div>
+            <div class="tb-odds" id="ui-tb-odds"></div>
+          </div>
+
+          <div class="tb-block">
+            <div class="tb-block-head"><span>渡劫淬体 · 永久加成</span>
+              <span class="dim">跨兵解保留，每一世都叠上去</span></div>
+            <div class="tb-boons" id="ui-tb-boons"></div>
+          </div>
+
+          <label class="auto-tier-row">
+            <input type="checkbox" id="chk-auto-tribulation" checked>
+            <span>灵气满格时自动渡劫<em class="dim">（关掉后先堆厚算力再动手，能把成功率抬最多 15 个百分点）</em></span>
+          </label>
+
+          <button class="btn full tb-btn" id="btn-tribulation" disabled>渡劫</button>
+
+          <p class="dim" id="ui-tb-warn">
+            渡劫失败 → <b>被动兵解</b>：这一世作废。
+            <b>元婴之下连设备与功法一并清空</b>；元婴及以上则等同主动兵解，只是道行打三折。
+          </p>
+        </div>
+      </div>
+
+      <!-- ---------- 兵解 · 转生（终局循环） ---------- -->
+      <div class="panel" id="rebirth-panel">
+        <div class="panel-head">
+          <h2>兵解 · 转生</h2>
+          <span class="hint" id="ui-rb-hint">元婴之后，才有资格谈重塑</span>
+        </div>
+
+        <!-- 未达门槛 -->
+        <div class="panel-body" id="rb-lock">
+          <p class="locked-note" id="ui-rb-lock">需达到「元婴」才能兵解</p>
+          <p class="dim"><b>主动兵解</b>（需元婴）是这一世的终点：<b>境界与灵气归零、金钱与灵石归零、
+             公司与股市全部清空、投向配置与累计产出重置</b>；功法本体与熟练度段位保留、
+             设备保留（但算力与神识倍率会被<b>压掉几个数量级</b>，即「转生衰减」）、
+             渡劫淬体层数与工作履历保留。作为交换你会获得<b>道行</b>，用来购买永久加成 ——
+             每一世都比上一世爬得更快。</p>
+        </div>
+
+        <!-- 已解锁 -->
+        <div class="panel-body hidden" id="rb-main">
+          <div class="rb-stats">
+            <div class="rb-stat"><span class="k">已兵解</span><span class="v" id="ui-rb-count">0</span><span class="u">次</span></div>
+            <div class="rb-stat"><span class="k">可用道行</span><span class="v gold" id="ui-rb-dao">0</span></div>
+            <div class="rb-stat"><span class="k">累计道行</span><span class="v" id="ui-rb-daototal">0</span></div>
+            <div class="rb-stat"><span class="k">设备算力衰减</span><span class="v" id="ui-rb-disc">原值</span></div>
+          </div>
+
+          <div class="rb-gain-line">
+            现在兵解可得 <b class="gold" id="ui-rb-gain">100</b> 道行
+            <span class="dim">（渡劫失败触发的被动兵解只有 <b id="ui-rb-gain-passive">30</b>）</span>
+          </div>
+          <div class="rb-next-line dim" id="ui-rb-nextline">—</div>
+
+          <button class="btn danger full" id="btn-rebirth">兵解转生</button>
+
+          <div class="rb-sub-head">
+            <span>道行加成</span>
+            <span class="dim">每项都有硬上限；等级只增不减</span>
+          </div>
+          <div class="rb-perks" id="rb-perk-list"></div>
+
+          <div class="rb-sub-head">
+            <span>兵解记录</span>
+            <span class="dim">最多保留最近 8 条</span>
+          </div>
+          <div class="rb-history" id="rb-history"></div>
+        </div>
       </div>
 
       <div class="panel">
@@ -202,7 +312,7 @@
           <p><b>关于投向</b></p>
           <p>算力是有限资源，分配比例之和不超过 100%。<span class="c-red">修仙</span>产出灵气（境界唯一来源），
              <span class="c-red">金融</span>即时变现，<span class="c-red">AI</span>与<span class="c-red">硬件</span>是长线全局加成，
-             <span class="c-red">功法增幅</span>在习得功法后解锁。</p>
+             <span class="c-red">功法算力投入</span>在习得功法后解锁。</p>
           <p><b>离线收益</b></p>
           <p>离线时间按 30% 效率结算，最多累计 48 小时。离线期间工作与功法修炼都会继续，工作同样受精力上限约束。</p>
         </div>
@@ -348,7 +458,7 @@
             </div>
             <div class="locked-note">
               <span class="dot"></span>
-              <span>商品 <b>市价会波动</b>：科技类逐年变价，修仙类每 10 年变价（涨红跌绿）</span>
+              <span>商品 <b>市价会波动</b>：科技类每 1 分钟变价，修仙类每 10 分钟变价（涨红跌绿；按现实时间走，与时间档位无关）</span>
             </div>
           </div>
 
@@ -517,7 +627,7 @@
       <div class="panel">
         <div class="panel-head">
           <h2>商品行情</h2>
-          <span class="hint" id="ui-mk-market-hint">科技类逐年变价 · 修仙类每 10 年变价</span>
+          <span class="hint" id="ui-mk-market-hint">科技类每 1 分钟变价 · 修仙类每 10 分钟变价</span>
         </div>
         <div id="mk-good-list"></div>
         <div class="co-market-foot" id="mk-foot">
@@ -683,7 +793,7 @@
             </div>
             <div class="locked-note">
               <span class="dot"></span>
-              <span>「投向」页的 <b>功法增幅</b> 项同样处于锁定状态，无法分配算力</span>
+              <span>「投向」页的 <b>功法算力投入</b> 项同样处于锁定状态，无法分配算力</span>
             </div>
             <div class="locked-note">
               <span class="dot"></span>
@@ -719,8 +829,20 @@
               <div class="tech-kv">
                 <span class="k">功法等级</span>
                 <span class="v" id="ui-tech-level">0</span>
-                <span class="dim">由算力换算，无上限</span>
+                <span class="dim">修炼积累经验升级，无上限；只涨这一本</span>
               </div>
+              <div class="mastery-wrap">
+                <div class="mastery-head">
+                  <span>功法经验</span>
+                  <span class="v" id="ui-tech-exp-lv">Lv.0</span>
+                </div>
+                <div class="bar"><div class="fill azure" id="ui-tech-exp-bar"></div></div>
+                <div class="mastery-meta">
+                  <span id="ui-tech-exp-val">0 / 30</span>
+                  <span id="ui-tech-exp-rate">+0 / 秒</span>
+                </div>
+              </div>
+
               <div class="tech-kv">
                 <span class="k">主属性 · 灵气吸收</span>
                 <span class="v jade" id="ui-tech-main">+0%</span>
@@ -777,9 +899,14 @@
         <div class="panel">
           <div class="panel-head">
             <h2>功法阁</h2>
-            <span class="hint" id="ui-tech-count">0 / 6 已得</span>
+            <span class="hint" id="ui-tech-count">0 / 0 已得</span>
+            <span class="tech-view-toggle">
+              <button class="btn sm" id="btn-tech-owned" title="只显示已拥有的功法">已得</button>
+              <button class="btn sm ghost" id="btn-tech-codex" title="查看全部功法与解锁条件">图鉴</button>
+            </span>
           </div>
           <div id="tech-list"></div>
+          <div id="tech-codex" class="hidden"></div>
         </div>
 
         <div class="panel">
@@ -798,9 +925,39 @@
 
 <div id="toast-zone"></div>
 
+<!-- ---------- 兵解确认弹窗（不可撤销，必须列清三栏） ---------- -->
+<div class="modal-mask hidden" id="rebirth-modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>兵解 · 转生</h3>
+      <p class="dim">这一步不可撤销。确认前请看清：你失去什么、保留什么、得到什么。</p>
+    </div>
+    <div class="modal-body" id="rb-confirm-body">
+      <div class="rb-col lost">
+        <div class="rb-col-head">失去</div>
+        <ul id="rb-lost-list"></ul>
+      </div>
+      <div class="rb-col keep">
+        <div class="rb-col-head">保留</div>
+        <ul id="rb-keep-list"></ul>
+      </div>
+      <div class="rb-col gain">
+        <div class="rb-col-head">获得</div>
+        <ul id="rb-gain-list"></ul>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="btn-rebirth-cancel">再想想</button>
+      <button class="btn danger" id="btn-rebirth-confirm">确认兵解</button>
+    </div>
+  </div>
+</div>
+
 <script src="/shared/decimal.js"></script>
 <script src="/shared/game-config.js"></script>
-<script src="/shared/game-core.js"></script>
-<script src="/js/app.js"></script>
+<!-- 版本参数用于打破浏览器缓存：shared 与 public 改动后忘了强刷，
+     玩家会一直跑旧代码（本机实测踩过 —— 页面明明更新了，事件栏却永远不动）。 -->
+<script src="/shared/game-core.js?v=3.5"></script>
+<script src="/js/app.js?v=3.5"></script>
 </body>
 </html>

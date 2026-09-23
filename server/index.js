@@ -7,7 +7,6 @@
  */
 
 const path = require('path');
-const crypto = require('crypto');
 const express = require('express');
 const dbm = require('./db');
 const GameCore = require('../shared/game-core.js');
@@ -21,18 +20,17 @@ app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/shared', express.static(path.join(__dirname, '..', 'shared')));
 
-// ---------- 会话（内存 token，重启后需重新登录） ----------
-const sessions = new Map(); // token -> { userId, username, created }
-
-function newToken() {
-  return crypto.randomBytes(24).toString('hex');
-}
+// ---------- 会话 ----------
+//
+// token 落盘在 SQLite 的 sessions 表（见 db.js），服务端重启后依然有效。
+// 早先用内存 Map，重启一次全部作废 —— 前端明明存着 token，还是被迫重新登录一次。
 
 function auth(req, res, next) {
   const token = req.get('x-token') || (req.body && req.body.token);
-  const sess = token && sessions.get(token);
+  const sess = token && dbm.getSession(token);
   if (!sess) return res.status(401).json({ ok: false, msg: '未登录或登录已失效' });
   req.user = sess;
+  req.token = sess.token;
   next();
 }
 
@@ -41,8 +39,7 @@ app.post('/api/register', (req, res) => {
   const { username, password } = req.body || {};
   const r = dbm.register(username, password);
   if (!r.ok) return res.status(400).json(r);
-  const token = newToken();
-  sessions.set(token, { userId: r.userId, username: r.username, created: Date.now() });
+  const token = dbm.createSession(r.userId, r.username);
   res.json({ ok: true, token, username: r.username, userId: r.userId });
 });
 
@@ -50,14 +47,12 @@ app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
   const r = dbm.login(username, password);
   if (!r.ok) return res.status(400).json(r);
-  const token = newToken();
-  sessions.set(token, { userId: r.userId, username: r.username, created: Date.now() });
+  const token = dbm.createSession(r.userId, r.username);
   res.json({ ok: true, token, username: r.username, userId: r.userId });
 });
 
 app.post('/api/logout', auth, (req, res) => {
-  const token = req.get('x-token') || (req.body && req.body.token);
-  sessions.delete(token);
+  dbm.deleteSession(req.token || req.get('x-token') || (req.body && req.body.token));
   res.json({ ok: true });
 });
 
@@ -210,6 +205,13 @@ app.post('/api/save', auth, (req, res) => {
       if (prevCo.cycles > nextCo.cycles) nextCo.cycles = prevCo.cycles;
       if (prevCo.totalRevenue.gt(nextCo.totalRevenue)) nextCo.totalRevenue = prevCo.totalRevenue;
       if (prevCo.totalUpkeep.gt(nextCo.totalUpkeep)) nextCo.totalUpkeep = prevCo.totalUpkeep;
+      // 历史最高抛压（v3.4）：「操控市场」类功法成就的凭据，只增不减
+      {
+        const pk = Number(nextCo.peakPressure);
+        const cur = Math.max(0, Math.min(1, Number.isFinite(pk) ? pk : 0));
+        const prevPk = Number(prevCo.peakPressure) || 0;
+        nextCo.peakPressure = Math.max(cur, prevPk);
+      }
       // 生产线：现在是「每台独立配置」的结构（{ units: [{p 产物, r 产能}] }）。
       // 台数只增不减；每台造什么、开几成力由玩家自己改，但要夹到合法范围内 ——
       // 产物必须是这条线能造的（否则可以拿矿线造芯片），产能必须在 [0, 1]。
@@ -274,6 +276,63 @@ app.post('/api/save', auth, (req, res) => {
       if (prevSk.totalFee.gt(nextSk.totalFee)) nextSk.totalFee = prevSk.totalFee;
       if (prevSk.realized.gt(nextSk.realized)) nextSk.realized = prevSk.realized;
       if (prevSk.totalTrades > nextSk.totalTrades) nextSk.totalTrades = prevSk.totalTrades;
+    }
+
+    // 转生（兵解）：兵解次数、累计道行、每项加成的等级**只增不减**；
+    // 未分配道行会因为消费加成而减少，所以它不做「只增」，改为夹到 [0, daoTotal]。
+    // 等级另夹到该加成的 maxLevel —— 不加这一道，玩家可以直接把加成填到天上。
+    const prevRb = prevState.rebirth;
+    const nextRb = incoming.rebirth;
+    if (prevRb && nextRb) {
+      // 兵解是不可逆的单向门：服务端记的次数不可能变小。
+      // 如果 incoming 的次数更小，说明客户端手里是**兵解之前**的旧存档
+      // （典型场景：另一个标签页还在用旧 state 定时回写）。这时直接以服务端为准返回，
+      // 否则下面的「公司 founded 只增 / 生产线台数只增」会把兵解清空的资产又补回来。
+      if (prevRb.count > nextRb.count) {
+        return res.status(409).json({
+          ok: false,
+          msg: '存档已过期（该账号已完成兵解），已改用服务端版本',
+          state: dbm.loadSave(req.user.userId),
+        });
+      }
+      if (prevRb.daoTotal > nextRb.daoTotal) nextRb.daoTotal = prevRb.daoTotal;
+      let dao = Math.floor(Number(nextRb.dao) || 0);
+      if (dao < 0) dao = 0;
+      if (dao > nextRb.daoTotal) dao = nextRb.daoTotal;
+      nextRb.dao = dao;
+      if (!nextRb.perks || typeof nextRb.perks !== 'object') nextRb.perks = {};
+      for (const p of ((GAME.rebirth && GAME.rebirth.perks) || [])) {
+        const prevLv = Math.floor(Number((prevRb.perks || {})[p.id]) || 0);
+        let lv = Math.floor(Number(nextRb.perks[p.id]) || 0);
+        const maxLv = Math.floor(p.maxLevel || 0);
+        if (lv < prevLv) lv = prevLv;
+        if (lv > maxLv) lv = maxLv;
+        nextRb.perks[p.id] = lv;
+      }
+      // 转生衰减快照（v3.4）：只在兵解瞬间随 count 一起变化。
+      // 次数没变却带来不同快照 → 以服务端为准（防止改小快照抬高有效算力）；
+      // 次数变大（刚在服务端完成兵解）→ 接受客户端带回的新快照。
+      if (prevRb.count === nextRb.count) {
+        nextRb.baseCompute = prevRb.baseCompute !== undefined ? prevRb.baseCompute : null;
+        nextRb.baseShenshi = prevRb.baseShenshi !== undefined ? prevRb.baseShenshi : null;
+      }
+    }
+
+    // 渡劫淬体：层数 / 次数**只增不减**。
+    // 它是跨兵解保留的永久沉淀，任何时候变小都只可能是改档；
+    // 夹到配置的 maxLevel —— 不加这一道，玩家可以直接把层数填满。
+    {
+      const prevT = prevState.tribulation || null;
+      const nextT = incoming.tribulation || null;
+      if (prevT && nextT) {
+        const maxLv = Math.floor(((GAME.tribulation && GAME.tribulation.maxLevel) || 40));
+        let lv = Math.floor(Number(nextT.level) || 0);
+        if (lv < prevT.level) lv = prevT.level;
+        if (lv > maxLv) lv = maxLv;
+        nextT.level = lv;
+        if ((nextT.attempts || 0) < (prevT.attempts || 0)) nextT.attempts = prevT.attempts;
+        if ((nextT.failures || 0) < (prevT.failures || 0)) nextT.failures = prevT.failures;
+      }
     }
   }
 
@@ -495,6 +554,70 @@ app.post('/api/action', auth, (req, res) => {
       };
       break;
     }
+    case 'rebirth': {
+      // 兵解（转生）—— 服务端权威执行：客户端只提交「确认兵解」这个意图，
+      // 道行收益、重置清单、转生折扣全部由服务端重算，避免前端改数值。
+      // mode: 'active'（默认，主动兵解，需境界 ≥ 元婴）| 'passive'（渡劫失败，道行三折）。
+      // 主动入口在界面上；被动入口由 doTribulation 内部调用，走的是后端同一段代码。
+      const mode = (payload && payload.mode === 'passive') ? 'passive' : 'active';
+      const r = GameCore.doRebirth(s, mode);
+      if (!r.ok) {
+        dbm.saveGame(req.user.userId, GameCore.serialize(s));
+        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
+      }
+      result = {
+        ok: true, dao: r.dao, count: r.count, mode: r.mode,
+        fullWipe: r.fullWipe, discount: r.discount, lost: r.lost,
+      };
+      break;
+    }
+    case 'tribulation': {
+      // 渡劫 —— 突破境界的唯一出口。
+      //
+      // ⚠️ 为什么必须由服务端执行（而浏览器端的本地 tick 刻意不自动渡劫）：
+      // 渡劫失败会触发被动兵解，而**兵解会清空设备与功法** —— 这两样在
+      // /api/save 里是「只增不减」的。如果本地先失败、再由 /api/save 回写，
+      // 服务端会把清掉的资产原样补回来，出现「界面已归零、服务器还留着元婴」。
+      // 走 /api/action 则直接落库，绕开了那层只增保护，两端才一致。
+      const r = GameCore.doTribulation(s);
+      if (!r.ok) {
+        dbm.saveGame(req.user.userId, GameCore.serialize(s));
+        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
+      }
+      result = {
+        ok: true,
+        success: r.success,
+        rate: r.rate,
+        realm: r.realm,
+        realmName: r.realmName,
+        level: r.level,
+        maxLevel: r.maxLevel,
+        lostRealm: r.lostRealm,
+        lostRealmName: r.lostRealmName,
+        dao: r.dao,
+        fullWipe: r.fullWipe,
+        boons: r.boons,
+      };
+      break;
+    }
+    case 'setAutoTribulation': {
+      const on = !!(payload && payload.on);
+      const r = GameCore.setAutoTribulation(s, on);
+      result = { ok: true, auto: r.auto };
+      break;
+    }
+    case 'buyPerk': {
+      const r = GameCore.buyPerk(s, payload && payload.perkId);
+      if (!r.ok) {
+        dbm.saveGame(req.user.userId, GameCore.serialize(s));
+        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
+      }
+      result = {
+        ok: true, id: r.id, name: r.name, level: r.level,
+        cost: r.cost, daoLeft: r.daoLeft,
+      };
+      break;
+    }
     default:
       return res.status(400).json({ ok: false, msg: '未知操作: ' + action });
   }
@@ -530,6 +653,10 @@ function publicConfig() {
     })),
     investments: GAME.investments.map((i) => ({
       id: i.id, name: i.name, desc: i.desc, period: i.period, locked: !!i.locked,
+      /** 产出量纲（前端据此换算显示，不能直接把 investOutput 当资源显示） */
+      unit: i.unit || '',
+      /** 锁定原因文案（功法增幅 = 未习得功法，工业产能 = 未成立公司） */
+      lockReason: i.lockReason || '',
     })),
     jobs: GAME.jobs.map((j) => ({
       id: j.id, name: j.name, real: j.real, tier: j.tier, hours: j.hours,
@@ -557,7 +684,7 @@ function publicConfig() {
         computePerUnit: g.computePerUnit, outputCoef: g.outputCoef,
         upkeep: g.upkeep,
         volatility: g.volatility, minFactor: g.minFactor, maxFactor: g.maxFactor,
-        periodYears: g.periodYears,
+        periodSeconds: g.periodSeconds,
       })),
       /** 行业表 —— 上下游与成本传导都挂在这里 */
       industries: GAME.company.industries.map((ind) => ({
@@ -595,17 +722,21 @@ function publicConfig() {
         kind: st.kind || 'tech', sector: st.sector || null,
         basePrice: st.basePrice, volatility: st.volatility,
         minFactor: st.minFactor, maxFactor: st.maxFactor,
-        depth: st.depth, periodYears: st.periodYears, desc: st.desc,
+        depth: st.depth, periodSeconds: st.periodSeconds, desc: st.desc,
       })),
     },
     offline: GAME.offline,
+    /** 转生（兵解）：门槛 / 道行参数 / 折扣公式 / 加成表 —— 前端渲染兵解面板要用 */
+    rebirth: GAME.rebirth,
+    /** 渡劫：成功率表 / 准备度上限 / 淬体加成表 / 被动兵解规则 */
+    tribulation: GAME.tribulation,
   };
 }
 
 /**
  * 公司视图 —— 把「配置里的公司」与「玩家存档里的公司」合成前端要的结构。
- * 市价 / 涨跌 / 下次变价时间都由 game-core 用 gameSeconds 确定性算出，
- * 前端不需要自己实现任何价格逻辑。
+ * 市价 / 涨跌 / 下次变价时间都由 game-core 用「现实秒累计」（marketClock）确定性算出，
+ * 前端不需要自己实现任何价格逻辑。行情挂在现实时间上，与时间档位无关。
  */
 function buildCompanyView(s) {
   const cyc = GAME.company.cycleRealSeconds || 20;
@@ -655,14 +786,14 @@ function buildCompanyView(s) {
         id: g.id, name: g.name, kind: g.kind, basePrice: g.basePrice,
         industry: g.industry,
         industryName: (GameCore.industryById(g.industry) || {}).name || '',
-        periodYears: g.periodYears,
+        periodSeconds: g.periodSeconds,
         outputCoef: g.outputCoef,
         upkeepRate: g.upkeepRate,
         price: price.toJSON(),
         factor: price.div(new Decimal(g.basePrice)).toNumber(),
         naturalPrice: ms ? ms.naturalPrice.toJSON() : price.toJSON(),
-        trend: GameCore.goodsTrend(g, s.gameSeconds),
-        nextChangeIn: GameCore.goodsNextChangeIn(g, s.gameSeconds),
+        trend: GameCore.goodsTrend(g, GameCore.marketClock(s)),
+        nextChangeIn: GameCore.goodsNextChangeIn(g, GameCore.marketClock(s)),
         stock: stock,
         sold: s.company.goodsSold[g.id] || 0,
         stockValue: price.mul(stock).toJSON(),
@@ -803,7 +934,7 @@ function buildStockView(s) {
       /** 主营业务 —— 行情一动就能看出波及哪家 */
       business: x.business || '',
       kind: x.kind || 'tech', sector: x.sector || null,
-      basePrice: x.basePrice, depth: x.depth, periodYears: x.periodYears,
+      basePrice: x.basePrice, depth: x.depth, periodSeconds: x.periodSeconds,
       /** 市值 = 现价 × 流通盘，榜单排序依据 */
       marketCap: x.marketCap.toJSON(),
       period: x.period, nextPeriod: x.nextPeriod,
@@ -844,12 +975,16 @@ function buildView(s) {
   return {
     money: s.money.toJSON(),
     realCompute: s.realCompute.toJSON(),
-    deviceCompute: GameCore.totalCompute(s).toJSON(),
+    /** 设备算力（**已应用转生衰减**）—— 界面上的「设备提供」必须与实际口径一致 */
+    deviceCompute: GameCore.deviceComputeEffective(s).toJSON(),
     aiBonus: s.aiBonus.toJSON(),
-    costDiscount: s.costDiscount,
+    /** v3.5：计算设备领域的累积议价值（设备折扣按它稀释） */
+    investedHardware: s.investedHardware.toJSON(),
 
     // ---- 时间 ----
     gameSeconds: s.gameSeconds,
+    /** 行情时钟（现实秒累计）—— 市场与股市的「期」按它推进，与时间档位无关 */
+    playTime: s.playTime,
     timeTier: s.timeTier,
     autoTier: s.autoTier,
     maxTier: GameCore.maxUnlockedTier(s),
@@ -872,6 +1007,19 @@ function buildView(s) {
     shenshi: GameCore.totalShenshi(s),
     shenshiBase: GameCore.shenshiBase(s),
     shenshiDeviceMultiplier: GameCore.shenshiDeviceMultiplier(s),
+    /**
+     * 神识对「算力 / 修炼速度」的**实际乘区**（分层阻尼后的口径）。
+     * 界面显示加成百分比时要照这个来，不能再用「神识总量 × 固定系数」——
+     * 那个口径在后期会明显大于实际值，属于「UI 显示成功率与实际不符」类问题。
+     */
+    shenshiComputeMultiplier: GameCore.shenshiComputeMultiplier(s),
+    shenshiCultivateMultiplier: GameCore.shenshiCultivateMultiplier(s),
+
+    // ---- 转生（兵解）----
+    rebirth: GameCore.rebirthSummary(s),
+
+    // ---- 渡劫（突破境界的门槛）----
+    tribulation: GameCore.tribulationSummary(s),
 
     // ---- 修仙（灵气 / 灵石 / 功法）----
     qi: s.qi.toJSON(),
@@ -923,11 +1071,18 @@ function buildView(s) {
 }
 
 // ---------- 启动 ----------
+// 会话表落盘，所以重启服务端不会让所有人重新登录 —— 只顺手清掉已过期的那些。
+const purgedSessions = dbm.purgeSessions();
+
 app.listen(PORT, () => {
+  const ss = dbm.sessionStats();
   console.log('');
   console.log('  算力修仙 服务已启动');
   console.log('  http://localhost:' + PORT);
   console.log('');
   console.log('  数据目录: ' + path.join(__dirname, '..', 'data'));
+  console.log('  会话: 有效 ' + ss.total + ' 个（有效期 ' + ss.ttlDays + ' 天，已落盘）'
+    + (purgedSessions > 0 ? '，本次清理过期 ' + purgedSessions + ' 个' : ''));
+  console.log('  登录状态会保留：服务端重启后，之前登录过的浏览器无需重新登录');
   console.log('');
 });

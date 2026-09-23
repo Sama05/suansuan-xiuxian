@@ -118,12 +118,15 @@ function installStubs() {
   const Core = require(path.join(ROOT, 'shared', 'game-core.js'));
   const GAME = global.GAME;
 
+  /** 变价周期（现实秒）→ 文案 */
+  const fmtPer = (g) => (g.periodSeconds >= 60 ? (g.periodSeconds / 60) + ' 分钟' : g.periodSeconds + ' 秒');
+
   // ---------- 造一个「多条产线 + 有库存」的存档 ----------
   const s = Core.createState();
   s.realm = 4;
   s.money = new Decimal(1e15);
   s.working = false;
-  s.gameSeconds = 360 * 86400 * 40;   // 停在第 40 游戏年，避开开市期
+  s.playTime = 60 * 40;               // 停在第 40 期（科技类 60 秒一期），避开开市期
   Core.foundCompany(s);
   // 沿解锁链铺开：每条线尽量多买，买不动（前置数量/境界不够）就停在那一档
   for (const l of GAME.company.lines) {
@@ -141,12 +144,12 @@ function installStubs() {
   for (const id of Object.keys(pressured)) s.company.pressure[id] = pressured[id];
   // 期数游标推到当前期，否则首次结算会把刚种下的抛压当积压上百期衰减掉
   for (const g of GAME.company.goods) {
-    s.company.lastPeriod[g.id] = Core.goodsPeriod(g, s.gameSeconds);
+    s.company.lastPeriod[g.id] = Core.goodsPeriod(g, s.playTime);
   }
   const snap = Core.serialize(s);
 
-  console.log('存档就绪：第 ' + Math.floor(s.gameSeconds / (360 * 86400)) + ' 游戏年，'
-    + '产线 ' + Object.keys(s.company.lines).filter((k) => s.company.lines[k] > 0).length + ' 种，'
+  console.log('存档就绪：第 ' + Math.floor(s.playTime / 60) + ' 期，'
+    + '产线 ' + GAME.company.lines.filter((l) => Core.lineOwned(s, l.id) > 0).length + ' 种，'
     + '库存 ' + Core.stockTotal(s) + ' 件');
 
   // ---------- 跑真实的前端脚本 ----------
@@ -154,7 +157,7 @@ function installStubs() {
   EL_CACHE['co-line-list'] = mkListMock(
     GAME.company.lines.map((l) => l.id),
     ['lowned', 'lcap', 'lstats', 'llock', 'lprice', 'lbuy'], 'line');
-  EL_CACHE['co-good-list'] = mkListMock(
+  EL_CACHE['mk-good-list'] = mkListMock(
     GAME.company.goods.map((g) => g.id),
     ['gprice', 'gtrend', 'gmeta', 'gpress', 'gpressbar', 'gpresstxt',
      'gstock', 'gvalue', 'gsell', 'gspark'], 'good');
@@ -177,11 +180,11 @@ function installStubs() {
   await new Promise((r) => setTimeout(r, 120));   // 等 boot 的异步渲染落地
 
   // ---------- 取渲染结果 ----------
-  const chart = String(EL_CACHE['co-chart-body'].innerHTML);
+  const chart = String(EL_CACHE['mk-chart-body'].innerHTML);
   const rows = GAME.company.goods.map((g) => {
-    const it = EL_CACHE['co-good-list']._items.find((x) => x.dataset.good === g.id);
+    const it = EL_CACHE['mk-good-list']._items.find((x) => x.dataset.good === g.id);
     const spark = it ? String(it._sub.gspark.innerHTML) : '';
-    const trend = Core.goodsTrend(g, s.gameSeconds);
+    const trend = Core.goodsTrend(g, s.playTime);
     const cls = trend === 'up' ? 'up' : (trend === 'down' ? 'down' : 'flat');
     const arrow = trend === 'up' ? '▲ 涨' : (trend === 'down' ? '▼ 跌' : '— 平');
     const pr = Core.pressureOf(s, g.id);
@@ -191,13 +194,13 @@ function installStubs() {
         + '<span class="co-press-label">抛压</span>'
         + '<span class="co-press-bar"><i style="width:' + Math.round(pr * 100) + '%"></i></span>'
         + '<span class="co-press-txt">已被压 −' + (drop * 100).toFixed(1) + '%'
-        + '<span class="faint">　本应 ' + Core.naturalPrice(g, s.gameSeconds).toString()
+        + '<span class="faint">　本应 ' + Core.naturalPrice(g, s.playTime).toString()
         + '　卖出后下一期起跳</span></span></div>'
       : '';
     return '<div class="pv-row">'
       + '<div class="pv-name">' + g.name
       + '<span class="co-line-tag ' + (g.kind === 'xiuxian' ? 'xiuxian' : 'tech') + '">'
-      + (g.kind === 'xiuxian' ? '修仙类' : '科技类') + ' · 每 ' + g.periodYears + ' 年变价</span>'
+      + (g.kind === 'xiuxian' ? '修仙类' : '科技类') + ' · 每 ' + fmtPer(g) + '变价</span>'
       + press
       + '</div>'
       + '<div class="co-good-spark pv-spark">' + spark + '</div>'
@@ -206,7 +209,7 @@ function installStubs() {
   }).join('');
 
   if (!chart || chart.indexOf('<svg') !== 0) {
-    console.error('渲染失败：co-chart-body 里没有 SVG，预览中止');
+    console.error('渲染失败：mk-chart-body 里没有 SVG，预览中止');
     process.exit(1);
   }
   if (chart.indexOf('NaN') >= 0) {
@@ -251,7 +254,7 @@ function installStubs() {
     + '</style></head><body>'
     + '<h1>价格走势图 · 静态预览</h1>'
     + '<div class="pv-note">由 tools/chart-preview.js 跑真实前端脚本导出，'
-    + '存档时间：第 ' + Math.floor(s.gameSeconds / (360 * 86400)) + ' 游戏年'
+    + '存档时间：第 ' + Math.floor(s.playTime / 60) + ' 期'
     + '　·　灰色细虚线 = 不受抛压的自然价，与实线的落差就是玩家自己砸出来的'
     + '</div>'
 
@@ -259,11 +262,11 @@ function installStubs() {
     + '<h2>市场走势（大图）</h2><span class="hint">点商品行切换 · 这里只显示默认选中项</span>'
     + '</div><div class="co-chart-wrap">'
     + '<div class="co-chart-head">'
-    + '<span class="co-chart-name">' + EL_CACHE['ui-co-chart-name'].textContent + '</span>'
-    + '<span class="co-chart-tag">' + EL_CACHE['ui-co-chart-tag'].textContent + '</span>'
+    + '<span class="co-chart-name">' + EL_CACHE['ui-mk-chart-name'].textContent + '</span>'
+    + '<span class="co-chart-tag">' + EL_CACHE['ui-mk-chart-tag'].textContent + '</span>'
     + legend + '</div>'
     + '<div class="co-chart-body">' + chart + '</div>'
-    + '<div class="co-chart-foot">' + EL_CACHE['ui-co-chart-foot'].textContent + '</div>'
+    + '<div class="co-chart-foot">' + EL_CACHE['ui-mk-chart-foot'].textContent + '</div>'
     + '</div></div>'
 
     + '<div class="panel pv-panel"><div class="panel-head">'
