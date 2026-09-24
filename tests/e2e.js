@@ -1465,6 +1465,61 @@ async function req(path, opts) {
     ok(Core.hydrate(r.data.state).autoTribulation === false, '开关已落盘');
   }
 
+  console.log('\n=== 认证：同步 / 异步两条路径 ===');
+  {
+    // 背景：服务端为了不阻塞事件循环，把 register / login 改成了 async（路由 await）。
+    // 但命令行工具是同步代码，直接调会拿到 Promise —— `r.ok` 恒为 undefined，
+    // 工具静默地建不出号、登不上号。所以 db 层必须同时提供同步版，
+    // 并且这里加一条**静态守卫**，防止以后有人又把 tools/ 里的调用写回异步版。
+    const dbm2 = require('../server/db.js');
+    const fs = require('fs');
+    const pathMod = require('path');
+
+    ok(typeof dbm2.registerSync === 'function' && typeof dbm2.loginSync === 'function',
+      'db 层同时导出同步版 registerSync / loginSync');
+
+    const u2 = 'synctest_' + Date.now().toString(36);
+    const rs = dbm2.registerSync(u2, 'test1234');
+    ok(rs.ok === true && rs.userId > 0 && typeof rs.then !== 'function',
+      'registerSync 同步返回结果（不是 Promise）', JSON.stringify(rs));
+    ok(dbm2.registerSync(u2, 'test1234').ok === false, 'registerSync 同样拒绝重名');
+    ok(dbm2.registerSync('x', 'test1234').ok === false, 'registerSync 同样做长度校验');
+    ok(dbm2.registerSync('okname_' + Date.now().toString(36), '12').ok === false,
+      'registerSync 同样做密码长度校验');
+
+    const ls = dbm2.loginSync(u2, 'test1234');
+    ok(ls.ok === true && ls.userId === rs.userId, 'loginSync 校验通过', JSON.stringify(ls));
+    ok(dbm2.loginSync(u2, 'wrongpwd').ok === false, 'loginSync 拒绝错误密码');
+    ok(dbm2.loginSync('nobody_' + Date.now().toString(36), 'test1234').ok === false,
+      'loginSync 拒绝不存在的账号');
+
+    const u3 = 'asynctest_' + Date.now().toString(36);
+    const ra = dbm2.register(u3, 'test1234');
+    ok(typeof ra.then === 'function', 'register 返回 Promise（HTTP 路由才能不阻塞）');
+    const raRes = await ra;
+    ok(raRes.ok === true && raRes.username === u3, 'await register 后结果正常');
+
+    // 静态守卫：tools/ 下的离线脚本一律不许直呼异步版
+    const toolsDir = pathMod.join(__dirname, '..', 'tools');
+    const offenders = [];
+    for (const f of fs.readdirSync(toolsDir)) {
+      if (!f.endsWith('.js')) continue;
+      const src = fs.readFileSync(pathMod.join(toolsDir, f), 'utf8');
+      // 注意 `dbm.registerSync(` 不会命中 —— 正则要求 '(' 紧跟 register/login
+      if (/dbm\s*\.\s*(register|login)\s*\(/.test(src)) offenders.push(f);
+    }
+    ok(offenders.length === 0,
+      'tools/ 下没有脚本同步调用异步版 register/login', offenders.join(', '));
+
+    // 清理本段新建的两个账号，别让测试库无限膨胀
+    const ids = [rs.userId, raRes.userId];
+    dbm2.db.prepare('DELETE FROM sessions WHERE user_id IN (?, ?)').run(ids[0], ids[1]);
+    dbm2.db.prepare('DELETE FROM saves WHERE user_id IN (?, ?)').run(ids[0], ids[1]);
+    dbm2.db.prepare('DELETE FROM users WHERE id IN (?, ?)').run(ids[0], ids[1]);
+    ok(!dbm2.db.prepare('SELECT id FROM users WHERE id = ?').get(rs.userId),
+      '测试账号已清理');
+  }
+
   console.log('\n' + '='.repeat(46));
   console.log('  通过  ' + pass + '   失败  ' + fail);
   console.log('='.repeat(46) + '\n');

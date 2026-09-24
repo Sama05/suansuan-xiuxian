@@ -147,7 +147,9 @@ function findUserByName(name) {
 let u = findUserByName(username);
 let created = false;
 if (!u) {
-  const r = dbm.register(username, password);
+  // 用同步版：register 现在是 async（HTTP 路由要 await），
+  // 脚本里直接调会拿到 Promise，r.ok 恒为 undefined —— 静默建不出号。
+  const r = dbm.registerSync(username, password);
   if (!r.ok) {
     console.error('注册失败:', r.msg);
     process.exit(1);

@@ -424,9 +424,15 @@
           修仙方向为 0%，灵气不会增长，境界无法推进。若只是想攒钱买设备，这样可以；否则请给修仙留出份额。
         </div>
         <div class="panel-body tight" style="border-top:1px solid var(--border);display:flex;gap:8px">
-          <button class="btn sm" id="btn-alloc-reset" style="flex:1">全部归修仙</button>
-          <button class="btn sm" id="btn-alloc-even" style="flex:1">四路均分</button>
+          <button class="btn sm" id="btn-alloc-reset" style="flex:1"
+                  title="算力全部压给修仙方向 —— 冲境界时用">全部归修仙</button>
+          <button class="btn sm" id="btn-alloc-main" style="flex:1"
+                  title="修仙占一半，其余可用方向平分另一半 —— 长期挂机的默认解">修仙优先</button>
+          <button class="btn sm" id="btn-alloc-even" style="flex:1"
+                  title="所有已解锁方向平均分配">均分</button>
         </div>
+        <div class="panel-body tight" id="ui-alloc-preset-hint"
+             style="border-top:1px solid var(--border);color:var(--text-faint);font-size:11px;line-height:1.6"></div>
       </div>
     </section>
 
@@ -634,6 +640,15 @@
         <div class="panel-head">
           <h2>商品行情</h2>
           <span class="hint" id="ui-mk-market-hint">科技类每 1 分钟变价 · 修仙类每 10 分钟变价</span>
+        </div>
+        <!-- 排序：价格/涨幅/跌幅是「打散分组、全表排序」，行业是「回到分组」 -->
+        <div class="mk-sortbar" id="mk-sortbar">
+          <span class="mk-sort-label">排序</span>
+          <button class="mk-sort on" data-sort="industry">行业<i class="ar"></i></button>
+          <button class="mk-sort" data-sort="price">价格<i class="ar"></i></button>
+          <button class="mk-sort" data-sort="gain">涨幅<i class="ar"></i></button>
+          <button class="mk-sort" data-sort="drop">跌幅<i class="ar"></i></button>
+          <span class="mk-sort-hint" id="ui-mk-sort-hint">按行业分组展示</span>
         </div>
         <div id="mk-good-list"></div>
         <div class="co-market-foot" id="mk-foot">

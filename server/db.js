@@ -14,6 +14,11 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(path.join(DATA_DIR, 'game.db'));
 db.pragma('journal_mode = WAL');
+// WAL 不做 checkpoint 的话 -wal 文件会一直涨（写入越多涨越快），读性能也会退化。
+// 这里两件事一起做：① 启动时把已有的 WAL 合并回主库并截断；② 开自动 checkpoint，
+// 让 WAL 超过 512 页（约 2MB）时自动合并，不用等人手动处理。
+db.pragma('wal_checkpoint(TRUNCATE)');
+db.pragma('wal_autocheckpoint = 512');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -69,28 +74,72 @@ const q = {
   allSessions: db.prepare('SELECT * FROM sessions ORDER BY seen_at DESC LIMIT 20'),
 };
 
-function register(username, password) {
-  username = String(username || '').trim();
-  if (username.length < 2 || username.length > 20) {
+/**
+ * 注册前的字段校验（同步 / 异步两条注册路径共用，避免规则漂移）。
+ * 返回 { ok:true, username } 或 { ok:false, msg }。
+ */
+function validateNewAccount(username, password) {
+  const name = String(username || '').trim();
+  if (name.length < 2 || name.length > 20) {
     return { ok: false, msg: '用户名长度需为 2-20 个字符' };
   }
-  if (!/^[\w\u4e00-\u9fa5]+$/.test(username)) {
+  if (!/^[\w\u4e00-\u9fa5]+$/.test(name)) {
     return { ok: false, msg: '用户名只能包含字母、数字、下划线或中文' };
   }
-  if (!password || password.length < 4) {
+  if (!password || String(password).length < 4) {
     return { ok: false, msg: '密码至少 4 位' };
   }
-  if (q.findUser.get(username)) {
+  if (q.findUser.get(name)) {
     return { ok: false, msg: '该用户名已被注册' };
   }
-  const hash = bcrypt.hashSync(password, 10);
-  const info = q.createUser.run(username, hash, Date.now());
-  return { ok: true, userId: info.lastInsertRowid, username };
+  return { ok: true, username: name };
 }
 
-function login(username, password) {
-  username = String(username || '').trim();
-  const user = q.findUser.get(username);
+/**
+ * 注册（**异步**，HTTP 路由走这条）。
+ *
+ * bcrypt 走异步接口：hashSync 是纯 CPU 的同步阻塞，一次 ~90ms，
+ * 期间整个 Node 进程（也就是所有其它玩家的请求）都得等着。人一多就排队雪崩。
+ * 所以这里返回 Promise，路由那边 await。
+ */
+async function register(username, password) {
+  const v = validateNewAccount(username, password);
+  if (!v.ok) return v;
+  const hash = await bcrypt.hash(password, 10);
+  const info = q.createUser.run(v.username, hash, Date.now());
+  return { ok: true, userId: info.lastInsertRowid, username: v.username };
+}
+
+/**
+ * 注册（**同步**，只给离线脚本 / 造号工具用）。
+ *
+ * 存在的理由：把 register 改成 async 之后，命令行工具里那句 `dbm.register(...)`
+ * 会拿到一个 Promise，`r.ok` 恒为 undefined —— 工具会静默地建不出号。
+ * 与其让每个脚本自己 await（总有漏的），不如在这一层把两条路都摆出来。
+ */
+function registerSync(username, password) {
+  const v = validateNewAccount(username, password);
+  if (!v.ok) return v;
+  const hash = bcrypt.hashSync(password, 10);
+  const info = q.createUser.run(v.username, hash, Date.now());
+  return { ok: true, userId: info.lastInsertRowid, username: v.username };
+}
+
+/** 登录（**异步**，HTTP 路由走这条）。同理走异步 compare，别把进程堵住 */
+async function login(username, password) {
+  const name = String(username || '').trim();
+  const user = q.findUser.get(name);
+  if (!user) return { ok: false, msg: '用户名或密码错误' };
+  const okPwd = await bcrypt.compare(password || '', user.password);
+  if (!okPwd) return { ok: false, msg: '用户名或密码错误' };
+  q.touchLogin.run(Date.now(), user.id);
+  return { ok: true, userId: user.id, username: user.username };
+}
+
+/** 登录（**同步**，只给离线脚本用，理由同 registerSync） */
+function loginSync(username, password) {
+  const name = String(username || '').trim();
+  const user = q.findUser.get(name);
   if (!user) return { ok: false, msg: '用户名或密码错误' };
   if (!bcrypt.compareSync(password || '', user.password)) {
     return { ok: false, msg: '用户名或密码错误' };
@@ -168,7 +217,7 @@ function sessionStats() {
 }
 
 module.exports = {
-  register, login, loadSave, saveGame, getUser, db,
+  register, login, registerSync, loginSync, loadSave, saveGame, getUser, db,
   createSession, getSession, deleteSession, purgeSessions, sessionStats,
   SESSION_TTL_MS,
 };

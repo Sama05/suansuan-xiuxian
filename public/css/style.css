@@ -178,6 +178,7 @@ body::before {
 .btn.ghost { background: transparent; }
 .btn.block { width: 100%; display: block; }
 .btn.sm { padding: 5px 10px; font-size: 12px; }
+.btn.xs { padding: 3px 7px; font-size: 11px; line-height: 1.5; }
 
 /* ============================================================
    主界面骨架
@@ -1418,6 +1419,7 @@ body::before {
 
 .toast.ok  { border-left-color: var(--jade); }
 .toast.err { border-left-color: var(--red); }
+.toast.warn { border-left-color: var(--gold); }
 
 @keyframes toast-in {
   from { opacity: 0; transform: translateX(22px); }
@@ -2151,6 +2153,77 @@ body::before {
 }
 .mk-group-body .co-good:last-child { border-bottom: none; }
 
+/* 组头右侧的批量操作（一键满速 / 一键停工）—— 点它们不该折叠分组 */
+.mk-group-acts {
+  display: flex;
+  gap: 5px;
+  flex: none;
+  margin-left: 6px;
+}
+.mk-group-head:hover .mk-group-acts { opacity: 1; }
+.mk-group-acts .btn.xs { opacity: .82; }
+.mk-group-acts .btn.xs:hover { opacity: 1; border-color: var(--gold-dim); }
+
+/* 生产线的「优先生产」开关 */
+.co-prio {
+  margin-left: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.6;
+  border-radius: 3px;
+  cursor: pointer;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  font-family: inherit;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.co-prio:hover { color: var(--text-dim); border-color: var(--gold-dim); }
+.co-prio.on {
+  color: var(--gold);
+  border-color: var(--gold-dim);
+  background: rgba(232,185,98,.12);
+  font-weight: 600;
+}
+.co-line.prio { box-shadow: inset 2px 0 0 var(--gold-dim); }
+
+/* ---------- 商品列表排序条 ---------- */
+.mk-sortbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,.018);
+  flex-wrap: wrap;
+}
+.mk-sort-label { font-size: 10px; color: var(--text-faint); flex: none; }
+.mk-sort {
+  padding: 3px 9px;
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border-hi);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.mk-sort:hover { color: var(--text); border-color: var(--gold-dim); }
+.mk-sort .ar { font-style: normal; margin-left: 3px; color: var(--gold); }
+.mk-sort.on {
+  color: var(--gold);
+  border-color: var(--gold-dim);
+  background: rgba(232,185,98,.10);
+  font-weight: 600;
+}
+.mk-sort-hint {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
 /* ============================================================
    股市：主营业务 + 市值榜
    ============================================================ */
@@ -2521,12 +2594,32 @@ body::before {
 /* 售灵石标签 */
 .co-line-tag.cur { color: var(--jade); border-color: #2f6349; background: rgba(127,201,160,.10); }
 
-/* 折叠 */
-.mk-fold { flex: none; width: 16px; color: var(--text-faint); font-size: 11px; }
+/* 折叠 —— v3.7：统一的展开 / 收起动画，所有 [data-collapse] 组头共用 */
+.mk-fold {
+  flex: none; width: 16px; color: var(--text-faint); font-size: 11px;
+  display: inline-block; transition: transform .2s ease, color .2s ease;
+}
 .mk-group-head { cursor: pointer; user-select: none; }
 .mk-group-head:hover .mk-group-name { color: var(--gold); }
+.mk-group-head:hover .mk-fold { color: var(--gold); }
+/* 箭头靠旋转表示方向，比换字符更顺滑，也不用在 JS 里改文本 */
+.folded > .mk-group-head .mk-fold { transform: rotate(-90deg); }
 .mk-group.folded .mk-group-body,
 .co-line-group.folded .mk-group-body { display: none; }
+/*
+ * 动画期间由 JS 加上的临时类：接管 display（否则 .folded 会当场把元素抹掉，
+ * 收起动画根本看不见），并给 height 做过渡。动画结束 JS 会移除它，
+ * 静止态重新交回 CSS 决定。
+ */
+.col-anim {
+  display: block !important;
+  overflow: hidden;
+  transition: height .2s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .col-anim { transition: none; }
+  .mk-fold { transition: none; }
+}
 .co-line-group { border-bottom: 1px solid var(--border); }
 .co-line-group:last-child { border-bottom: none; }
 

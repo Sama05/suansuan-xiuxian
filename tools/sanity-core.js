@@ -510,7 +510,8 @@ console.log('\n[11] 股市（证券账户）');
     fee: SK.fee, minOrder: SK.minOrder, flowDecay: SK.flowDecay,
     maxRise: SK.maxRise, maxDrop: SK.maxDrop, linkWeight: SK.linkWeight,
   }));
-  ok('池子里 50 家公司（30 科技 + 20 宗门）', (SK.stocks || []).length === 50, (SK.stocks || []).length);
+  // v3.6 起池子 100 家：老 50 家（30 科技 + 20 宗门）+ 50 家融合赛道（元婴解锁）
+  ok('池子里 100 家公司（50 基础 + 50 融合赛道）', (SK.stocks || []).length === 100, (SK.stocks || []).length);
 
   const mk = () => {
     const st = Core.createState();

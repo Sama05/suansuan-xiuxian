@@ -2022,7 +2022,12 @@ const GAME = {
  * 存档里的 id 引用（生产线产物、股票联动）永远有效。
  * ============================================================ */
 (function generateFusionContent() {
-  var NM = (typeof window !== 'undefined' ? window.GAME : GAME);
+  // 必须用模块作用域里的 GAME，不能写 window.GAME：
+  // window.GAME 要到文件末尾（module.exports 之前）才挂上，而这段生成代码在它
+  // 之前执行 —— 写 window.GAME 时浏览器里拿到的是 undefined，整个融合内容会被
+  // 静默跳过。后果是「服务端 288 商品 / 18 产线 / 100 股票，浏览器 72 / 12 / 50」，
+  // 前端永远看不到 v3.6 加进来的那批内容（Node 端因为没有 window 反而是对的）。
+  var NM = GAME;
   if (!NM || !NM.company) return;
 
   // ---- 36 个融合行业名（修仙 × 科技）----

@@ -22,3 +22,9 @@ Thumbs.db
 
 # 本机私有的演示账号（见 tools/_env.py）
 tools/_local.json
+
+# 改动前的本地备份目录（.bak-YYYYMMDD / .bak-YYYYMMDDb）
+.bak-*/
+
+# 一次性草稿脚本（正式验收脚本是 tools/verify-v38.py，无下划线前缀）
+tools/_verify*.py

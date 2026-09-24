@@ -24,16 +24,14 @@
   let chartGood = null;
   // 股市走势图当前选中的股票（同上）
   let chartStock = null;
-  // 行情列表是否展开全部 50 家（默认只列市值前 10）
+  // 行情列表是否展开全部 100 家（默认只列市值前 10）
   let showAllStocks = false;
-  // 市场行业折叠（v3.6）：folded 集合 + 初始化哨兵 + 签名缓存
+  // 市场行业折叠（v3.7）：folded 集合 + 初始化哨兵。只记状态，不再据此重建 DOM
   const mktFolded = new Set();
   const mktFoldInit = new Set();
-  let mktFoldSig = '';
-  // 生产线折叠（v3.6）
+  // 生产线折叠（v3.7）
   const lineFolded = new Set();
   const lineFoldInit = new Set();
-  let lineFoldSig = '';
   // 功法阁视图：'owned' 只显示已拥有（默认）| 'codex' 图鉴（全部 + 解锁条件）
   let techView = 'owned';
   // 功法列表 DOM 的重建签名 = 已拥有 id 串。变化才重建，其余帧只改数值。
@@ -59,6 +57,98 @@
     if (!el) return;
     if (el[prop] !== value) el[prop] = value;
   }
+  // ============================================================
+  // 通用折叠 / 展开（v3.7）
+  // ============================================================
+  /*
+   * 页面上所有「点一下收起、再点一下展开」的地方统一走这一处，不再各自实现。
+   *
+   * 用法（新增折叠点只需两步）：
+   *   1. 给可点击的标题元素加 `data-collapse`（值是要展开的元素选择器，
+   *      写 next 或不写就取它的下一个兄弟元素）；
+   *   2. 容器上调用一次 bindCollapse(容器, { onToggle })。
+   *
+   * 折叠状态写在祖先的 `.folded` 类上（箭头靠 CSS 旋转），动画期间用
+   * `.col-anim` 临时接管 display —— 这样「静止态由 CSS 决定、动画态由 JS 决定」，
+   * 不会出现收起动画还没播完就被 display:none 抹掉的情况。
+   */
+  const COLLAPSE_MS = 200;
+  /** el -> { r: rafId, t: timerId }，防止连点把动画叠在一起 */
+  const collapseAnim = new WeakMap();
+
+  function collapseBodyOf(head) {
+    const sel = head.getAttribute('data-collapse');
+    if (!sel || sel === 'next') return head.nextElementSibling;
+    return head.parentElement ? head.parentElement.querySelector(sel) : null;
+  }
+
+  /**
+   * 高度过渡：展开 0 → 内容高，收起 内容高 → 0，结束后把高度交还给 CSS。
+   * @param {HTMLElement} el 要展开 / 收起的元素
+   * @param {boolean} open true 展开
+   * @param {function} [onDone] 动画结束回调
+   * @param {string} [hideClass] 收起结束后要加的类（如 'hidden'）；组头折叠靠 .folded，不传
+   */
+  function slideToggle(el, open, onDone, hideClass) {
+    if (!el) { if (onDone) onDone(); return; }
+    const prev = collapseAnim.get(el);
+    if (prev && prev.t) clearTimeout(prev.t);
+    const rec = { t: 0 };
+    collapseAnim.set(el, rec);
+
+    el.classList.remove('hidden');   // 动画期间不能被 .hidden 压住
+    el.classList.add('col-anim');
+
+    /**
+     * 起始高度 → **强制一次同步布局** → 目标高度。
+     *
+     * 中间那步 `void el.offsetHeight` 不能省，也不能换成 requestAnimationFrame：
+     * rAF 回调排在样式计算**之前**，所以「起始值」和「目标值」会落进同一次 recalc，
+     * 浏览器只看到 `auto → 0px` —— 而 auto 不可插值，过渡被直接跳过，收起就成了瞬变。
+     * 只有读一次布局属性（offsetHeight）把起始高度真正落到**计算值**上，
+     * transition 才有东西可以插值。
+     *
+     * 症状上的表现很有迷惑性：**展开有动画、收起没有**。
+     * 因为展开时 `el.scrollHeight` 恰好是在赋值之后读的，那一次读顺带把布局刷了，
+     * 于是「碰巧」有动画 —— 依赖这种巧合的动画等于没有。
+     */
+    el.style.height = (open ? 0 : el.scrollHeight) + 'px';
+    void el.offsetHeight;
+    el.style.height = (open ? el.scrollHeight : 0) + 'px';
+
+    rec.t = setTimeout(() => {
+      el.classList.remove('col-anim');
+      el.style.height = '';
+      if (!open && hideClass) el.classList.add(hideClass);
+      if (onDone) onDone();
+    }, COLLAPSE_MS + 30);
+  }
+
+  /**
+   * 给容器里的 [data-collapse] 元素挂上点击折叠（事件委托，重建 DOM 也不失效）。
+   * @param {HTMLElement} root 容器
+   * @param {object} [opts] { onToggle(head, group, folded) }
+   */
+  function bindCollapse(root, opts) {
+    if (!root) return;
+    opts = opts || {};
+    root.addEventListener('click', (e) => {
+      // 组头里可能塞了按钮（一键满速 / 优先生产……），点它们不该顺手折叠分组
+      if (e.target.closest('[data-nocollapse]')) return;
+      const head = e.target.closest('[data-collapse]');
+      if (!head || !root.contains(head)) return;
+      const body = collapseBodyOf(head);
+      if (!body) return;
+      const group = head.closest('.mk-group, .co-line-group') || head.parentElement;
+      const folded = !group.classList.contains('folded');   // 当前展开 -> 接下来收起
+      // 先切类：箭头（CSS 旋转）立刻跟着动，不等动画结束
+      if (folded) group.classList.add('folded'); else group.classList.remove('folded');
+      slideToggle(body, !folded);
+      head.setAttribute('aria-expanded', folded ? 'false' : 'true');
+      if (opts.onToggle) opts.onToggle(head, group, folded);
+    });
+  }
+
   let lastLocalTick = 0;
   let lastServerSave = 0;
   let saveTimer = null;
@@ -875,6 +965,220 @@
 
   function pad2(n) { return n < 10 ? '0' + n : String(n); }
 
+    /**
+     * v3.6：生产线按行业分组骨架（折叠 + fusion kind）。
+     * 行内容（lstats / lunits / lprice）仍由 renderCompanyPage 逐帧回填。
+     */
+    function buildCompanyLineGroups() {
+      $('co-line-list').innerHTML = GAME.company.industries.map((ind) => {
+        const ls = GAME.company.lines.filter((l) => l.industry === ind.id);
+        if (!ls.length) return '';
+        const kind = ind.kind === 'xiuxian' ? 'xiuxian' : (ind.kind === 'fusion' ? 'fusion' : 'tech');
+        if (kind === 'fusion' && !lineFoldInit.has(ind.id)) { lineFoldInit.add(ind.id); lineFolded.add(ind.id); }
+        const rows = ls.map((l) => {
+          return '<div class="co-line ' + kind + '" data-line="' + l.id + '">' +
+            '<div class="co-line-icon">' + esc(indIcon(l.industry)) + '</div>' +
+            '<div class="co-line-main">' +
+              '<div class="co-line-title">' + esc(l.name) +
+                '<span class="co-line-tag ' + kind + '">' + esc(indName(l.industry)) + '</span>' +
+                '<span class="co-line-tag" data-role="lowned">×0</span>' +
+                // 「优先生产」：算力不够时先喂饱这条线。data-nocollapse 让点它不触发组折叠
+                '<button class="co-prio" data-role="lprio" data-nocollapse ' +
+                  'title="开启后，工业产能不足时优先保障这条线">优先</button>' +
+              '</div>' +
+              '<div class="co-line-desc">' + esc(l.desc) + '</div>' +
+              '<div class="co-line-stats" data-role="lstats"></div>' +
+              // 每一台的配置行在这里动态回填（台数会变，不能写死在静态结构里）
+              '<div class="co-line-units" data-role="lunits"></div>' +
+              '<div class="co-line-lock hidden" data-role="llock"></div>' +
+            '</div>' +
+            '<div class="co-line-right">' +
+              '<div class="co-line-owned" data-role="lcap">已拥有 0 条</div>' +
+              '<div class="co-line-price" data-role="lprice">—</div>' +
+              '<button class="btn sm" data-role="lbuy">购入</button>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+        return '<div class="co-line-group ' + (lineFolded.has(ind.id) ? 'folded' : '') + '" data-industry="' + ind.id + '">' +
+          '<div class="mk-group-head" data-role="lgrouphead" data-collapse="next" ' +
+            'aria-expanded="' + (lineFolded.has(ind.id) ? 'false' : 'true') + '" ' +
+            'title="点击折叠 / 展开该行业生产线">' +
+            '<span class="mk-fold">▾</span>' +
+            '<span class="mk-group-icon">' + esc(indIcon(ind.id)) + '</span>' +
+            '<span class="mk-group-name">' + esc(ind.name) + '</span>' +
+            '<span class="mk-group-tag">' + (kind === 'fusion' ? '融合 · 元婴解锁' : (kind === 'xiuxian' ? '修仙 · 产业' : '科技 · 产业')) + '</span>' +
+            '<span class="mk-group-idx">' + ls.length + ' 条线' +
+              '<span class="faint" data-role="lgown"></span></span>' +
+            // 批量操作：整个行业一起满速 / 停工（data-nocollapse 防止顺手把组折叠了）
+            '<span class="mk-group-acts" data-nocollapse>' +
+              '<button class="btn xs" data-role="lrun" data-industry="' + ind.id + '" ' +
+                'title="把该行业全部产线的产能拉到 100%">一键满速运转</button>' +
+              '<button class="btn xs ghost" data-role="lstop" data-industry="' + ind.id + '" ' +
+                'title="把该行业全部产线的产能降到 0（停机不耗算力）">一键停工</button>' +
+            '</span>' +
+          '</div>' +
+          '<div class="mk-group-body">' + rows + '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+
+    /** v3.6：市场分组骨架（fusion kind + 折叠箭头），折叠态变化时整体重建 */
+    function buildMarketGroups() {
+      $('mk-good-list').innerHTML = GAME.company.industries.map((ind) => {
+        const goods = GAME.company.goods.filter((g) => g.industry === ind.id);
+        if (!goods.length) return '';
+        const kind = ind.kind === 'xiuxian' ? 'xiuxian' : (ind.kind === 'fusion' ? 'fusion' : 'tech');
+        const ups = (ind.upstream || []).map((u) => indName(u)).join(' + ');
+        // 融合行业默认折叠（48 个组全展开页面太长），点击组头切换
+        if (kind === 'fusion' && !mktFoldInit.has(ind.id)) { mktFoldInit.add(ind.id); mktFolded.add(ind.id); }
+        return '<div class="mk-group ' + kind + (mktFolded.has(ind.id) ? ' folded' : '') + '" data-industry="' + ind.id + '">' +
+          '<div class="mk-group-head" data-role="ghead" data-collapse="next" ' +
+            'aria-expanded="' + (mktFolded.has(ind.id) ? 'false' : 'true') + '" ' +
+            'title="点击折叠 / 展开该行业产品">' +
+            '<span class="mk-fold">▾</span>' +
+            '<span class="mk-group-icon">' + esc(indIcon(ind.id)) + '</span>' +
+            '<span class="mk-group-name">' + esc(ind.name) + '</span>' +
+            '<span class="mk-group-tag">' + (kind === 'fusion' ? '融合 · ' : '') + (ups ? ('上游 · ' + esc(ups)) : '最上游 · 无原料依赖') + '</span>' +
+            '<span class="mk-group-idx" data-role="gidx"></span>' +
+          '</div>' +
+          '<div class="mk-group-body">' + goods.map((g) => goodRowHTML(g, kind)).join('') + '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+
+  // ============================================================
+  // 商品列表排序（v3.8）
+  // ============================================================
+  /*
+   * 四个互斥按钮：行业（回到分组）/ 价格 / 涨幅 / 跌幅。
+   * 后三个是「打散分组、全表统一排序」，首次点击升序（↓），再点降序（↑）。
+   *
+   * 排序状态只有一个 { field, dir }，所以「切换时重置其他按钮」是天然的 ——
+   * 不存在两个字段同时生效的可能。
+   *
+   * 数据每帧刷新，但**排序不每帧重排**：价格只在换期 / 抛压变化时动，每帧重排
+   * 会让 288 行在眼前乱跳。这里做的是「节流 + 顺序签名比对」—— 顺序真变了才动 DOM，
+   * 且只移动已有节点（appendChild），不重建，于是迷你走势图缓存、选中态都不丢。
+   */
+  const mktSort = { field: 'industry', dir: 1 };
+  let mktSortSig = '';
+  let mktSortCheckedAt = 0;
+  const MKT_RESORT_MS = 1200;
+
+  const MKT_SORT_LABEL = { industry: '行业', price: '价格', gain: '涨幅', drop: '跌幅' };
+
+  function marketKindOf(industryId) {
+    const ind = (GAME.company.industries || []).find((x) => x.id === industryId);
+    const k = ind ? ind.kind : '';
+    return k === 'xiuxian' ? 'xiuxian' : (k === 'fusion' ? 'fusion' : 'tech');
+  }
+
+  /** 涨跌幅（相对基准价）：涨为正、跌为负。drop 字段取相反数，于是「跌得越狠」值越大 */
+  function marketChangePct(good) {
+    const base = Number(good.basePrice) || 1;
+    const cur = Core.goodsPriceWith(state, good);
+    const b = new D(base);
+    if (b.eq(0)) return 0;
+    return cur.div(b).toNumber() - 1;
+  }
+
+  function marketSortCmp(a, b) {
+    if (mktSort.field === 'price') {
+      const c = Core.goodsPriceWith(state, a).cmp(Core.goodsPriceWith(state, b));
+      return mktSort.dir === 1 ? c : -c;
+    }
+    const ga = mktSort.field === 'gain' ? marketChangePct(a) : -marketChangePct(a);
+    const gb = mktSort.field === 'gain' ? marketChangePct(b) : -marketChangePct(b);
+    const d = ga - gb;
+    if (d !== 0) return mktSort.dir === 1 ? d : -d;
+    return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+  }
+
+  /** 按当前字段排好序的商品列表 */
+  function marketSortedGoods() {
+    const list = GAME.company.goods.slice();
+    list.sort(marketSortCmp);
+    return list;
+  }
+
+  /** 同步四个按钮的高亮与箭头（箭头用文本 ↓ / ↑，方向一眼可见） */
+  function syncSortButtons() {
+    const bar = $('mk-sortbar');
+    if (!bar) return;
+    const btns = bar.querySelectorAll('[data-sort]');
+    for (let i = 0; i < btns.length; i++) {
+      const b = btns[i];
+      const on = b.dataset.sort === mktSort.field;
+      b.classList.toggle('on', on);
+      b.classList.toggle('asc', on && mktSort.dir === 1);
+      b.classList.toggle('desc', on && mktSort.dir === -1);
+      const ar = b.querySelector('.ar');
+      if (ar) ar.textContent = on ? (mktSort.dir === 1 ? '↓' : '↑') : '';
+    }
+    const hint = $('ui-mk-sort-hint');
+    if (hint) {
+      // 升序 / 降序具体到「从什么排到什么」—— 「涨幅升序」= 跌最多 → 涨最多，
+      // 光写「升序」会让人以为是在看涨幅榜。
+      const RANGE = {
+        price: ['低价 → 高价', '高价 → 低价'],
+        gain: ['跌最多 → 涨最多', '涨最多 → 跌最多'],
+        drop: ['涨最多 → 跌最多', '跌最多 → 涨最多'],
+      };
+      const r = RANGE[mktSort.field];
+      hint.textContent = mktSort.field === 'industry'
+        ? '按行业分组展示 · 点组头折叠 / 展开'
+        : ('全表按' + MKT_SORT_LABEL[mktSort.field] + (mktSort.dir === 1 ? '升序' : '降序') +
+           (r ? '（' + r[mktSort.dir === 1 ? 0 : 1] + '）' : '') + '　点「行业」回到分组');
+    }
+  }
+
+  /**
+   * 把排序状态落到 DOM。
+   * @param {boolean} force true = 无条件重建（用户刚点按钮）；false = 顺序变了才动
+   */
+  function applyMarketSort(force) {
+    const list = $('mk-good-list');
+    if (!list) return;
+    if (mktSort.field === 'industry') {
+      buildMarketGroups();
+      mktSortSig = 'industry';
+      syncSortButtons();
+      return;
+    }
+    const order = marketSortedGoods();
+    const sig = order.map((g) => g.id).join(',');
+    if (!force && sig === mktSortSig) return;
+
+    const rows = list.querySelectorAll('.co-good');
+    if (rows.length !== order.length || list.querySelector('.mk-group')) {
+      // 结构不匹配（刚从分组切过来 / 首次进入）→ 整体重建
+      list.innerHTML = order.map((g) => goodRowHTML(g, marketKindOf(g.industry))).join('');
+    } else {
+      // 已有一批行：按新顺序移动节点（appendChild 即移动，元素身份与事件都保留）
+      const byId = Object.create(null);
+      for (let i = 0; i < rows.length; i++) byId[rows[i].dataset.good] = rows[i];
+      const frag = document.createDocumentFragment();
+      for (const g of order) {
+        const el = byId[g.id];
+        if (el) frag.appendChild(el);
+      }
+      list.appendChild(frag);
+    }
+    mktSortSig = sig;
+    syncSortButtons();
+  }
+
+  /** 刷新后仍按当前字段排序 —— 节流，别让列表每帧乱跳 */
+  function maybeResortMarket() {
+    if (mktSort.field === 'industry') return;
+    const now = Date.now();
+    if (now - mktSortCheckedAt < MKT_RESORT_MS) return;
+    mktSortCheckedAt = now;
+    applyMarketSort(false);
+  }
+
   function renderStatic() {
     // 时间档位不再铺成列表 —— 顶栏的四键（◀ / ▶⏸ / ▶▶ / ▶▶▶）就是全部入口，
     // 具体倍率看 clock-tier 上的数字。列表形式会让人以为那是「四套并存的档」。
@@ -890,8 +1194,9 @@
     if (evBar) {
       evBar.addEventListener('click', () => {
         const box = $('ev-history');
-        const open = box.classList.toggle('hidden');
-        if (!open) renderEventHistory();
+        const willOpen = box.classList.contains('hidden');
+        if (willOpen) renderEventHistory();
+        slideToggle(box, willOpen, null, 'hidden');
       });
     }
 
@@ -1054,77 +1359,32 @@
     // ---- 公司：生产线（每条线买下后，每一台都能单独选产物、调产能）----
     buildCompanyLineGroups();
 
-    $('co-line-list').addEventListener('click', (e) => {
-      // v3.6：点击行业组头折叠 / 展开该组生产线
-      const lhead = e.target.closest('[data-role="lgrouphead"]');
-      if (lhead) {
-        const grp = lhead.closest('.co-line-group');
-        const gid = grp ? grp.dataset.industry : null;
-        if (gid) {
-          if (lineFolded.has(gid)) lineFolded.delete(gid); else lineFolded.add(gid);
-          grp.classList.toggle('folded', lineFolded.has(gid));
-          const f = grp.querySelector('.mk-fold');
-          if (f) f.textContent = lineFolded.has(gid) ? '▸' : '▾';
-        }
-        return;
-      }
+    // v3.7：行业组头折叠 / 展开统一走 bindCollapse（带高度动画）
+    bindCollapse($('co-line-list'), {
+      onToggle: function (head, group, folded) {
+        const gid = group.dataset.industry;
+        if (!gid) return;
+        if (folded) lineFolded.add(gid); else lineFolded.delete(gid);
+      },
     });
-
-    /**
-     * v3.6：生产线按行业分组骨架（折叠 + fusion kind）。
-     * 行内容（lstats / lunits / lprice）仍由 renderCompanyPage 逐帧回填。
-     */
-    function buildCompanyLineGroups() {
-      $('co-line-list').innerHTML = GAME.company.industries.map((ind) => {
-        const ls = GAME.company.lines.filter((l) => l.industry === ind.id);
-        if (!ls.length) return '';
-        const kind = ind.kind === 'xiuxian' ? 'xiuxian' : (ind.kind === 'fusion' ? 'fusion' : 'tech');
-        if (kind === 'fusion' && !lineFoldInit.has(ind.id)) { lineFoldInit.add(ind.id); lineFolded.add(ind.id); }
-        const rows = ls.map((l) => {
-          return '<div class="co-line ' + kind + '" data-line="' + l.id + '">' +
-            '<div class="co-line-icon">' + esc(indIcon(l.industry)) + '</div>' +
-            '<div class="co-line-main">' +
-              '<div class="co-line-title">' + esc(l.name) +
-                '<span class="co-line-tag ' + kind + '">' + esc(indName(l.industry)) + '</span>' +
-                '<span class="co-line-tag" data-role="lowned">×0</span>' +
-              '</div>' +
-              '<div class="co-line-desc">' + esc(l.desc) + '</div>' +
-              '<div class="co-line-stats" data-role="lstats"></div>' +
-              // 每一台的配置行在这里动态回填（台数会变，不能写死在静态结构里）
-              '<div class="co-line-units" data-role="lunits"></div>' +
-              '<div class="co-line-lock hidden" data-role="llock"></div>' +
-            '</div>' +
-            '<div class="co-line-right">' +
-              '<div class="co-line-owned" data-role="lcap">已拥有 0 条</div>' +
-              '<div class="co-line-price" data-role="lprice">—</div>' +
-              '<button class="btn sm" data-role="lbuy">购入</button>' +
-            '</div>' +
-          '</div>';
-        }).join('');
-        return '<div class="co-line-group ' + (lineFolded.has(ind.id) ? 'folded' : '') + '" data-industry="' + ind.id + '">' +
-          '<div class="mk-group-head" data-role="lgrouphead" title="点击折叠 / 展开该行业生产线">' +
-            '<span class="mk-fold">' + (lineFolded.has(ind.id) ? '▸' : '▾') + '</span>' +
-            '<span class="mk-group-icon">' + esc(indIcon(ind.id)) + '</span>' +
-            '<span class="mk-group-name">' + esc(ind.name) + '</span>' +
-            '<span class="mk-group-tag">' + (kind === 'fusion' ? '融合 · 元婴解锁' : (kind === 'xiuxian' ? '修仙 · 产业' : '科技 · 产业')) + '</span>' +
-            '<span class="mk-group-idx">' + ls.length + ' 条线</span>' +
-          '</div>' +
-          '<div class="mk-group-body">' + rows + '</div>' +
-        '</div>';
-      }).join('');
-    }
-
-    function lineBuyQty() {
-      const el = document.getElementById('line-buy-qty');
-      const v = el ? Math.floor(Number(el.value) || 1) : 1;
-      return Math.max(1, Math.min(100, v));
-    }
 
     $('co-line-list').addEventListener('click', (e) => {
       const btn = e.target.closest('[data-role="lbuy"]');
       if (btn) {
         const item = btn.closest('[data-line]');
         if (item) buyLine(item.dataset.line);
+        return;
+      }
+      // 行业批量：一键满速 / 一键停工（该行业全部产线的每一台一起改）
+      const runBtn = e.target.closest('[data-role="lrun"]');
+      if (runBtn) { setIndustryRate(runBtn.dataset.industry, 1); return; }
+      const stopBtn = e.target.closest('[data-role="lstop"]');
+      if (stopBtn) { setIndustryRate(stopBtn.dataset.industry, 0); return; }
+      // 「优先生产」开关（整条线一个开关）
+      const prioBtn = e.target.closest('[data-role="lprio"]');
+      if (prioBtn) {
+        const item = prioBtn.closest('[data-line]');
+        if (item) setLinePriority(item.dataset.line, !item.classList.contains('prio'));
         return;
       }
       // 「全部套用」：把这台的产品 / 产能复制到这条线的每一台
@@ -1163,30 +1423,27 @@
       if (txt) txt.textContent = Math.round(Number(e.target.value)) + '%';
     });
 
-    /** v3.6：市场分组骨架（fusion kind + 折叠箭头），折叠态变化时整体重建 */
-    function buildMarketGroups() {
-      $('mk-good-list').innerHTML = GAME.company.industries.map((ind) => {
-        const goods = GAME.company.goods.filter((g) => g.industry === ind.id);
-        if (!goods.length) return '';
-        const kind = ind.kind === 'xiuxian' ? 'xiuxian' : (ind.kind === 'fusion' ? 'fusion' : 'tech');
-        const ups = (ind.upstream || []).map((u) => indName(u)).join(' + ');
-        // 融合行业默认折叠（48 个组全展开页面太长），点击组头切换
-        if (kind === 'fusion' && !mktFoldInit.has(ind.id)) { mktFoldInit.add(ind.id); mktFolded.add(ind.id); }
-        return '<div class="mk-group ' + kind + (mktFolded.has(ind.id) ? ' folded' : '') + '" data-industry="' + ind.id + '">' +
-          '<div class="mk-group-head" data-role="ghead" title="点击折叠 / 展开该行业产品">' +
-            '<span class="mk-fold">' + (mktFolded.has(ind.id) ? '▸' : '▾') + '</span>' +
-            '<span class="mk-group-icon">' + esc(indIcon(ind.id)) + '</span>' +
-            '<span class="mk-group-name">' + esc(ind.name) + '</span>' +
-            '<span class="mk-group-tag">' + (kind === 'fusion' ? '融合 · ' : '') + (ups ? ('上游 · ' + esc(ups)) : '最上游 · 无原料依赖') + '</span>' +
-            '<span class="mk-group-idx" data-role="gidx"></span>' +
-          '</div>' +
-          '<div class="mk-group-body">' + goods.map((g) => goodRowHTML(g, kind)).join('') + '</div>' +
-        '</div>';
-      }).join('');
-    }
-
     // ---- 市场：商品行情按行业分组 ----
     buildMarketGroups();
+
+    // v3.8：四个互斥排序按钮（行业 / 价格 / 涨幅 / 跌幅）
+    const sortBar = $('mk-sortbar');
+    if (sortBar) {
+      sortBar.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-sort]');
+        if (!btn) return;
+        const f = btn.dataset.sort;
+        if (f === mktSort.field) {
+          if (f === 'industry') return;          // 分组模式只有一个状态
+          mktSort.dir = -mktSort.dir;            // 再点一次：升 ↔ 降
+        } else {
+          mktSort.field = f;
+          mktSort.dir = 1;                       // 换字段一律从升序开始
+        }
+        applyMarketSort(true);
+      });
+      syncSortButtons();
+    }
 
     // v3.6：快捷算力投向（境界页=修仙 / 设备页=AI）。拖动只改显示，松手提交。
     document.querySelectorAll('[data-qa]').forEach((bar) => {
@@ -1202,20 +1459,16 @@
       });
     });
 
+    // v3.7：行业组头折叠 / 展开统一走 bindCollapse（带高度动画）
+    bindCollapse($('mk-good-list'), {
+      onToggle: function (head, group, folded) {
+        const gid = group.dataset.industry;
+        if (!gid) return;
+        if (folded) mktFolded.add(gid); else mktFolded.delete(gid);
+      },
+    });
+
     $('mk-good-list').addEventListener('click', (e) => {
-      // v3.6：点击组头折叠 / 展开该行业
-      const ghead = e.target.closest('[data-role="ghead"]');
-      if (ghead) {
-        const grp = ghead.closest('.mk-group');
-        const gid = grp ? grp.dataset.industry : null;
-        if (gid) {
-          if (mktFolded.has(gid)) mktFolded.delete(gid); else mktFolded.add(gid);
-          grp.classList.toggle('folded', mktFolded.has(gid));
-          const f = grp.querySelector('.mk-fold');
-          if (f) f.textContent = mktFolded.has(gid) ? '▸' : '▾';
-        }
-        return;
-      }
       const item = e.target.closest('[data-good]');
       if (!item) return;
       // 「卖出」是行内子操作，点了不该把上方的走势图切走
@@ -1370,7 +1623,7 @@
     renderQuickAlloc();
     renderInvestPage();
     renderCompanyPage();
-    // 市场页与股市页平时不参与每帧重绘：商品 72 种、股票 50 家，
+    // 市场页与股市页平时不参与每帧重绘：商品 288 种、股票 100 家，
     // 每行还带一张迷你走势图，后台页没必要每 100ms 全画一遍。
     // 但**首次渲染必须铺满** —— 否则切过去之前这两页是空的（测试与首屏都依赖它）。
     if (currentTab === 'market' || !firstRenderDone) renderMarketPage();
@@ -1394,11 +1647,15 @@
     setText('ui-spirit',  fmt(state.spiritStone));
     setText('ui-shenshi', fmtNum(Core.totalShenshi(state)));
 
-    const devCompute = Core.totalCompute(state);
-    if (state.aiBonus && state.aiBonus.gt(0)) {
-      setText('ui-compute-sub', '设备 ' + fmt(devCompute) + ' + AI ' + fmt(state.aiBonus));
+    // 算力拆解必须**能自己对上账**：标题上的数 = (设备 + AI) × 乘区。
+    // 早先这里写的是 `总设备算力 + AI`，既没扣兵解衰减也没乘乘区，
+    // 后期两者合计 1e20 而标题 2.27e23，玩家会以为数字算错了。
+    const cb = Core.computeBreakdown(state);
+    if (cb.ai.gt(0)) {
+      setText('ui-compute-sub', '设备 ' + fmt(cb.device) + ' + AI ' + fmt(cb.ai) +
+        '　乘区 ×' + fmtNum(cb.mul));
     } else {
-      setText('ui-compute-sub', '设备提供');
+      setText('ui-compute-sub', '设备 ' + fmt(cb.device) + '　乘区 ×' + fmtNum(cb.mul));
     }
 
     const spiritOk = Core.spiritAllowed(state);
@@ -1668,7 +1925,7 @@
       // 功法算力投入 → 经验/秒，只喂当前修炼的那本
       const cur = Core.currentTech(state);
       return cur
-        ? { label: '功法经验 / 秒', text: '+' + rate.toFixed(2) + ' → ' + cur.name }
+        ? { label: '功法经验 / 秒', text: '+' + fmt(new D(rate)) + ' → ' + cur.name }
         : { label: '功法经验 / 秒', text: '0' };
     }
     return { label: '产出', text: fmt(new D(rate)) };
@@ -1679,6 +1936,7 @@
 
   function renderInvestPage() {
     let allocSum = 0;
+    refreshAllocPresets();
 
     for (const inv of GAME.investments) {
       const el = document.querySelector('[data-inv="' + inv.id + '"]');
@@ -1836,12 +2094,26 @@
       Math.round(Math.max(0, Math.min(1, useRatio)) * 100) + '%';
 
     const cpScale = $('ui-co-cp-scale');
+    const tiers = Core.companyComputeTiers(state);
+    let prioLines = 0;
+    for (const l of GAME.company.lines) {
+      if (Core.linePriority(state, l.id) && Core.lineUnits(state, l.id).length) prioLines += 1;
+    }
     if (demand.lte(0)) {
       cpScale.className = 'hint';
       cpScale.textContent = '无产线开工';
     } else if (scale >= 0.999) {
       cpScale.className = 'hint ok';
-      cpScale.textContent = '算力充足 · 满负荷';
+      // 后期算力通常远远富余（设备 + AI 投向的累加把池子推到 1e22 量级，需求才 1e14），
+      // 这时「优先生产」标记是**没有任何效果**的。不说明的话，玩家会以为开关坏了 ——
+      // 一个能点但看不出作用的开关，比没有这个开关更糟。
+      cpScale.textContent = '算力充足 · 满负荷' + (prioLines > 0
+        ? '　（已标记 ' + prioLines + ' 条优先线；当前算力不缺，暂不影响产量）'
+        : '');
+    } else if (prioLines > 0) {
+      cpScale.className = 'hint ' + (scale < 0.5 ? 'err' : 'warn');
+      cpScale.textContent = '算力不足 · 优先线按 ' + (tiers.pri * 100).toFixed(0) +
+        '%　其余线按 ' + (tiers.norm * 100).toFixed(0) + '% 运转';
     } else {
       cpScale.className = 'hint ' + (scale < 0.5 ? 'err' : 'warn');
       cpScale.textContent = '算力不足 · 全厂按 ' + (scale * 100).toFixed(0) + '% 运转';
@@ -1852,12 +2124,10 @@
 
     // ---------- 生产线（每台可单独选产物、调产能）----------
     let lineCount = 0;
-    // v3.6：折叠/展开变化时重建分组骨架（数值仍逐帧回填）
-    const lFoldSig = Array.from(lineFolded).sort().join(',');
-    if (lFoldSig !== lineFoldSig) {
-      lineFoldSig = lFoldSig;
-      buildCompanyLineGroups();
-    }
+    // v3.7：折叠不再重建 DOM —— 直接切 .folded 类 + 高度动画就够了。
+    // 重建反而更糟：新骨架里 [data-role="lunits"] 是空的，而台数没变、
+    // 重建签名也没变，于是「每一台」的配置行会一直不回填，直到玩家再买一条线
+    // （台数变了才触发重建）才冒出来 —— 就是那个「改了产物看不见」的 bug。
     const lineItems = $('co-line-list').querySelectorAll('.co-line');
     for (let i = 0; i < lineItems.length; i++) {
       const el = lineItems[i];
@@ -1869,9 +2139,21 @@
       const unlocked = Core.lineUnlocked(state, line);
       const price = Core.lineCost(state, line);
       const prods = Core.lineProducts(line);
+      const prio = Core.linePriority(state, line.id);
+      // 优先线和非优先线拿到的算力成色不一样，产量要按**这条线自己的**削减系数算
+      const lscale = Core.unitComputeScale(state, line);
       lineCount += owned;
 
       el.classList.toggle('locked', !unlocked && owned === 0);
+      el.classList.toggle('prio', prio);
+      const prioBtn = el.querySelector('[data-role="lprio"]');
+      if (prioBtn) {
+        prioBtn.classList.toggle('on', prio);
+        prioBtn.textContent = prio ? '优先 ★' : '优先';
+        prioBtn.title = prio
+          ? '已开启：算力不足时优先保障这条线（点击关闭）'
+          : '开启后，工业产能不足时优先保障这条线';
+      }
       el.querySelector('[data-role="lowned"]').textContent = '×' + fmtCount(owned);
       el.querySelector('[data-role="lcap"]').textContent = '已拥有 ' + fmtCount(owned) + ' 条';
 
@@ -1895,11 +2177,23 @@
       const buyBtn = el.querySelector('[data-role="lbuy"]');
       buyBtn.disabled = !unlocked || state.money.lt(price);
 
-      renderLineUnits(el, line, units, prods, scale);
+      renderLineUnits(el, line, units, prods, lscale);
     }
     $('ui-co-line-hint').textContent = lineCount > 0
       ? ('共 ' + fmtCount(lineCount) + ' 条生产线 · 每台可单独换产物')
       : '买下一条线只是拿到产能上限，转起来要靠工业算力';
+
+    // 每个行业组头：显示该行业共有几台（批量操作的作用范围一目了然）
+    const lGroups = $('co-line-list').querySelectorAll('.co-line-group');
+    for (let i = 0; i < lGroups.length; i++) {
+      const gid = lGroups[i].dataset.industry;
+      let n = 0;
+      for (const l of GAME.company.lines) {
+        if (l.industry === gid) n += Core.lineUnits(state, l.id).length;
+      }
+      const ownEl = lGroups[i].querySelector('[data-role="lgown"]');
+      if (ownEl) ownEl.textContent = n ? ('　已购 ' + fmtCount(n) + ' 台') : '　未购产线';
+    }
   }
 
   /**
@@ -1908,15 +2202,22 @@
    * 结构只在**台数或产物**变化时重建 —— 产能是拖动条，玩家正拖着的时候
    * 如果把 DOM 整个换掉，拖动会被打断。所以产能只回写显示值，且焦点在它上面时不回写。
    */
-  const unitSigCache = Object.create(null);
+  /**
+   * 重建签名存在**元素自己身上**（data-usig），不用模块级缓存表。
+   *
+   * 原因：模块级 Map 的生命周期比 DOM 长。分组骨架一旦被重建（折叠、切页、
+   * 重新登录），新元素里的 units 盒子是空的，可缓存表里还留着旧签名 —— 于是
+   * 「签名没变 → 不重建」，盒子就一直空着，玩家改产物也看不到，非得再买一条线
+   * （台数变了、签名才变）才冒出来。签名跟着元素走，元素换了自然就重建，
+   * 不管是谁、什么时候重建的 DOM。
+   */
   function renderLineUnits(el, line, units, prods, scale) {
     const box = el.querySelector('[data-role="lunits"]');
     if (!box) return;
-    const key = el.dataset.line;
     const sig = units.length + '|' + units.map((u) => u.p).join(',');
 
-    if (unitSigCache[key] !== sig) {
-      unitSigCache[key] = sig;
+    if (box.getAttribute('data-usig') !== sig || box.children.length !== units.length) {
+      box.setAttribute('data-usig', sig);
       box.innerHTML = units.map((u, idx) => {
         const opts = prods.map((g) =>
           '<option value="' + esc(g.id) + '"' + (g.id === u.p ? ' selected' : '') + '>' +
@@ -2025,12 +2326,10 @@
     let peakPressure = 0;
     let pressuredGoods = 0;
 
-    // v3.6：折叠状态变化时重建分组骨架（数值仍逐帧刷新）
-    const foldSig = Array.from(mktFolded).sort().join(',');
-    if (foldSig !== mktFoldSig) {
-      mktFoldSig = foldSig;
-      buildMarketGroups();
-    }
+    // v3.8：排序可能把分组打散成平铺列表 —— 行一律从整个列表里取，
+    // 不假设自己一定在 .mk-group 里；组头的指数只在分组模式下回填。
+    maybeResortMarket();
+
     const groups = $('mk-good-list').querySelectorAll('.mk-group');
     for (let gi = 0; gi < groups.length; gi++) {
       const gid = groups[gi].dataset.industry;
@@ -2040,8 +2339,10 @@
         const p = Core.industryPriceIndex(state, gid);
         idxEl.textContent = '成本 ×' + c.toFixed(2) + '　售价 ×' + p.toFixed(2);
       }
+    }
 
-      const items = groups[gi].querySelectorAll('.co-good');
+    {
+      const items = $('mk-good-list').querySelectorAll('.co-good');
       for (let i = 0; i < items.length; i++) {
         const el = items[i];
         const good = goodByIdMap[el.dataset.good];
@@ -3268,13 +3569,35 @@
     renderAll();
   }
 
+  /**
+   * 快捷预设（v3.7）。
+   *
+   * 早先这两个按钮写死成「全部归修仙 / 四路均分」—— 可分配的方向早就不是四个了
+   * （修仙 / AI / 计算设备 / 金融 / 功法 / 工业，六条），写死的文案与写死的份数
+   * 都在骗人。现在份数一律按**当前已解锁**的方向数算，文案也跟着变。
+   */
+  function allocUsable() {
+    return state ? Core.allocatableInvestments(state) : [];
+  }
+
   function setAllocPreset(kind) {
-    const usable = Core.allocatableInvestments(state);
+    const usable = allocUsable();
+    if (!usable.length) { toast('当前没有可分配的投向', 'err'); return; }
+
     const alloc = {};
     if (kind === 'reset') {
       for (const inv of GAME.investments) alloc[inv.id] = inv.id === 'xiuxian' ? 1 : 0;
+    } else if (kind === 'main') {
+      // 修仙一半，其余已解锁方向平分另一半；只剩修仙可用时全额给它
+      const rest = usable.filter((i) => i.id !== 'xiuxian');
+      const xiShare = rest.length ? 0.5 : 1;
+      const share = rest.length ? (1 - xiShare) / rest.length : 0;
+      for (const inv of GAME.investments) {
+        if (!Core.investmentAvailable(state, inv)) { alloc[inv.id] = 0; continue; }
+        alloc[inv.id] = inv.id === 'xiuxian' ? xiShare : share;
+      }
     } else {
-      const share = usable.length ? 1 / usable.length : 0;
+      const share = 1 / usable.length;
       for (const inv of GAME.investments) {
         alloc[inv.id] = Core.investmentAvailable(state, inv) ? share : 0;
       }
@@ -3282,6 +3605,36 @@
     Core.setAllocation(state, alloc);
     dirty = true;
     renderAll();
+
+    const n = usable.length;
+    toast(kind === 'reset'
+      ? '算力已全部拨给修仙方向'
+      : (kind === 'main'
+        ? '修仙 50%，其余 ' + (n - 1) + ' 个方向平分剩余 50%'
+        : '已均分到 ' + n + ' 个方向（每个 ' + (100 / n).toFixed(1) + '%）'), 'ok');
+  }
+
+  /** 预设按钮的文案随「当前可用方向数」走，不再写死 */
+  function refreshAllocPresets() {
+    const usable = allocUsable();
+    const n = usable.length;
+    const evenBtn = $('btn-alloc-even');
+    if (evenBtn) {
+      evenBtn.textContent = n > 1 ? (n + ' 路均分') : '均分';
+      evenBtn.disabled = n === 0;
+    }
+    const mainBtn = $('btn-alloc-main');
+    if (mainBtn) mainBtn.disabled = n === 0;
+    const resetBtn = $('btn-alloc-reset');
+    if (resetBtn) resetBtn.disabled = n === 0;
+
+    const hint = $('ui-alloc-preset-hint');
+    if (hint) {
+      hint.textContent = n
+        ? ('当前可分配 ' + n + ' 个方向：' + usable.map((i) => i.name).join(' / ') +
+           '　·　未解锁的方向不参与分配，解锁后按钮上的份数会自动跟着变')
+        : '当前没有可分配的投向';
+    }
   }
 
   // ============================================================
@@ -3357,6 +3710,36 @@
     if (!r) return;
     // index === 'all' 时服务端返回 all=true，提示语要说清楚改了几台
     toast('已更新产线配置' + (r.all ? '（整条线 ' + r.count + ' 台）' : ''), 'ok');
+  }
+
+  /**
+   * 整条线的「优先生产」开关。
+   * 只在算力不够时才有意义：开了的线先吃满，剩下的才轮到没开的线。
+   */
+  async function setLinePriority(lineId, on) {
+    const r = await companyAction('setLinePriority', { lineId: lineId, priority: on });
+    if (!r) return;
+    const line = GAME.company.lines.find((l) => l.id === lineId);
+    toast((on ? '已开启优先生产：「' : '已关闭优先生产：「') + (line ? line.name : lineId) +
+      '」' + (on ? '　算力不足时优先保障这条线' : '　恢复按全厂比例分摊'), 'ok');
+  }
+
+  /**
+   * 一个行业下的全部产线批量设产能（1 = 一键满速，0 = 一键停工）。
+   * 逐台点太反人类，批量只改已经买入的台，没买过的线不受影响。
+   */
+  async function setIndustryRate(industryId, rate) {
+    const r = await companyAction('setIndustryRate', { industryId: industryId, rate: rate });
+    if (!r) return;
+    const ind = GAME.company.industries.find((x) => x.id === industryId);
+    const name = ind ? ind.name : industryId;
+    if (!r.units) {
+      toast('「' + name + '」还没有买入任何产线，无需调整', 'warn');
+      return;
+    }
+    toast(rate >= 1
+      ? '「' + name + '」已一键满速：' + r.lines + ' 条线 · ' + r.units + ' 台全部 100%'
+      : '「' + name + '」已一键停工：' + r.lines + ' 条线 · ' + r.units + ' 台全部停机', 'ok');
   }
 
   async function upgradeWarehouse() {
@@ -3753,6 +4136,7 @@
   });
 
   $('btn-alloc-reset').addEventListener('click', () => setAllocPreset('reset'));
+  $('btn-alloc-main').addEventListener('click', () => setAllocPreset('main'));
   $('btn-alloc-even').addEventListener('click', () => setAllocPreset('even'));
 
   $('btn-logout').addEventListener('click', async () => {

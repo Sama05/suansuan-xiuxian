@@ -8,7 +8,16 @@ const GAME = require('../shared/game-config.js');
 const C = require('../shared/game-core.js');
 
 let pass = 0, fail = 0;
-function ok(cond, name, extra) {
+// 名称参数永远是字符串、条件参数永远不是字符串，所以这里能安全归一。
+// 历史上本文件混用过两种写法：
+//   ok(条件, 名称)   —— 绝大多数
+//   ok(名称, 条件)   —— v3.x 后期新增的若干块
+// 不归一的话，后者会把字符串当条件（恒真）、把布尔当名称，
+// 于是输出一排 `✓ true`，看不出到底在测什么。这里一次修掉，以后怎么写都不会翻车。
+function ok(a, b, extra) {
+  let cond, name;
+  if (typeof b === 'string') { cond = a; name = b; }      // ok(条件, 名称)
+  else { name = a; cond = b; }                             // ok(名称, 条件)
   if (cond) { pass++; console.log('  \u2713 ' + name); }
   else { fail++; console.log('  \u2717 ' + name + (extra ? '  -> ' + extra : '')); }
 }
@@ -1022,6 +1031,98 @@ console.log('\n=== 公司系统 · 生产线与解锁链 ===');
   C.foundCompany(none);
   ok(C.setLineUnit(none, 'mine', 0, { rate: 1 }).ok === false, '没买过这条线时设置被拒');
   ok(C.companyCycleNet(full).gt(0), '全开净收益为正');
+}
+
+// ============================================================
+console.log('\n=== 公司系统 · 行业批量操作与优先生产 ===');
+{
+  const s = C.createState();
+  s.realm = 3;
+  s.money = new D(1e12);
+  C.foundCompany(s);
+
+  // 找两条「所属行业不同、且都能买」的线，跨行业批量才测得出来
+  const l1 = GAME.company.lines[0];
+  const l2 = GAME.company.lines.find((l) => l.industry !== l1.industry && !l.after);
+  ok(!!l2, '找到两条不同行业的生产线');
+
+  C.buyLine(s, l1.id);
+  C.buyLine(s, l1.id);
+  if (l2) { C.buyLine(s, l2.id); }
+
+  const ind1 = l1.industry;
+  ok(C.lineUnits(s, l1.id).every((u) => u.r === 1), '新买的台默认满产能');
+
+  // ---- 一键停工：只作用在该行业，别的行业不受影响 ----
+  const stop = C.setIndustryRate(s, ind1, 0);
+  ok(stop.ok === true, '一键停工成功', stop.msg);
+  ok(stop.lines >= 1 && stop.units === 2, '停工范围覆盖该行业的每一台',
+    stop.lines + ' 条 / ' + stop.units + ' 台');
+  ok(C.lineUnits(s, l1.id).every((u) => u.r === 0), '该行业全部台产能归 0');
+  if (l2) ok(C.lineUnits(s, l2.id).every((u) => u.r === 1), '别的行业不受影响');
+  ok(Object.keys(C.companyOutputPerCycle(s)).length === 0, '停产后不产出');
+
+  // ---- 一键满速 ----
+  const run = C.setIndustryRate(s, ind1, 1);
+  ok(run.ok === true && run.units === 2, '一键满速成功');
+  ok(C.lineUnits(s, l1.id).every((u) => u.r === 1), '该行业全部台回到 100%');
+
+  // 非法输入
+  ok(C.setIndustryRate(s, '不存在的行业', 1).ok === false, '不存在的行业被拒');
+  ok(C.setIndustryRate(C.createState(), ind1, 1).ok === false, '未成立公司时批量操作被拒');
+  ok(C.setIndustryRate(s, ind1, 99).rate === 1, '产能超 1 会被夹到 1');
+  ok(C.setIndustryRate(s, ind1, -5).rate === 0, '产能为负会被夹到 0');
+
+  // ---- 优先生产：算力不足时先喂饱优先线 ----
+  const t = C.createState();
+  t.realm = 3;
+  t.money = new D(1e12);
+  C.foundCompany(t);
+  C.buyLine(t, l1.id);
+  if (l2) C.buyLine(t, l2.id);
+
+  // 算力只够一条线满负荷 → 全厂按 ~50% 摊薄
+  const need1 = Number(l1.maxCompute) || 1;
+  t.realCompute = new D(need1 * 1.0);
+  C.setAllocation(t, { industry: 1 });
+
+  const tiers0 = C.companyComputeTiers(t);
+  ok(Math.abs(C.unitComputeScale(t, l1) - C.unitComputeScale(t, l2)) < 1e-9,
+    '没人开优先时各线系数相同（行为与旧版一致）',
+    C.unitComputeScale(t, l1).toFixed(3) + ' / ' + C.unitComputeScale(t, l2).toFixed(3));
+  ok(Math.abs(tiers0.norm - tiers0.scale) < 1e-9, '无优先线时 norm 档 = 旧版全厂口径');
+
+  // 给 l1 开优先：它应吃满，剩下的才轮到 l2
+  const p = C.setLinePriority(t, l1.id, true);
+  ok(p.ok === true && p.priority === true, '优先开关可开启');
+  ok(C.linePriority(t, l1.id) === true, '状态读得回来');
+  const tiers1 = C.companyComputeTiers(t);
+  ok(tiers1.pri > tiers1.norm, '优先线拿到的算力成色更高',
+    'pri ' + tiers1.pri.toFixed(3) + ' > norm ' + tiers1.norm.toFixed(3));
+  ok(Math.abs(tiers1.pri - 1) < 1e-9, '算力够优先线时它满负荷', tiers1.pri.toFixed(4));
+
+  const out = C.companyOutputPerCycle(t);
+  const priGood = C.lineUnits(t, l1.id)[0].p;
+  ok((out[priGood] || 0) > 0, '优先线有产出', JSON.stringify(out));
+
+  // 关掉开关 → 回到等比摊薄
+  C.setLinePriority(t, l1.id, false);
+  ok(C.linePriority(t, l1.id) === false, '优先开关可关闭');
+  const tiers2 = C.companyComputeTiers(t);
+  ok(Math.abs(C.unitComputeScale(t, l1) - C.unitComputeScale(t, l2)) < 1e-9,
+    '关掉后又回到统一比例');
+  ok(Math.abs(tiers2.scale - tiers0.scale) < 1e-9, '关掉后全厂口径与开启前一致');
+
+  // 加购一台不应抹掉优先标记
+  C.setLinePriority(t, l1.id, true);
+  C.buyLine(t, l1.id);
+  ok(C.linePriority(t, l1.id) === true, '加购一台后优先标记仍在');
+  ok(C.setLinePriority(t, '不存在的线', true).ok === false, '不存在的线被拒');
+
+  // ---- 存档往返 ----
+  const back = C.hydrate(JSON.parse(JSON.stringify(C.serialize(t))));
+  ok(C.linePriority(back, l1.id) === true, '优先标记可存档往返');
+  ok(C.lineOwned(back, l1.id) === 2, '加购后台数正确', String(C.lineOwned(back, l1.id)));
 }
 
 // ============================================================
@@ -2952,11 +3053,13 @@ console.log('\n=== v3.4 · 转生衰减快照 / 功法成就解锁 / 功法规�
     C.techniqueList(sC).every((t) => t.unlockText && t.unlockText.length > 0),
     C.techniqueList(sC).filter((t) => !t.unlockText).map((t) => t.id).join(','));
   // 稀有度规模：每级 ≥5，除天外每级 ≥1 本境界解锁
+  // 注意：荒档的解锁境界就是「凡人」（realm 0），所以这里必须判「字段存在」而不是
+  // 判真假 —— 用 `if (t.realm)` 会把 0 当成没写，导致这条断言永远恒真、形同虚设。
   const byR = {};
   for (const r of GAME.techniques.rarities) byR[r.id] = { total: 0, realm: 0 };
   for (const t of GAME.techniques.list) {
     byR[t.rarity].total += 1;
-    if (t.realm) byR[t.rarity].realm += 1;
+    if (t.realm != null) byR[t.rarity].realm += 1;
   }
   ok('每个稀有度至少 5 本功法',
     GAME.techniques.rarities.every((r) => byR[r.id].total >= 5),
@@ -2977,6 +3080,39 @@ console.log('\n=== v3.4 · 转生衰减快照 / 功法成就解锁 / 功法规�
   const backP = C.hydrate(C.serialize(sP));
   ok('peakPressure 随存档往返', Math.abs(backP.company.peakPressure - 0.42) < 1e-9,
     String(backP.company.peakPressure));
+}
+
+console.log('\n=== 顶栏算力拆解（数字能自己对上账）===');
+{
+  // 背景：`实际算力` =（**兵解衰减后**的设备算力 + AI 累积）× 神识乘区 × 被动/淬体乘区。
+  // 顶栏早先只显示「总设备算力 + AI」：既没扣兵解衰减，也没乘乘区 ——
+  // 后期这两项合计才 1e20，而标题上写着 2.27e23，差 2000 倍，玩家只会以为数字算错了。
+  // 这条断言把「拆解必须等于实际算力」钉死，避免以后再有人只取其中一截去显示。
+  const s = C.createState();
+  s.realm = 5;
+  s.money = new D(1e12);
+  for (const dev of GAME.devices) {
+    for (let i = 0; i < 3; i++) if (!C.buyDevice(s, dev.id).ok) break;
+  }
+  s.shenshi = C.totalShenshi(s);
+
+  const b = C.computeBreakdown(s);
+  ok('拆解：base = 设备 + AI', b.base.eq(b.device.add(b.ai)), String(b.base));
+  ok('拆解：(设备 + AI) × 乘区 = 拆解总量', b.total.eq(b.base.mul(b.mul)), String(b.total));
+  ok('拆解总量 === realComputeOf', b.total.eq(C.realComputeOf(s)), String(b.total));
+  ok('乘区 > 1（神识与被动都在放大算力）', b.mul > 1, String(b.mul));
+  ok('device 字段取的是**衰减后**的有效设备算力',
+    b.device.eq(C.deviceComputeEffective(s)), String(b.device));
+  ok('有效设备算力 ≤ 原始设备算力',
+    b.device.lte(C.totalCompute(s)), b.device.toNumber() + ' vs ' + C.totalCompute(s).toNumber());
+
+  C.tick(s, 60, { offline: false });
+  ok('tick 后 s.realCompute 与拆解一致（顶栏读的就是它）',
+    s.realCompute.eq(C.computeBreakdown(s).total), String(s.realCompute));
+
+  const s3 = C.hydrate(C.serialize(s));
+  ok('拆解随存档往返一致',
+    C.computeBreakdown(s3).total.eq(s.realCompute), String(C.computeBreakdown(s3).total));
 }
 
 console.log('\n' + '='.repeat(46));

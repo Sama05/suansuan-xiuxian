@@ -35,20 +35,29 @@ function auth(req, res, next) {
 }
 
 // ---------- 账号 ----------
-app.post('/api/register', (req, res) => {
+// bcrypt 是异步的（同步版会阻塞整个进程），所以这两个路由带 async + try/catch
+app.post('/api/register', async (req, res) => {
   const { username, password } = req.body || {};
-  const r = dbm.register(username, password);
-  if (!r.ok) return res.status(400).json(r);
-  const token = dbm.createSession(r.userId, r.username);
-  res.json({ ok: true, token, username: r.username, userId: r.userId });
+  try {
+    const r = await dbm.register(username, password);
+    if (!r.ok) return res.status(400).json(r);
+    const token = dbm.createSession(r.userId, r.username);
+    res.json({ ok: true, token, username: r.username, userId: r.userId });
+  } catch (e) {
+    res.status(500).json({ ok: false, msg: '注册失败：' + (e && e.message ? e.message : '服务端错误') });
+  }
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { username, password } = req.body || {};
-  const r = dbm.login(username, password);
-  if (!r.ok) return res.status(400).json(r);
-  const token = dbm.createSession(r.userId, r.username);
-  res.json({ ok: true, token, username: r.username, userId: r.userId });
+  try {
+    const r = await dbm.login(username, password);
+    if (!r.ok) return res.status(400).json(r);
+    const token = dbm.createSession(r.userId, r.username);
+    res.json({ ok: true, token, username: r.username, userId: r.userId });
+  } catch (e) {
+    res.status(500).json({ ok: false, msg: '登录失败：' + (e && e.message ? e.message : '服务端错误') });
+  }
 });
 
 app.post('/api/logout', auth, (req, res) => {
@@ -491,6 +500,35 @@ app.post('/api/action', auth, (req, res) => {
       }
       result = {
         ok: true, lineId: r.lineId, index: r.index, all: r.all, count: r.count,
+      };
+      break;
+    }
+    /**
+     * 整条线的「优先生产」开关：算力不足时先喂饱开了的线。
+     */
+    case 'setLinePriority': {
+      const r = GameCore.setLinePriority(s,
+        payload && payload.lineId, payload && payload.priority);
+      if (!r.ok) {
+        dbm.saveGame(req.user.userId, GameCore.serialize(s));
+        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
+      }
+      result = { ok: true, lineId: r.lineId, priority: r.priority };
+      break;
+    }
+    /**
+     * 一个行业下的全部产线批量设产能（一键满速 rate=1 / 一键停工 rate=0）。
+     */
+    case 'setIndustryRate': {
+      const r = GameCore.setIndustryRate(s,
+        payload && payload.industryId, payload && payload.rate);
+      if (!r.ok) {
+        dbm.saveGame(req.user.userId, GameCore.serialize(s));
+        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
+      }
+      result = {
+        ok: true, industryId: r.industryId, rate: r.rate,
+        lines: r.lines, units: r.units,
       };
       break;
     }

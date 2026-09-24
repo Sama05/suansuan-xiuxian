@@ -44,6 +44,14 @@ function mkEl(id) {
     },
     addEventListener() {}, removeEventListener() {},
     appendChild(c) { this.children.push(c); }, remove() {}, focus() {},
+    // 属性读写：app.js 用 data-* 存「重建签名」之类的状态，桩必须支持，
+    // 否则用到它的渲染分支会在测试里直接抛错、后面的断言全废。
+    _attr: {},
+    getAttribute(n) {
+      return Object.prototype.hasOwnProperty.call(this._attr, n) ? this._attr[n] : null;
+    },
+    setAttribute(n, v) { this._attr[n] = String(v); },
+    removeAttribute(n) { delete this._attr[n]; },
     querySelector() { return mkEl('q'); },
     querySelectorAll() { return []; },
     closest() { return null; },
@@ -68,6 +76,12 @@ function mkListMock(ids, roles, attr) {
       dataset: { [attr]: id },
       classList: mkEl('c').classList,
       innerHTML: '', style: {}, disabled: false,
+      _attr: {},
+      getAttribute(n) {
+        return Object.prototype.hasOwnProperty.call(this._attr, n) ? this._attr[n] : null;
+      },
+      setAttribute(n, v) { this._attr[n] = String(v); },
+      removeAttribute(n) { delete this._attr[n]; },
       querySelector(sel) {
         const m = /\[data-role="([^"]+)"\]/.exec(String(sel));
         return (m && sub[m[1]]) ? sub[m[1]] : mkEl('missing');
@@ -238,6 +252,32 @@ function installStubs() {
 
     // 旧的工作按钮应已移除
     ok(!html.includes('id="work-btn"'), '旧的单一「工作」按钮已移除');
+
+    // 折叠（v3.7）：一处实现 + 声明式挂载。新增折叠点只加 data-collapse 属性，
+    // 不用再复制一份展开/收起代码 —— 这里把「只有一处实现」钉死，防止以后各写各的。
+    const appSrc = read('public/js/app.js');
+    ok((appSrc.match(/function slideToggle/g) || []).length === 1,
+      '折叠动画只有一处实现（新增折叠点复用即可）');
+    ok(/data-collapse="next"/.test(appSrc), '组头用 data-collapse 声明折叠目标');
+    ok(/bindCollapse\(\$\('co-line-list'\)/.test(appSrc) && /bindCollapse\(\$\('mk-good-list'\)/.test(appSrc),
+      '公司 / 市场两处折叠都走同一个 bindCollapse');
+
+    // 折叠动画的**根因回归**（v3.8 修）：
+    // 起始高度和目标高度必须落在**两次不同的样式计算**里，过渡才有东西可插值。
+    // 之前用 requestAnimationFrame 做间隔 —— rAF 排在样式计算之前，两次 height 赋值
+    // 会被合并成一次 recalc，浏览器只看到 `auto → 0px`（auto 不可插值）→ 收起直接瞬变；
+    // 而展开「碰巧」有动画，因为 el.scrollHeight 是在赋值之后读的，那一次读顺带刷了布局。
+    // 症状：展开顺滑、收起生硬 —— 极易被当成「就这样」。这里把强制同步布局钉死。
+    const slideRaw = (/function slideToggle[\s\S]*?\n  \}/.exec(appSrc) || [''])[0];
+    ok(slideRaw.length > 0, '取到 slideToggle 函数体');
+    // 断言必须看**代码**，不能看注释 —— 注释里正好写着 rAF / offsetHeight 这两个词
+    const slideCode = slideRaw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    ok(!/requestAnimationFrame/.test(slideCode),
+      '折叠动画不靠 rAF 分帧（rAF 会与起始赋值合并进同一次样式计算）');
+    ok(/void\s+el\.offsetHeight/.test(slideCode),
+      '两次 height 赋值之间强制一次同步布局（否则收起没有过渡）');
+    ok(slideCode.indexOf('void el.offsetHeight') > slideCode.indexOf('el.style.height = (open ? 0'),
+      '强制布局必须夹在「起始高度」与「目标高度」之间');
   }
 
   console.log('\n=== 公司页样式（涨红跌绿）===');
@@ -336,6 +376,58 @@ function installStubs() {
     ok(/function setText\(/.test(app), '存在 setText 值缓存写入');
     ok(!/\$\('ui-money'\)\.textContent\s*=/.test(app),
       '顶栏不再无条件重写 textContent（避免每帧重排）');
+  }
+
+  console.log('\n=== 生产线批量操作 · 优先生产 · 商品排序 ===');
+  {
+    const html = read('public/index.html');
+    const app = read('public/js/app.js');
+    const css = read('public/css/style.css');
+
+    // ---- 市场排序条：四个互斥按钮 ----
+    const bar = /<div class="mk-sortbar" id="mk-sortbar">([\s\S]*?)<\/div>\s*<div id="mk-good-list">/.exec(html);
+    ok(!!bar, '市场商品列表上方存在排序条');
+    const barHtml = bar ? bar[1] : '';
+    for (const f of ['industry', 'price', 'gain', 'drop']) {
+      ok(barHtml.indexOf('data-sort="' + f + '"') >= 0, '排序按钮存在：' + f);
+    }
+    ok((barHtml.match(/data-sort="/g) || []).length === 4, '排序按钮恰为 4 个');
+    ok(html.indexOf('id="ui-mk-sort-hint"') > 0, '排序条有状态说明位');
+
+    // 排序状态必须是**单一**的 { field, dir } —— 否则「互斥」无从谈起
+    ok(/const mktSort = \{ field: 'industry', dir: 1 \}/.test(app),
+      '排序状态只有一个 field + dir（天然互斥）');
+    ok(/mktSort\.dir = -mktSort\.dir/.test(app), '再点同一按钮切换升 / 降序');
+    ok(/mktSort\.field = f;[\s\S]{0,80}mktSort\.dir = 1/.test(app), '换字段时重置为升序');
+    ok(/ar\.textContent = on \? \(mktSort\.dir === 1 \? '↓' : '↑'\)/.test(app),
+      '升序显示下箭头、降序显示上箭头');
+    ok(/function applyMarketSort\(force\)/.test(app), '存在统一的排序落地函数');
+    ok(/mktSort\.field === 'industry'[\s\S]{0,120}buildMarketGroups\(\)/.test(app),
+      '点「行业」回到分组展示');
+    ok(/function maybeResortMarket\(\)[\s\S]{0,200}applyMarketSort\(false\)/.test(app),
+      '刷新后按当前字段保持排序（节流重排，不每帧抖动）');
+    ok(/MKT_RESORT_MS/.test(app), '重排有节流间隔');
+
+    // ---- 行业批量操作（一键满速 / 一键停工）----
+    ok(/data-role="lrun"/.test(app) && /data-role="lstop"/.test(app),
+      '行业组头有「一键满速运转」与「一键停工」两个按钮');
+    ok(/data-nocollapse/.test(app), '批量按钮标了 data-nocollapse（点它不折叠分组）');
+    ok(/e\.target\.closest\('\[data-nocollapse\]'\)/.test(app),
+      'bindCollapse 会跳过 data-nocollapse 的点击');
+    ok(/async function setIndustryRate\(industryId, rate\)/.test(app),
+      '存在行业批量设产能的入口');
+    ok(/case 'setIndustryRate'/.test(read('server/index.js')), '服务端受理 setIndustryRate');
+    ok(/function setIndustryRate\(s, industryId, rate\)/.test(read('shared/game-core.js')),
+      '内核实现 setIndustryRate');
+    ok(/r\.lines[\s\S]{0,40}r\.units/.test(app), '批量操作给出作用范围的状态反馈');
+
+    // ---- 优先生产 ----
+    ok(/data-role="lprio"/.test(app), '每条生产线有「优先生产」开关');
+    ok(/co-prio\.on/.test(css) || /\.co-prio\.on/.test(css), '优先开关的开启态有独立样式');
+    ok(/async function setLinePriority\(lineId, on\)/.test(app), '存在优先开关入口');
+    ok(/case 'setLinePriority'/.test(read('server/index.js')), '服务端受理 setLinePriority');
+    ok(/function companyComputeTiers\(s\)/.test(read('shared/game-core.js')),
+      '算力按两级分配（优先线先吃满）');
   }
 
   console.log('\n=== app.js 加载（模拟浏览器） ===');
@@ -742,6 +834,13 @@ function installStubs() {
     ok(unitsHtml.indexOf('data-role="urate"') >= 0, '每台可调产能');
     ok(unitsHtml.indexOf('铁矿石') >= 0, '产物下拉里含本行业产物');
     ok(unitsHtml.indexOf('全部套用') >= 0, '整条线可一键套用');
+
+    // 回归（v3.7）：「每一台」配置行的重建签名必须写在**元素自己身上**。
+    // 早先存在模块级 Map 里 —— DOM 一旦被重建（折叠、切页、重登），新盒子是空的，
+    // 可缓存表里还留着旧签名，于是「签名没变 → 不重建」，玩家改了产物也看不见，
+    // 非得再买一条线（台数变了签名才变）才冒出来。签名跟着元素走就不会有这种漂移。
+    const usig = L('mine', 'lunits').getAttribute('data-usig') || '';
+    ok(usig.indexOf('5|') === 0, '产线配置行的重建签名写在元素上（DOM 换了必然重建）', usig);
     ok(L('mine', 'lprice').textContent.length > 0, '生产线价格已回填',
       L('mine', 'lprice').textContent);
     ok(L('mine', 'lbuy').disabled === false, '已解锁且钱够时购入按钮可用');

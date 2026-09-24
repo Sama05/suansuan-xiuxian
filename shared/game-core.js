@@ -70,6 +70,8 @@
    * 60 秒一段兼顾精度与性能（48 小时 = 2880 段，纯算术开销可忽略）。
    */
   const STEP_REAL_SECONDS = 60;
+  /** 离线结算的步数上限（步长由此反推，见 tick） */
+  const OFFLINE_MAX_STEPS = 600;
 
   // ============================================================
   // 状态
@@ -495,7 +497,7 @@
           if (r > 1) r = 1;
           out.push({ p: p, r: r });
         }
-        s.company.lines[l.id] = { units: out };
+        s.company.lines[l.id] = { units: out, priority: !!(raw && raw.priority) };
       }
       if (rc.pending) for (const g of GAME.company.goods) {
         const v = Number(rc.pending[g.id]);
@@ -701,7 +703,10 @@
         lines: (function () {
           const o = {};
           for (const l of GAME.company.lines) {
-            o[l.id] = { units: lineUnits(s, l.id).map((u) => ({ p: u.p, r: u.r })) };
+            o[l.id] = {
+              units: lineUnits(s, l.id).map((u) => ({ p: u.p, r: u.r })),
+              priority: linePriority(s, l.id),
+            };
           }
           return o;
         })(),
@@ -2426,11 +2431,33 @@
    *   b) 神识乘区走 shenshiComputeMultiplier 的分层公式（境界线性 × 设备对数收敛），
    *      不再用「神识总量 × 固定系数」—— 那个口径在后期会爆炸。
    */
-  function realComputeOf(s) {
-    const base = D.add(deviceComputeEffective(s), s.aiBonus);
+  /**
+   * 「实际算力」的构成拆解 —— 给界面显示用。
+   *
+   * 为什么要单拎出来：`实际算力` 不是「设备 + AI」这么简单，中间还有一层**兵解衰减**
+   * （设备部分走 deviceComputeEffective）和两层乘区（神识、被动/淬体）。
+   * 顶栏早先只显示 `总设备算力 + AI`，后期两者合计才 1e20，而标题写着 2.27e23 ——
+   * 差 2000 倍，玩家只会以为数字算错了。拆解出来之后这一行能自己对上账：
+   *   (device + ai) × mul === total === realComputeOf(s)
+   */
+  function computeBreakdown(s) {
+    const device = deviceComputeEffective(s);
+    const ai = (s.aiBonus instanceof D) ? s.aiBonus : D.fromJSON(s.aiBonus || 0);
     const shenshiMul = shenshiComputeMultiplier(s);
     const passiveMul = (1 + passiveBonus(s, 'compute')) * (1 + tribulationBonus(s, 'compute'));
-    return base.mul(shenshiMul).mul(passiveMul);
+    const mul = shenshiMul * passiveMul;
+    const base = D.add(device, ai);
+    return {
+      device: device,
+      ai: ai,
+      mul: mul,
+      base: base,
+      total: base.mul(mul),
+    };
+  }
+
+  function realComputeOf(s) {
+    return computeBreakdown(s).total;
   }
 
   /**
@@ -3353,6 +3380,45 @@
     return !!unit && !!unit.p && (unit.r === undefined ? 1 : unit.r) >= lineMinRate();
   }
 
+  /** 某条线是否开了「优先生产」 */
+  function linePriority(s, lineId) {
+    const e = s.company && s.company.lines && s.company.lines[lineId];
+    return !!(e && e.priority);
+  }
+
+  /** 开 / 关某条线的「优先生产」。没买过的线也允许先标记（买了就生效）。 */
+  function setLinePriority(s, lineId, on) {
+    const line = lineById(lineId);
+    if (!line) return { ok: false, msg: '生产线不存在' };
+    if (!companyFounded(s)) return { ok: false, msg: '尚未成立公司' };
+    if (!s.company.lines[lineId]) s.company.lines[lineId] = { units: [] };
+    s.company.lines[lineId].priority = !!on;
+    return { ok: true, lineId: lineId, priority: !!on };
+  }
+
+  /**
+   * 把一个行业下的**全部**生产线一次性设为同一产能（一键满速 / 一键停工）。
+   * 只动已经买入的台，没买过的线不受影响。
+   */
+  function setIndustryRate(s, industryId, rate) {
+    if (!companyFounded(s)) return { ok: false, msg: '尚未成立公司' };
+    const ind = industryById(industryId);
+    if (!ind) return { ok: false, msg: '行业不存在' };
+    const r = Number(rate);
+    if (!Number.isFinite(r)) return { ok: false, msg: '产能必须是数字' };
+    const v = Math.max(0, Math.min(1, r));
+    let lines = 0;
+    let units = 0;
+    for (const line of GAME.company.lines) {
+      if (line.industry !== industryId) continue;
+      const us = lineUnits(s, line.id);
+      if (!us.length) continue;
+      lines += 1;
+      for (const u of us) { u.r = v; units += 1; }
+    }
+    return { ok: true, industryId: industryId, rate: v, lines: lines, units: units };
+  }
+
   /** 全厂算力总需求 = Σ(每条线 maxCompute × 该台产能) */
   function companyComputeDemand(s) {
     let need = new D(0);
@@ -3367,18 +3433,76 @@
     return need;
   }
 
+  // 分级分配的缓存：按 state 分桶（WeakMap），桶内按「各线产能 + 优先标记 + 算力池」失效。
+  let _tierStore = new WeakMap();
+
+  /**
+   * 算力按**两级**分配。
+   *
+   *   第一档：开了「优先生产」的线 —— 先吃满，只有它们自己吃不饱时才内部按比例摊薄；
+   *   第二档：其余的线 —— 分第一档吃剩下的，按老规矩统一比例削减。
+   *
+   * 于是「优先」在经济上的含义是：算力不够时**先牺牲谁**。没开优先的线继续沿用
+   * 原来的等比削减规则，玩家不设置任何优先标记时的行为与 v3.7 之前完全一致
+   * （此时 priNeed = 0，normScale = pool / 总需求，即旧的 companyComputeScale）。
+   */
+  function companyComputeTiers(s) {
+    let priNeed = 0;
+    let normNeed = 0;
+    let sig = '';
+    for (const line of GAME.company.lines) {
+      const units = lineUnits(s, line.id);
+      if (!units.length) continue;
+      const pri = linePriority(s, line.id);
+      let r = 0;
+      for (const u of units) {
+        if (unitActive(u)) r += Math.max(0, Math.min(1, u.r === undefined ? 1 : u.r));
+      }
+      if (r <= 0) continue;
+      sig += line.id + ':' + r.toFixed(4) + (pri ? ':p;' : ':n;');
+      const c = (line.maxCompute || 0) * r;
+      if (pri) priNeed += c; else normNeed += c;
+    }
+    const pool = industrialComputePool(s).toNumber();
+    const key = sig + '|' + pool.toExponential(8);
+
+    let e = (s && typeof s === 'object') ? _tierStore.get(s) : null;
+    if (!e) {
+      e = { key: '', v: null };
+      if (s && typeof s === 'object') _tierStore.set(s, e);
+    }
+    if (e.key !== key || !e.v) {
+      const priScale = priNeed > 0 ? Math.max(0, Math.min(1, pool / priNeed)) : 1;
+      const left = Math.max(0, pool - Math.min(pool, priNeed));
+      const normScale = normNeed > 0 ? Math.max(0, Math.min(1, left / normNeed)) : 1;
+      const need = priNeed + normNeed;
+      e.key = key;
+      e.v = {
+        pri: priScale,
+        norm: normScale,
+        priNeed: priNeed,
+        normNeed: normNeed,
+        need: need,
+        pool: pool,
+        // 全厂口径：只用于界面显示「整体几成」
+        scale: need > 0 ? Math.max(0, Math.min(1, pool / need)) : 1,
+      };
+    }
+    return e.v;
+  }
+
+  /** 某台线实际能拿到几成算力（优先线走 pri 档，其余走 norm 档） */
+  function unitComputeScale(s, line) {
+    const t = companyComputeTiers(s);
+    return linePriority(s, line.id) ? t.pri : t.norm;
+  }
+
   /**
    * 算力供给 / 需求的比值（>1 表示供大于求，此时钳到 1）。
-   * **统一按比例削减**，不是先到先得 —— 于是算力不足时多买线不会凭空增产，
-   * 只会把每条线摊薄。这是「工业产能」这条投向的全部意义。
+   * 这是**全厂口径**，只给界面显示用 —— 真实产量走 unitComputeScale 的分档结果。
    */
   function companyComputeScale(s) {
-    const need = companyComputeDemand(s);
-    if (need.lte(0)) return 1;
-    const pool = industrialComputePool(s);
-    if (pool.gte(need)) return 1;
-    const v = pool.div(need).toNumber();
-    return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
+    return companyComputeTiers(s).scale;
   }
 
   /**
@@ -3388,13 +3512,16 @@
    *
    * 产能与削减系数都是乘在产量上的，所以「算力不够 → 产能打折」与
    * 「自己把产能调低」在产量上是同一回事，只是前者不由玩家控制。
+   *
+   * 削减系数按**台**取（unitComputeScale），因为开了「优先生产」的线和没开的
+   * 线拿到的成色不一样 —— 传进来的 scale 只在调用方已经算好时用于避免重复计算。
    */
   function unitOutput(s, line, unit, scale) {
     if (!unitActive(unit)) return 0;
     const g = goodById(unit.p);
     if (!g) return 0;
     const rate = Math.max(0, Math.min(1, unit.r === undefined ? 1 : unit.r));
-    const sc = (scale === undefined) ? companyComputeScale(s) : scale;
+    const sc = (scale === undefined) ? unitComputeScale(s, line) : scale;
     const coef = (typeof g.outputCoef === 'number') ? g.outputCoef : 1;
     return (line.baseOutput || 0) * coef * rate * sc;
   }
@@ -3405,10 +3532,10 @@
    */
   function companyOutputPerCycle(s) {
     const out = {};
-    const scale = companyComputeScale(s);
     for (const line of GAME.company.lines) {
       const units = lineUnits(s, line.id);
       if (!units.length) continue;
+      const scale = unitComputeScale(s, line);
       for (const u of units) {
         const n = unitOutput(s, line, u, scale);
         if (n <= 0) continue;
@@ -3429,11 +3556,11 @@
   function companyUpkeep(s) {
     let material = new D(0);
     let labor = new D(0);
-    const scale = companyComputeScale(s);
     const cache = {};
     for (const line of GAME.company.lines) {
       const units = lineUnits(s, line.id);
       if (!units.length) continue;
+      const scale = unitComputeScale(s, line);
       for (const u of units) {
         const n = unitOutput(s, line, u, scale);
         if (n <= 0) continue;
@@ -3557,7 +3684,9 @@
       const units = lineUnits(s, line.id).slice();
       const prods = lineProducts(line);
       units.push({ p: prods.length ? prods[0].id : null, r: 1 });
-      s.company.lines[line.id] = { units: units };
+      // priority 必须跟着一起写回 —— 否则「加购一台」会把这条线的优先标记抹掉，
+      // 而且序列化时字段时有时无，存档往返会对不上。
+      s.company.lines[line.id] = { units: units, priority: linePriority(s, line.id) };
       lastIndex = units.length - 1;
       lastProduct = units[units.length - 1].p;
       lastCost = cost;
@@ -3967,14 +4096,49 @@
   }
 
   /** 当前成交价 = 自然价 × 冲击系数，并兜一道绝对下限 */
+  /**
+   * 股价缓存：s -> { key, map }。
+   *
+   * 股价是纯函数，只由这几项决定：期数（自然价）、抛压版本号（联动因子）、
+   * 玩家持仓与本期净买入流（冲击系数）。行情不动的那一帧里，100 只股票的报价
+   * 其实一模一样 —— 但走一遍完整链路要几毫秒，而界面 100ms 就重绘一次。
+   * key 变了整张作废，不会无限增长。
+   */
+  const _stockPxMemo = new WeakMap();
+  function stockPxMemo(s) {
+    let e = (s && typeof s === 'object') ? _stockPxMemo.get(s) : null;
+    if (!e) {
+      e = { key: '', map: new Map() };
+      if (s && typeof s === 'object') _stockPxMemo.set(s, e);
+    }
+    return e;
+  }
+
   function stockPrice(s, stock, realSeconds) {
     if (!stock) return new D(0);
-    const t = (realSeconds === undefined || realSeconds === null)
-      ? marketClock(s) : realSeconds;
+    // 只在「取当前时点」这条路上缓存：显式传 realSeconds 是回看历史价，
+    // 那种调用本来就少，不做缓存也无所谓。
+    const memoable = !!(s && typeof s === 'object') &&
+      (realSeconds === undefined || realSeconds === null);
+    const t = memoable ? marketClock(s) : (realSeconds || 0);
+
+    let store = null;
+    let mKey = null;
+    if (memoable) {
+      store = stockPxMemo(s);
+      const key = stockPeriod(stock, t) + '|' + _mktVer;
+      if (store.key !== key) { store.key = key; store.map.clear(); }
+      mKey = stock.id + '|' + stockShares(s, stock.id) + '|' + stockFlow(s, stock.id);
+      const hit = store.map.get(mKey);
+      if (hit) return hit;
+    }
+
     const nat = stockNaturalAtPeriod(s, stock, stockPeriod(stock, t));
     const px = nat.mul(stockImpact(s, stock));
     const fl = nat.mul(stockCfg().floor || 0);
-    return px.lt(fl) ? fl : px;
+    const v = px.lt(fl) ? fl : px;
+    if (store) store.map.set(mKey, v);
+    return v;
   }
 
   /** 相对上一期的行情涨跌：'up' / 'down' / 'flat'（只看自然价，不看自己的冲击） */
@@ -4562,9 +4726,20 @@
 
     const offline = !!opts.offline;
     let remain = total;
+    // 离线步长自适应：把总步数压在上限内，短时离线（< 上限 × 60 秒）步长不变。
+    //
+    // 为什么离线可以放大步长：这段 tick 里所有**按周期结算**的模块都支持一次跨多期 ——
+    //   · syncCompany：cycleProgress 累加后 while 循环把这一大步里的每个周期都结算掉；
+    //   · syncMarket / syncStocks：n = 当前期 − 上次结算期，一次补齐 n 期的衰减与压力；
+    //   · 工作 / 精力 / 灵气：都是速率 × dt 的线性累积。
+    // 所以放大步长不改变结果，只减少「每步固定开销」被重复的次数 —— 那才是
+    // 长离线真正的耗时来源（每步都要扫一遍 288 个商品、100 只股票、几十条产线）。
+    const stepMax = offline
+      ? Math.max(STEP_REAL_SECONDS, Math.ceil(total / OFFLINE_MAX_STEPS))
+      : STEP_REAL_SECONDS;
     let guard = 0;
     while (remain > 0 && guard < 100000) {
-      const step = Math.min(remain, STEP_REAL_SECONDS);
+      const step = Math.min(remain, stepMax);
       // 渡劫是否允许在这段 tick 内自动触发。
       // 浏览器端传 tribulation:false —— 它把渡劫留给服务端权威操作；
       // 服务端（/api/load 的离线结算、/api/action 的前置推进）保持默认开启。
@@ -4798,7 +4973,7 @@
     learnTechniques, addMastery, cultivateSpeed, comprehendCost, comprehendGain,
     techLevel, techMainQiSpeed, techniqueList, passiveBonus,
     // 科技
-    deviceCost, deviceStoneCost, totalCompute, deviceStoneOutput, realComputeOf,
+    deviceCost, deviceStoneCost, totalCompute, deviceStoneOutput, realComputeOf, computeBreakdown,
     autoIncome, qiMultiplier,
     allocatableInvestments, investmentAvailable, investmentLockReason,
     investOutput, investOutputRate, hardwareCostFactor, investedHardwareOf, hasAnyTechnique,
@@ -4821,7 +4996,8 @@
     industryById, goodsOfIndustry, lineProducts, lineIndustry,
     industryPriceRatio, industryUpstreamRatio, industryPriceIndex, industryCostIndex,
     industrialComputePool, lineUnits, lineMinRate, unitActive,
-    companyComputeDemand, companyComputeScale, unitOutput, setLineUnit,
+    companyComputeDemand, companyComputeScale, companyComputeTiers, unitComputeScale,
+    unitOutput, setLineUnit, setIndustryRate, linePriority, setLinePriority,
     // 股市（证券账户）
     stockCfg, stockById, stockUnlocked, stockLockedReason, stockDepth,
     stockPeriodSeconds, stockPeriod, stockFactor, stockLinkFactor,
