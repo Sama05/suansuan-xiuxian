@@ -1952,7 +1952,10 @@ console.log('\n=== 股市（证券账户） · 配置自洽 ===');
     if (st.link && !C.goodById(st.link)) bad = st.id + ' link 指向不存在的商品: ' + st.link;
     // 主营业务是「行情一动就能看出波及谁」的关键，必须有
     if (!st.business) bad = st.id + ' 缺 business（主营业务）';
-    if (st.kind !== 'tech' && st.kind !== 'xiuxian') bad = st.id + ' kind 必须是 tech / xiuxian';
+    // v3.6 起新增第三类：fusion（融合赛道，元婴解锁）
+    if (st.kind !== 'tech' && st.kind !== 'xiuxian' && st.kind !== 'fusion') {
+      bad = st.id + ' kind 必须是 tech / xiuxian / fusion';
+    }
   }
   ok(bad === null, '每只股票的字段自洽', bad || '');
 

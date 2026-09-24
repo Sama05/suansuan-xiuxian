@@ -26,6 +26,14 @@
   let chartStock = null;
   // 行情列表是否展开全部 50 家（默认只列市值前 10）
   let showAllStocks = false;
+  // 市场行业折叠（v3.6）：folded 集合 + 初始化哨兵 + 签名缓存
+  const mktFolded = new Set();
+  const mktFoldInit = new Set();
+  let mktFoldSig = '';
+  // 生产线折叠（v3.6）
+  const lineFolded = new Set();
+  const lineFoldInit = new Set();
+  let lineFoldSig = '';
   // 功法阁视图：'owned' 只显示已拥有（默认）| 'codex' 图鉴（全部 + 解锁条件）
   let techView = 'owned';
   // 功法列表 DOM 的重建签名 = 已拥有 id 串。变化才重建，其余帧只改数值。
@@ -617,7 +625,7 @@
   let evSeq = 0;
   /** 观察快照：与上一帧比较用 */
   const evSnap = {
-    realm: -1, techTiers: {}, learnedSet: null, revenue: null, autoSold: 0, alloc: {},
+    realm: -1, techTiers: {}, techLevels: {}, learnedSet: null, revenue: null, autoSold: 0, alloc: {},
   };
   /** 自动卖出入账的聚合窗口：攒 6 秒报一次，不然每个生产周期（20s 内多次）都刷屏 */
   let sellAccum = new (window.Decimal || Object)();
@@ -713,6 +721,19 @@
       evSnap.techTiers[id] = rec.tier;
     }
 
+    // ---- 功法升级（v3.5 独立经验制，升级值得播一条）----
+    for (const id of Object.keys(state.learned || {})) {
+      const rec = state.learned[id];
+      if (!rec) continue;
+      const prev = evSnap.techLevels[id];
+      if (prev === undefined) { evSnap.techLevels[id] = rec.level || 0; continue; }
+      if ((rec.level || 0) > prev) {
+        const t = Core.techById(id);
+        if (t) pushEvent('功法升级：《' + t.name + '》→ Lv.' + rec.level, 'good');
+      }
+      evSnap.techLevels[id] = rec.level || 0;
+    }
+
     // ---- 公司自动卖出入账（按窗口聚合）----
     const rev = state.company && state.company.totalRevenue;
     if (rev && rev.gt && evSnap.revenue && rev.gt(evSnap.revenue)) {
@@ -792,13 +813,14 @@
 
   /** 单个商品行情行的静态结构（市场页按行业分组塞进去） */
   function goodRowHTML(g, kind) {
-    const kindName = kind === 'xiuxian' ? '修仙类' : '科技类';
+    const kindName = kind === 'xiuxian' ? '修仙类' : (kind === 'fusion' ? '融合类' : '科技类');
     return '<div class="co-good ' + kind + '" data-good="' + g.id + '">' +
       '<div class="co-good-icon">' + esc(indIcon(g.industry)) + '</div>' +
       '<div class="co-good-main">' +
         '<div class="co-good-title">' + esc(g.name) +
           '<span class="co-line-tag ' + kind + '">' + kindName + '</span>' +
           '<span class="co-line-tag">每 ' + fmtPeriod(g.periodSeconds) + '变价</span>' +
+          (kind !== 'tech' ? '<span class="co-line-tag cur">售 → 灵石</span>' : '') +
         '</div>' +
         '<div class="co-good-meta" data-role="gmeta"></div>' +
         '<div class="co-press hidden" data-role="gpress">' +
@@ -1030,31 +1052,73 @@
     }).join('');
 
     // ---- 公司：生产线（每条线买下后，每一台都能单独选产物、调产能）----
-    $('co-line-list').innerHTML = GAME.company.lines.map((l) => {
-      // 门类挂在行业上（产线本身不带 kind），别写成 l.kind —— 那永远是 undefined
-      const ind = GAME.company.industries.find((x) => x.id === l.industry);
-      const kind = (ind && ind.kind === 'xiuxian') ? 'xiuxian' : 'tech';
-      const kindName = kind === 'xiuxian' ? '修仙' : '科技';
-      return '<div class="co-line ' + kind + '" data-line="' + l.id + '">' +
-        '<div class="co-line-icon">' + esc(indIcon(l.industry)) + '</div>' +
-        '<div class="co-line-main">' +
-          '<div class="co-line-title">' + esc(l.name) +
-            '<span class="co-line-tag ' + kind + '">' + kindName + ' · ' + esc(indName(l.industry)) + '</span>' +
-            '<span class="co-line-tag" data-role="lowned">×0</span>' +
+    buildCompanyLineGroups();
+
+    $('co-line-list').addEventListener('click', (e) => {
+      // v3.6：点击行业组头折叠 / 展开该组生产线
+      const lhead = e.target.closest('[data-role="lgrouphead"]');
+      if (lhead) {
+        const grp = lhead.closest('.co-line-group');
+        const gid = grp ? grp.dataset.industry : null;
+        if (gid) {
+          if (lineFolded.has(gid)) lineFolded.delete(gid); else lineFolded.add(gid);
+          grp.classList.toggle('folded', lineFolded.has(gid));
+          const f = grp.querySelector('.mk-fold');
+          if (f) f.textContent = lineFolded.has(gid) ? '▸' : '▾';
+        }
+        return;
+      }
+    });
+
+    /**
+     * v3.6：生产线按行业分组骨架（折叠 + fusion kind）。
+     * 行内容（lstats / lunits / lprice）仍由 renderCompanyPage 逐帧回填。
+     */
+    function buildCompanyLineGroups() {
+      $('co-line-list').innerHTML = GAME.company.industries.map((ind) => {
+        const ls = GAME.company.lines.filter((l) => l.industry === ind.id);
+        if (!ls.length) return '';
+        const kind = ind.kind === 'xiuxian' ? 'xiuxian' : (ind.kind === 'fusion' ? 'fusion' : 'tech');
+        if (kind === 'fusion' && !lineFoldInit.has(ind.id)) { lineFoldInit.add(ind.id); lineFolded.add(ind.id); }
+        const rows = ls.map((l) => {
+          return '<div class="co-line ' + kind + '" data-line="' + l.id + '">' +
+            '<div class="co-line-icon">' + esc(indIcon(l.industry)) + '</div>' +
+            '<div class="co-line-main">' +
+              '<div class="co-line-title">' + esc(l.name) +
+                '<span class="co-line-tag ' + kind + '">' + esc(indName(l.industry)) + '</span>' +
+                '<span class="co-line-tag" data-role="lowned">×0</span>' +
+              '</div>' +
+              '<div class="co-line-desc">' + esc(l.desc) + '</div>' +
+              '<div class="co-line-stats" data-role="lstats"></div>' +
+              // 每一台的配置行在这里动态回填（台数会变，不能写死在静态结构里）
+              '<div class="co-line-units" data-role="lunits"></div>' +
+              '<div class="co-line-lock hidden" data-role="llock"></div>' +
+            '</div>' +
+            '<div class="co-line-right">' +
+              '<div class="co-line-owned" data-role="lcap">已拥有 0 条</div>' +
+              '<div class="co-line-price" data-role="lprice">—</div>' +
+              '<button class="btn sm" data-role="lbuy">购入</button>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+        return '<div class="co-line-group ' + (lineFolded.has(ind.id) ? 'folded' : '') + '" data-industry="' + ind.id + '">' +
+          '<div class="mk-group-head" data-role="lgrouphead" title="点击折叠 / 展开该行业生产线">' +
+            '<span class="mk-fold">' + (lineFolded.has(ind.id) ? '▸' : '▾') + '</span>' +
+            '<span class="mk-group-icon">' + esc(indIcon(ind.id)) + '</span>' +
+            '<span class="mk-group-name">' + esc(ind.name) + '</span>' +
+            '<span class="mk-group-tag">' + (kind === 'fusion' ? '融合 · 元婴解锁' : (kind === 'xiuxian' ? '修仙 · 产业' : '科技 · 产业')) + '</span>' +
+            '<span class="mk-group-idx">' + ls.length + ' 条线</span>' +
           '</div>' +
-          '<div class="co-line-desc">' + esc(l.desc) + '</div>' +
-          '<div class="co-line-stats" data-role="lstats"></div>' +
-          // 每一台的配置行在这里动态回填（台数会变，不能写死在静态结构里）
-          '<div class="co-line-units" data-role="lunits"></div>' +
-          '<div class="co-line-lock hidden" data-role="llock"></div>' +
-        '</div>' +
-        '<div class="co-line-right">' +
-          '<div class="co-line-owned" data-role="lcap">已拥有 0 条</div>' +
-          '<div class="co-line-price" data-role="lprice">—</div>' +
-          '<button class="btn sm" data-role="lbuy">购入</button>' +
-        '</div>' +
-      '</div>';
-    }).join('');
+          '<div class="mk-group-body">' + rows + '</div>' +
+        '</div>';
+      }).join('');
+    }
+
+    function lineBuyQty() {
+      const el = document.getElementById('line-buy-qty');
+      const v = el ? Math.floor(Number(el.value) || 1) : 1;
+      return Math.max(1, Math.min(100, v));
+    }
 
     $('co-line-list').addEventListener('click', (e) => {
       const btn = e.target.closest('[data-role="lbuy"]');
@@ -1099,24 +1163,59 @@
       if (txt) txt.textContent = Math.round(Number(e.target.value)) + '%';
     });
 
+    /** v3.6：市场分组骨架（fusion kind + 折叠箭头），折叠态变化时整体重建 */
+    function buildMarketGroups() {
+      $('mk-good-list').innerHTML = GAME.company.industries.map((ind) => {
+        const goods = GAME.company.goods.filter((g) => g.industry === ind.id);
+        if (!goods.length) return '';
+        const kind = ind.kind === 'xiuxian' ? 'xiuxian' : (ind.kind === 'fusion' ? 'fusion' : 'tech');
+        const ups = (ind.upstream || []).map((u) => indName(u)).join(' + ');
+        // 融合行业默认折叠（48 个组全展开页面太长），点击组头切换
+        if (kind === 'fusion' && !mktFoldInit.has(ind.id)) { mktFoldInit.add(ind.id); mktFolded.add(ind.id); }
+        return '<div class="mk-group ' + kind + (mktFolded.has(ind.id) ? ' folded' : '') + '" data-industry="' + ind.id + '">' +
+          '<div class="mk-group-head" data-role="ghead" title="点击折叠 / 展开该行业产品">' +
+            '<span class="mk-fold">' + (mktFolded.has(ind.id) ? '▸' : '▾') + '</span>' +
+            '<span class="mk-group-icon">' + esc(indIcon(ind.id)) + '</span>' +
+            '<span class="mk-group-name">' + esc(ind.name) + '</span>' +
+            '<span class="mk-group-tag">' + (kind === 'fusion' ? '融合 · ' : '') + (ups ? ('上游 · ' + esc(ups)) : '最上游 · 无原料依赖') + '</span>' +
+            '<span class="mk-group-idx" data-role="gidx"></span>' +
+          '</div>' +
+          '<div class="mk-group-body">' + goods.map((g) => goodRowHTML(g, kind)).join('') + '</div>' +
+        '</div>';
+      }).join('');
+    }
+
     // ---- 市场：商品行情按行业分组 ----
-    $('mk-good-list').innerHTML = GAME.company.industries.map((ind) => {
-      const goods = GAME.company.goods.filter((g) => g.industry === ind.id);
-      if (!goods.length) return '';
-      const kind = ind.kind === 'xiuxian' ? 'xiuxian' : 'tech';
-      const ups = (ind.upstream || []).map((u) => indName(u)).join(' + ');
-      return '<div class="mk-group ' + kind + '" data-industry="' + ind.id + '">' +
-        '<div class="mk-group-head" data-role="ghead">' +
-          '<span class="mk-group-icon">' + esc(indIcon(ind.id)) + '</span>' +
-          '<span class="mk-group-name">' + esc(ind.name) + '</span>' +
-          '<span class="mk-group-tag">' + (ups ? ('上游 · ' + esc(ups)) : '最上游 · 无原料依赖') + '</span>' +
-          '<span class="mk-group-idx" data-role="gidx"></span>' +
-        '</div>' +
-        '<div class="mk-group-body">' + goods.map((g) => goodRowHTML(g, kind)).join('') + '</div>' +
-      '</div>';
-    }).join('');
+    buildMarketGroups();
+
+    // v3.6：快捷算力投向（境界页=修仙 / 设备页=AI）。拖动只改显示，松手提交。
+    document.querySelectorAll('[data-qa]').forEach((bar) => {
+      const id = bar.dataset.qa;
+      const range = bar.querySelector('[data-role="qarange"]');
+      const pctEl = bar.querySelector('[data-role="qapct"]');
+      if (!range) return;
+      range.addEventListener('input', () => {
+        if (pctEl) pctEl.textContent = range.value + '%';
+      });
+      range.addEventListener('change', () => {
+        if (state) commitQuickAlloc(id, Number(range.value));
+      });
+    });
 
     $('mk-good-list').addEventListener('click', (e) => {
+      // v3.6：点击组头折叠 / 展开该行业
+      const ghead = e.target.closest('[data-role="ghead"]');
+      if (ghead) {
+        const grp = ghead.closest('.mk-group');
+        const gid = grp ? grp.dataset.industry : null;
+        if (gid) {
+          if (mktFolded.has(gid)) mktFolded.delete(gid); else mktFolded.add(gid);
+          grp.classList.toggle('folded', mktFolded.has(gid));
+          const f = grp.querySelector('.mk-fold');
+          if (f) f.textContent = mktFolded.has(gid) ? '▸' : '▾';
+        }
+        return;
+      }
       const item = e.target.closest('[data-good]');
       if (!item) return;
       // 「卖出」是行内子操作，点了不该把上方的走势图切走
@@ -1130,7 +1229,7 @@
 
     // ---- 市场：行业景气 ----
     $('mk-ind-list').innerHTML = GAME.company.industries.map((ind) => {
-      const kind = ind.kind === 'xiuxian' ? 'xiuxian' : 'tech';
+      const kind = ind.kind === 'xiuxian' ? 'xiuxian' : (ind.kind === 'fusion' ? 'fusion' : 'tech');
       const ups = (ind.upstream || []).map((u) => indName(u)).join(' + ');
       return '<div class="mk-ind ' + kind + '" data-industry="' + ind.id + '">' +
         '<div class="mk-ind-top">' +
@@ -1151,13 +1250,13 @@
       $('st-list').innerHTML = GAME.stock.stocks.map((st) => {
         const linked = !!st.link;
         const good = linked ? GAME.company.goods.find((g) => g.id === st.link) : null;
-        const kind = st.kind === 'xiuxian' ? 'xiuxian' : 'tech';
+        const kind = st.kind === 'xiuxian' ? 'xiuxian' : (st.kind === 'fusion' ? 'fusion' : 'tech');
         return '<div class="st-row' + (linked ? ' linked' : '') + ' ' + kind + '" data-stock="' + st.id + '">' +
           '<div class="st-icon">' + esc((st.name || '股').slice(0, 2)) + '</div>' +
           '<div class="st-main">' +
             '<div class="st-title">' + esc(st.name) +
               '<span class="st-code">' + esc(st.code) + '</span>' +
-              '<span class="co-line-tag ' + kind + '">' + (kind === 'xiuxian' ? '修仙宗门' : '科技') + '</span>' +
+              '<span class="co-line-tag ' + kind + '">' + (kind === 'xiuxian' ? '修仙宗门' : (kind === 'fusion' ? '融合赛道' : '科技')) + '</span>' +
               (good ? '<span class="co-line-tag">联动 · ' + esc(good.name) + '</span>' : '') +
             '</div>' +
             // 主营业务 —— 行情一动就能看出波及的是哪家公司
@@ -1228,6 +1327,38 @@
   // 动态渲染
   // ============================================================
 
+  /** v3.6：快捷算力投向模块（境界页=修仙 / 设备页=AI），改动按比例让位其余方向 */
+  function renderQuickAlloc() {
+    const bars = document.querySelectorAll('[data-qa]');
+    for (let i = 0; i < bars.length; i++) {
+      const bar = bars[i];
+      const id = bar.dataset.qa;
+      const inv = GAME.investments.find((x) => x.id === id);
+      if (!inv) continue;
+      const available = Core.investmentAvailable(state, inv);
+      const range = bar.querySelector('[data-role="qarange"]');
+      const pctEl = bar.querySelector('[data-role="qapct"]');
+      const v = Math.round((state.alloc[id] || 0) * 100);
+      if (pctEl) pctEl.textContent = available ? (v + '%') : '锁定';
+      if (range) {
+        range.disabled = !available;
+        if (document.activeElement !== range && Number(range.value) !== v) range.value = String(v);
+      }
+    }
+  }
+
+  function commitQuickAlloc(id, pct) {
+    const r = Core.setAllocationShare(state, id, pct / 100);
+    if (!r.ok) {
+      toast(r.msg || '调整失败', 'err');
+      renderQuickAlloc();
+      return;
+    }
+    dirty = true;
+    renderAll();
+    syncNow();
+  }
+
   function renderAll() {
     if (!state) return;
     renderTop();
@@ -1236,6 +1367,7 @@
     renderTribulationPage();
     renderWorkPage();
     renderTechPage();
+    renderQuickAlloc();
     renderInvestPage();
     renderCompanyPage();
     // 市场页与股市页平时不参与每帧重绘：商品 72 种、股票 50 家，
@@ -1720,6 +1852,12 @@
 
     // ---------- 生产线（每台可单独选产物、调产能）----------
     let lineCount = 0;
+    // v3.6：折叠/展开变化时重建分组骨架（数值仍逐帧回填）
+    const lFoldSig = Array.from(lineFolded).sort().join(',');
+    if (lFoldSig !== lineFoldSig) {
+      lineFoldSig = lFoldSig;
+      buildCompanyLineGroups();
+    }
     const lineItems = $('co-line-list').querySelectorAll('.co-line');
     for (let i = 0; i < lineItems.length; i++) {
       const el = lineItems[i];
@@ -1887,6 +2025,12 @@
     let peakPressure = 0;
     let pressuredGoods = 0;
 
+    // v3.6：折叠状态变化时重建分组骨架（数值仍逐帧刷新）
+    const foldSig = Array.from(mktFolded).sort().join(',');
+    if (foldSig !== mktFoldSig) {
+      mktFoldSig = foldSig;
+      buildMarketGroups();
+    }
     const groups = $('mk-good-list').querySelectorAll('.mk-group');
     for (let gi = 0; gi < groups.length; gi++) {
       const gid = groups[gi].dataset.industry;
@@ -2287,6 +2431,16 @@
         sellOk = true;
       }
 
+      // v3.6：未解锁个股（融合赛道 50 家 = 元婴解锁）禁交易并标注原因
+      if (!row.unlocked) {
+        const reason = Core.stockAccessReason(state, st) || '元婴解锁';
+        setT(costEl, 'className', 'st-trade-cost no');
+        setT(costEl, 'textContent', '🔒 ' + reason);
+        setT(netEl, 'className', 'st-trade-cost');
+        setT(netEl, 'textContent', '');
+        buyOk = false; sellOk = false;
+      }
+
       const bb = el.querySelector('[data-role="stbuy"]');
       if (bb.disabled !== !buyOk) bb.disabled = !buyOk;
       const bs = el.querySelector('[data-role="stsell"]');
@@ -2672,7 +2826,13 @@
         stateEl.textContent = '已得';
         stateEl.className = 'codex-state got';
       } else {
-        condEl.textContent = '解锁：' + (t.unlockText || '未知条件');
+        // v3.6：条件后附当前进度（如「完成工作 ≥ 15 次（12/15）」）
+        const p = t.condProgress;
+        const prog = (p && p.need > 0)
+          ? '（' + (p.need >= 10000 ? Core.fmtBig(Math.min(p.cur, p.need)) : fmtCount(Math.min(p.cur, p.need))) +
+            '/' + (p.need >= 10000 ? Core.fmtBig(p.need) : fmtCount(p.need)) + '）'
+          : '';
+        condEl.textContent = '解锁：' + (t.unlockText || '未知条件') + prog;
         stateEl.textContent = '未得';
         stateEl.className = 'codex-state not';
       }
@@ -2812,9 +2972,8 @@
         else right += '<span class="tag">可切换</span>';
         rightEl.innerHTML = right;
       }
-    } else if (ownedSig !== techListSig) {
-      // 图鉴：静态骨架已按稀有度分组建好，这里只刷新「已得 / 未得」与条件
-      techListSig = ownedSig;
+    } else {
+      // 图鉴：进度数字随状态实时变，每帧刷新（41 行纯文本，开销可忽略）
       refreshCodexStates(list);
     }
 
@@ -3169,11 +3328,21 @@
     toast('公司已成立　—　去「生产线」买下第一条产线', 'ok');
   }
 
+  function lineBuyQty() {
+    const el = document.getElementById('line-buy-qty');
+    const v = el ? Math.floor(Number(el.value) || 1) : 1;
+    return Math.max(1, Math.min(100, v));
+  }
+
   async function buyLine(lineId) {
-    const r = await companyAction('buyLine', { lineId: lineId });
+    const qty = lineBuyQty();
+    const r = await companyAction('buyLine', { lineId: lineId, count: qty });
     if (!r) return;
     const line = GAME.company.lines.find((l) => l.id === lineId);
-    toast('已购入「' + (line ? line.name : lineId) + '」（共 ' + r.owned + ' 条）', 'ok');
+    const bought = r.bought || 1;
+    toast('已购入「' + (line ? line.name : lineId) + '」×' + bought +
+      (r.asked > bought ? '（想买 ' + r.asked + ' 台，金钱只够 ' + bought + ' 台）' : '') +
+      '（共 ' + r.owned + ' 条）', 'ok');
   }
 
   /**

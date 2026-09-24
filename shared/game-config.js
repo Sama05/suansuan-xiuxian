@@ -1037,6 +1037,18 @@ const GAME = {
    * ≈ 单次同级别工作的 10 倍。见下方 workshop 的注释。
    */
   company: {
+    /**
+     * 修仙系与融合系商品的**售卖货币换算**（v3.6）：
+     *   科技系商品 → 卖金钱（1:1）
+     *   修仙系 / 融合系商品 → 卖灵石，灵石 = 售价（金钱口径）× stoneExchange
+     * 换算系数 1e-4 的量级依据：修仙商品售价 1e8（金钱口径）≈ 1e4 灵石，
+     * 与同期灵石工作收益同量级；后期融合商品卖到 1e14 ≈ 1e10 灵石，
+     * 正好补上 6/7 境设备（5e10 / 2e12 灵石）的供给断档。
+     * 价格本身仍按金钱口径计算（行情、抛压、股市联动全部不动），
+     * 只在**入账那一刻**换算货币。
+     */
+    stoneExchange: 1e-4,
+
     /** 公司系统是否已实现 */
     implemented: true,
 
@@ -1995,6 +2007,157 @@ const GAME = {
     tickMs: 100,
   },
 };
+
+/* ============================================================
+ * v3.6 · 融合内容生成（确定性，无随机）
+ * ============================================================
+ *   融合行业 36 个 × 6 商品 = 216 商品（原 72 → 288，≥3 倍）
+ *   融合生产线 6 条（元婴解锁，链式）
+ *   新增上市公司 50 家（元婴解锁，总量 100）
+ *
+ * 为什么用生成而不是手写：288 条商品、50 家公司的字段全是
+ * 「同一模板换名字与数值」，手写必然抄错；生成段是纯确定性的
+ * （按索引取词表，不用 Math.random），前后端加载同一份配置，
+ * 结果必然一致。词表固定，所以每次启动生成的 id 完全一致，
+ * 存档里的 id 引用（生产线产物、股票联动）永远有效。
+ * ============================================================ */
+(function generateFusionContent() {
+  var NM = (typeof window !== 'undefined' ? window.GAME : GAME);
+  if (!NM || !NM.company) return;
+
+  // ---- 36 个融合行业名（修仙 × 科技）----
+  var FUSION_NAMES = [
+    '灵能芯片', '符文算法', '阵法计算', '剑意数控', '丹方化工', '灵纹电子',
+    '御剑航空', '灵子对撞', '咒能电网', '天机数据', '太初材料', '星轨导航',
+    '符阵半导体', '灵液冷却', '真元光伏', '遁速物流', '灵晶电池', '卦象建模',
+    '傀儡制造', '灵泉提纯', '剑坯冶金', '符墨印刷', '星图测绘', '灵植基因',
+    '御兽驯算', '幻象渲染', '雷法储能', '云篆加密', '丹渣回收', '灵砂光刻',
+    '道基云算', '天雷并网', '虚空仓储', '神识接口', '周天调度', '界域组网',
+  ];
+  // 每行业 6 个产物后缀
+  var GOOD_SUFFIX = ['原件', '整机', '耗材', '精制品', '定制件', '旗舰品'];
+  /**
+   * 行业内 6 件产物的价格倍率（相对该行业的价格档位）。
+   * 几何平均 ≈ 1（10^0.0055），所以「行业价格档位」就是这 6 件的几何均价。
+   */
+  var PRICE_MUL = [0.23, 0.48, 0.80, 1.36, 2.30, 3.90];
+  var VOL_BY_POS = [0.34, 0.33, 0.32, 0.33, 0.35, 0.38];
+  // 越贵造得越慢 —— 必须严格递减（配置自洽测试项）
+  var COEF_BY_POS = [1.30, 1.14, 0.99, 0.86, 0.74, 0.62];
+  /**
+   * 各融合行业的价格档位（= 该行业 6 件产物的几何均价）。
+   * 前 6 个行业有生产线，档位按 1.8× 递进 —— 与「单位算力产值随层级递增」
+   * 的校验对齐：算力上限 ×1.8、基准产量 ÷1.1，产值才逐级抬升。
+   */
+  var PRICE_SCALE = [];
+  (function () {
+    var g0 = 8.6e9;
+    for (var i = 0; i < FUSION_NAMES.length; i++) {
+      PRICE_SCALE.push(i < 6 ? g0 * Math.pow(1.8, i) : PRICE_SCALE[i - 1] * 1.32);
+    }
+  })();
+
+  var industries = NM.company.industries;
+  var goods = NM.company.goods;
+  var existInd = {};
+  for (var ii = 0; ii < industries.length; ii++) existInd[industries[ii].id] = true;
+
+  // 融合产业接在既有产业链的腰上（tier ≤ 3，严格低于融合行业的 tier）。
+  // ⚠️ 上游层级必须更低：这是「传导图无环」的硬约束，也是递归终止的依据。
+  var ANCHORS = ['smelt', 'chem', 'precision', 'refine', 'talisman', 'alchemy'];
+
+  var fuIds = [];
+  for (var f = 0; f < FUSION_NAMES.length; f++) {
+    var fid = 'fu' + (f + 1 < 10 ? '0' + (f + 1) : (f + 1));
+    var tier = f < 18 ? 4 : 5;
+    // tier 4 挂既有产业链；tier 5 再挂两个 tier 4 的融合行业（层级仍严格递增）
+    var upA = fuIds[Math.max(0, f - 19)];       // 恒为 tier 4
+    var upB = fuIds[Math.max(0, f - 18)];       // 恒为 tier 4
+    var upstream = f < 18
+      ? [ANCHORS[f % ANCHORS.length]]
+      : (upA === upB ? [upB] : [upA, upB]);
+    if (!existInd[fid]) {
+      industries.push({
+        id: fid, name: FUSION_NAMES[f], kind: 'fusion', tier: tier,
+        upstream: upstream, passThrough: 0.52, pricePass: 0.27,
+      });
+      fuIds.push(fid);
+    } else {
+      fuIds.push(fid);
+    }
+    // 6 商品
+    var scale = PRICE_SCALE[f];
+    for (var k = 0; k < 6; k++) {
+      goods.push({
+        id: fid + '_' + (k + 1),
+        name: FUSION_NAMES[f] + GOOD_SUFFIX[k],
+        kind: 'fusion', industry: fid,
+        basePrice: Math.round(scale * PRICE_MUL[k]),
+        volatility: VOL_BY_POS[k], minFactor: 0.46, maxFactor: 2.20,
+        // 与修仙系同源（卖灵石、慢周期），科技系才是 60 秒变价
+        periodSeconds: 600, outputCoef: COEF_BY_POS[k], upkeepRate: 0.30,
+      });
+    }
+  }
+
+  // ---- 6 条融合生产线（元婴解锁，链式）----
+  // maxCompute 由「基准产量 × 行业价格档位 ÷ 目标单位算力产值」反推：
+  // 目标产值 2.40 → 2.65（高于 tier3 的 1.86、低于 tier5 的 3.00），
+  // 这样「越下游越划算」的校验在加入融合线之后依然成立。
+  var LINE_COST = [1.2e12, 3.5e12, 1.0e13, 3.0e13, 1.0e14, 3.0e14];
+  var LINE_OUT = [420, 380, 350, 320, 300, 260];
+  var LINE_VALUE = [2.40, 2.45, 2.50, 2.55, 2.60, 2.65];
+  var LINE_COMPUTE = LINE_OUT.map(function (b, i) {
+    return Math.round(b * PRICE_SCALE[i] / LINE_VALUE[i]);
+  });
+  var lines = NM.company.lines;
+  var lineIds = [];
+  for (var L = 0; L < 6; L++) {
+    var lid = 'fline' + (L + 1);
+    lines.push({
+      id: lid, name: FUSION_NAMES[L] + '厂', industry: fuIds[L],
+      maxCompute: LINE_COMPUTE[L], baseOutput: LINE_OUT[L],
+      cost: LINE_COST[L], costGrowth: 1.20,
+      realm: 4, after: L === 0 ? null : { id: lineIds[L - 1], times: 3 },
+      desc: '修仙与科技的合流产物：以灵石为能源、以算力为法阵。' +
+            '元婴之后才能驾驭的产业形态。',
+    });
+    lineIds.push(lid);
+  }
+
+  // ---- 新增 50 家上市公司（元婴解锁，联动融合商品）----
+  var SUF = ['集团', '控股', '联合', '科技', '宗门', '重工'];
+  var stocks = NM.stock.stocks;
+  var nameCursor = 0;
+  for (var si = 0; si < 50; si++) {
+    var ind = fuIds[si % fuIds.length];
+    var indName = FUSION_NAMES[si % FUSION_NAMES.length];
+    var sname = indName + SUF[si % SUF.length];
+    var code = ('FU' + (101 + si));
+    var glink = goods.filter(function (g) { return g.industry === ind; })[si % 6];
+    var tier5 = si >= 25;
+    // 市值（basePrice × depth）必须落在老 50 家同一档（≈ 9e10）：
+    // 否则榜单前 10 会被天价融合股永久占据，行情再动也不换人。
+    var cap = 9e10 * Math.pow(1.0035, si);
+    var price = Math.round(4000 * Math.pow(1.085, si));
+    stocks.push({
+      id: 'fustock' + (si + 1),
+      name: sname,
+      code: code,
+      kind: 'fusion', sector: ind, link: glink.id,
+      business: FUSION_NAMES[si % FUSION_NAMES.length] + '产业 · 融合赛道',
+      basePrice: price,
+      volatility: tier5 ? 1.30 : 1.05,
+      minFactor: tier5 ? 0.28 : 0.35, maxFactor: tier5 ? 3.60 : 2.80,
+      depth: Math.max(1000, Math.floor(cap / price)),
+      periodSeconds: 600,
+      unlockRealm: 4,
+      desc: '元婴之后才进入公开市场的融合赛道公司。行情与「' +
+            glink.name + '」联动。',
+    });
+    nameCursor++;
+  }
+})();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = GAME;
 if (typeof window !== 'undefined') window.GAME = GAME;

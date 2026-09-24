@@ -1668,6 +1668,7 @@
         c.producedThisPeriod[g.id] = 0;
         c.lastPeriod[g.id] = 0;
       }
+      bumpMarketVer();
     }
 
     // ---- 10. 股市：全清 ----
@@ -2074,6 +2075,35 @@
     }
   }
 
+  /**
+   * 成就条件的**当前进度**（图鉴显示「12/15 次」用）。
+   * 返回 { cur, need }；该条件没有可比数字时返回 null。
+   */
+  function techCondProgress(s, tech) {
+    const c = techCondOf(tech);
+    if (!c) return null;
+    const company = s.company || {};
+    const stock = s.stock || {};
+    let devCount = 0;
+    for (const k of Object.keys(s.devices || {})) devCount += s.devices[k] || 0;
+    switch (c.type) {
+      case 'jobsDone':      return { cur: s.totalJobs || 0, need: c.n };
+      case 'devicesOwned':  return { cur: devCount, need: c.n };
+      case 'marketProfit':  return { cur: (company.totalRevenue && company.totalRevenue.gt(0)) ? 1 : 0, need: 1 };
+      case 'marketRevenue': return { cur: company.totalRevenue ? company.totalRevenue.toNumber() : 0, need: c.amount };
+      case 'stockProfit':   return { cur: (stock.realized && stock.realized.gt(0)) ? 1 : 0, need: 1 };
+      case 'stockRealized': return { cur: stock.realized ? stock.realized.toNumber() : 0, need: c.amount };
+      case 'trades':        return { cur: stock.totalTrades || 0, need: c.n };
+      case 'pressurePeak':  return { cur: company.peakPressure || 0, need: c.peak };
+      case 'companyCycles': return { cur: company.cycles || 0, need: c.n };
+      case 'warehouse':     return { cur: company.warehouseLevel || 0, need: c.level };
+      case 'tribulation':   return { cur: tribulationLevel(s), need: c.n };
+      case 'rebirth':       return { cur: rebirthCount(s), need: c.n };
+      case 'compute':       return { cur: realComputeOf(s).toNumber(), need: c.n };
+      default:              return null;
+    }
+  }
+
   /** 成就条件的**文案**（图鉴与锁定原因共用） */
   function techCondText(tech) {
     const c = techCondOf(tech);
@@ -2314,6 +2344,8 @@
         expRate: rec ? techExpRateOf(s, t) : 0,
         /** 成就条件的展示文案（图鉴用；境界/算力解锁的功法为空串） */
         condText: techCondText(t),
+        /** 成就条件进度（图鉴显示 12/15 用；无可数字化的条件为 null） */
+        condProgress: rec ? null : techCondProgress(s, t),
         /** 图鉴用完整解锁文案：境界 / 算力 / 行为成就三合一 */
         unlockText: (function () {
           const parts = [];
@@ -2494,6 +2526,36 @@
    * 计算某投资方向的实际可用算力
    * 收益 = rate * compute^decay，其中 decay < 1 表示收益递减
    */
+  /**
+   * 快捷投向调整（v3.6）：把某一个方向设为指定份额，**其余可用方向按比例
+   * 分掉剩余额度** —— 合计恒为 1，不会把别的方向清零。
+   * 内部复用 setAllocation 的归一化与锁定过滤，保证口径一致。
+   */
+  function setAllocationShare(s, id, share) {
+    const target = GAME.investments.find((i) => i.id === id);
+    if (!target) return { ok: false, msg: '投向不存在' };
+    if (!investmentAvailable(s, target)) {
+      return { ok: false, msg: '该方向当前不可用' };
+    }
+    const v = Math.max(0, Math.min(1, Number(share) || 0));
+    const next = {};
+    let others = 0;
+    for (const inv of GAME.investments) {
+      if (inv.id === id) continue;
+      if (!investmentAvailable(s, inv)) continue;
+      const cur = s.alloc[inv.id] || 0;
+      next[inv.id] = cur;
+      others += cur;
+    }
+    const rest = 1 - v;
+    if (others > 1e-9) {
+      const k = rest / others;
+      for (const key of Object.keys(next)) next[key] = next[key] * k;
+    }
+    next[id] = v;
+    return setAllocation(s, next);
+  }
+
   function investOutput(s, inv) {
     if (!investmentAvailable(s, inv)) return new D(0);
     const ratio = s.alloc[inv.id] || 0;
@@ -2959,6 +3021,7 @@
     }
     // 记录历史最高抛压（只增不减）——「操控市场」类功法成就的达成凭据
     if (acc.peak > (c.peakPressure || 0)) c.peakPressure = acc.peak;
+    if (acc.goods > 0) bumpMarketVer();            // 抛压变了 → 传导缓存作废
     return acc;
   }
 
@@ -3130,77 +3193,131 @@
   // 上下游是按 tier 递增的有向无环图，所以递归一定终止；这里仍加一层深度守卫，
   // 防止配置写错（出现环）时把整个 tick 拖成栈溢出。
 
-  let _indDepth = 0;
+  /** 传导链上最多向上展开几层（超出就按「无传导」= 1 处理） */
+  const IND_MAX_DEPTH = 8;
+
+  /**
+   * 传导缓存。
+   *
+   * 三个约束叠在一起，才把这条链从「指数级」压成「常数级」：
+   *
+   * 1. **必须显式传行业指数**（v3.2 的旧结论）：不能直接调 `goodsPriceWith`，
+   *    否则它会再算回本行业的指数，每层展开「6 件商品 × 上游数」。
+   * 2. **深度预算必须按「剩余层数」传参，不能用全局计数器**：这条调用链是
+   *    ratio → index → upstreamRatio → ratio 的互递归，全局守卫管不到 index 那一环。
+   *    融合产业链是 36 层串联，守卫一失效就是每层 ×上游数 的爆炸
+   *    （v3.6 实测：第 24 只融合股单次推导 39 秒）。
+   * 3. **按 (行业, 剩余层数) 记忆化**：状态空间只有 行业数 × 9，
+   *    再深的链也只是把每个格子算一次 —— 指数级退化成线性。
+   *
+   * 缓存的失效条件是「行情时钟 + 抛压版本号」，两者任一变化就整体清空。
+   */
+  // 按 state 分桶（WeakMap），杜绝「A 玩家的缓存被 B 玩家读到」；
+  // 桶内再按「行情时钟 + 抛压版本号」失效。
+  let _indMemoStore = new WeakMap();
+  /** 抛压版本号：凡是改了 s.company.pressure 的地方都要 bumpMarketVer() */
+  let _mktVer = 0;
+  function bumpMarketVer() { _mktVer += 1; }
+  function indMemo(s) {
+    const k = marketClock(s) + '|' + _mktVer;
+    let e = (s && typeof s === 'object') ? _indMemoStore.get(s) : null;
+    if (!e) {
+      e = { key: '', map: new Map() };
+      if (s && typeof s === 'object') _indMemoStore.set(s, e);
+    }
+    if (e.key !== k) { e.map.clear(); e.key = k; }
+    return e.map;
+  }
 
   /**
    * 某行业当前的「价格倍数」= 该行业全部商品 现价/基准价 的平均值（1 = 平价）。
-   *
-   * ⚠️ 这里的算法必须**显式把行业指数传进去**，不能直接调 `goodsPriceWith`。
-   *
-   * 原因：`goodsPriceWith` 内部会再调 `industryPriceIndex(本行业)` →
-   * `industryUpstreamRatio` → `industryPriceRatio(本行业)` → 又一个 `goodsPriceWith`……
-   * 每层展开成「6 件商品 × 上游数」，而深度守卫放到 8 层，实际展开量是 6^8 量级。
-   * 实测：修仙下游行业（洞天，基准价 4.5e10）单次推导 2.2ms —— 股市页每帧要对
-   * 50 只股票各推导一次自然价，于是整页被拖到 300ms 以上。**这就是「股市页卡顿」的根因**，
-   * 不是 DOM 也不是图表：是核心层的一个指数级自引用。
-   *
-   * 改成显式传 index 之后，递归只沿「本行业 → 它的上游」这条 DAG 向上走
-   * （上下游按 tier 严格递增，测试里有 noCycle 断言），一次调用只剩
-   * 「上游行业数 × 6 件商品」次运算。
+   * rem = 还能向上展开的层数。
    */
   function industryPriceRatio(s, industryId) {
-    return industryPriceRatioWith(s, industryId, industryPriceIndex(s, industryId));
+    return industryRatioAt(s, industryId, IND_MAX_DEPTH);
   }
 
-  /** industryPriceRatio 的实际实现：index 由调用方给出，切断自引用 */
-  function industryPriceRatioWith(s, industryId, index) {
+  function industryRatioAt(s, industryId, rem) {
     const list = goodsOfIndustry(industryId);
     if (!list.length) return 1;
-    if (_indDepth > 8) return 1;
-    _indDepth += 1;
+    if (rem <= 0) return 1;
+    const memo = indMemo(s);
+    const key = 'R|' + industryId + '|' + rem;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+
+    const index = industryIndexAt(s, industryId, rem);
     let sum = 0;
-    try {
-      for (const g of list) {
-        const period = goodsPeriod(g, marketClock(s));
-        let p = new D(g.basePrice)
-          .mul(goodsPriceFactor(g, period))
-          .mul(index)
-          .mul(marketImpactAt(s, g, period));
-        const floor = marketFloorPrice(g);
-        if (p.lt(floor)) p = floor;
-        sum += p.div(new D(g.basePrice)).toNumber();
-      }
-    } finally {
-      _indDepth -= 1;
+    for (const g of list) {
+      const period = goodsPeriod(g, marketClock(s));
+      let p = new D(g.basePrice)
+        .mul(goodsPriceFactor(g, period))
+        .mul(index)
+        .mul(marketImpactAt(s, g, period));
+      const floor = marketFloorPrice(g);
+      if (p.lt(floor)) p = floor;
+      sum += p.div(new D(g.basePrice)).toNumber();
     }
-    return sum / list.length;
+    const v = sum / list.length;
+    memo.set(key, v);
+    return v;
   }
 
   /** 上游综合价格倍数（多个上游行业等权平均） */
   function industryUpstreamRatio(s, industryId) {
+    return industryUpstreamRatioAt(s, industryId, IND_MAX_DEPTH);
+  }
+
+  function industryUpstreamRatioAt(s, industryId, rem) {
     const ind = industryById(industryId);
     if (!ind || !ind.upstream || !ind.upstream.length) return 1;
     let sum = 0;
-    for (const up of ind.upstream) sum += industryPriceRatio(s, up);
+    for (const up of ind.upstream) sum += industryRatioAt(s, up, rem);
     return sum / ind.upstream.length;
   }
 
   /** 上游涨价 → 本行业**售价**的传导（打折跟涨） */
   function industryPriceIndex(s, industryId) {
+    return industryIndexAt(s, industryId, IND_MAX_DEPTH);
+  }
+
+  function industryIndexAt(s, industryId, rem) {
     const ind = industryById(industryId);
     if (!ind) return 1;
-    const up = industryUpstreamRatio(s, industryId);
-    if (_indDepth > 8) return 1;
-    return 1 + (up - 1) * (ind.pricePass || 0);
+    const pass = ind.pricePass || 0;
+    if (pass <= 0) return 1;                       // 不跟涨 —— 不必展开上游
+    if (rem <= 0) return 1;
+    const memo = indMemo(s);
+    const key = 'I|' + industryId + '|' + rem;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+
+    const up = industryUpstreamRatioAt(s, industryId, rem - 1);
+    const v = 1 + (up - 1) * pass;
+    memo.set(key, v);
+    return v;
   }
 
   /** 上游涨价 → 本行业**成本**的传导（全额上涨，于是毛利被压缩） */
   function industryCostIndex(s, industryId) {
+    return industryCostIndexAt(s, industryId, IND_MAX_DEPTH);
+  }
+
+  function industryCostIndexAt(s, industryId, rem) {
     const ind = industryById(industryId);
     if (!ind) return 1;
-    const up = industryUpstreamRatio(s, industryId);
-    if (_indDepth > 8) return 1;
-    return 1 + (up - 1) * (ind.passThrough || 0);
+    const pass = ind.passThrough || 0;
+    if (pass <= 0) return 1;
+    if (rem <= 0) return 1;
+    const memo = indMemo(s);
+    const key = 'C|' + industryId + '|' + rem;
+    const hit = memo.get(key);
+    if (hit !== undefined) return hit;
+
+    const up = industryUpstreamRatioAt(s, industryId, rem - 1);
+    const v = 1 + (up - 1) * pass;
+    memo.set(key, v);
+    return v;
   }
 
   // ---------- 工业算力 ----------
@@ -3413,26 +3530,44 @@
   }
 
   /** 买一条生产线 */
-  function buyLine(s, lineId) {
+  function buyLine(s, lineId, count) {
     const line = lineById(lineId);
     if (!line) return { ok: false, msg: '生产线不存在' };
     if (!lineUnlocked(s, line)) {
       return { ok: false, msg: lineLockedReason(s, line) || '尚未解锁' };
     }
-    const cost = lineCost(s, line);
-    if (s.money.lt(cost)) return { ok: false, msg: '金钱不足' };
-    s.money = s.money.sub(cost);
+    // v3.6 批量购买：count 台逐台成交（每台都按当前拥有数重新计价），
+    // 钱不够就停在最后一台买得起的——「买了多少是多少」。
+    let want = Math.floor(Number(count) || 1);
+    if (!(want > 0)) want = 1;
+    if (want > 100) want = 100;
 
-    // 新买的一台是一份**独立配置**：默认产该行业第一个产物、产能拉满。
-    // 买完想改产什么、开几成力，由 setLineUnit 单独调。
-    const units = lineUnits(s, line.id).slice();
-    const prods = lineProducts(line);
-    units.push({ p: prods.length ? prods[0].id : null, r: 1 });
-    s.company.lines[line.id] = { units: units };
-
+    let totalCost = new D(0);
+    let bought = 0;
+    let lastIndex = -1;
+    let lastProduct = null;
+    let lastCost = new D(0);
+    while (bought < want) {
+      const cost = lineCost(s, line);
+      if (s.money.lt(cost)) break;
+      s.money = s.money.sub(cost);
+      totalCost = totalCost.add(cost);
+      // 新买的一台是一份**独立配置**：默认产该行业第一个产物、产能拉满。
+      // 买完想改产什么、开几成力，由 setLineUnit 单独调。
+      const units = lineUnits(s, line.id).slice();
+      const prods = lineProducts(line);
+      units.push({ p: prods.length ? prods[0].id : null, r: 1 });
+      s.company.lines[line.id] = { units: units };
+      lastIndex = units.length - 1;
+      lastProduct = units[units.length - 1].p;
+      lastCost = cost;
+      bought += 1;
+    }
+    if (bought === 0) return { ok: false, msg: '金钱不足' };
     return {
-      ok: true, owned: units.length, cost: cost,
-      index: units.length - 1, product: units[units.length - 1].p,
+      ok: true, owned: lineUnits(s, line.id).length, cost: totalCost,
+      bought: bought, asked: want,
+      index: lastIndex, product: lastProduct, unitCost: lastCost,
     };
   }
 
@@ -3453,24 +3588,46 @@
    * 按当前市价卖光库存（内部使用，不校验是否已成立公司）。
    * @returns {{revenue: D, sold: object}}
    */
+  /**
+   * 商品的**售卖货币**（v3.6）：
+   *   科技系 → 金钱（1:1）
+   *   修仙系 / 融合系 → 灵石 = 售价（金钱口径）× company.stoneExchange
+   * 价格、行情、抛压、股市联动仍全部按金钱口径计算 —— 只在入账那一刻换货币。
+   */
+  function goodCurrency(g) {
+    return (g && g.kind === 'tech') ? 'money' : 'stone';
+  }
+
+  /** 灵石换算系数（金钱口径售价 → 灵石） */
+  function stoneExchangeRate() {
+    return num(GAME.company.stoneExchange, 1e-4);
+  }
+
   function sellAllInternal(s) {
     const sold = {};
-    let revenue = new D(0);
+    let moneyRev = new D(0);
+    let stoneRev = new D(0);   // 金钱口径的销售额（入账前乘换算系数）
     for (const g of GAME.company.goods) {
       const n = s.company.stock[g.id] || 0;
       if (n <= 0) continue;
-      revenue = revenue.add(goodsPriceWith(s, g).mul(n));
+      const rev = goodsPriceWith(s, g).mul(n);
+      if (goodCurrency(g) === 'stone') stoneRev = stoneRev.add(rev);
+      else moneyRev = moneyRev.add(rev);
       sold[g.id] = n;
       s.company.stock[g.id] = 0;
       s.company.goodsSold[g.id] = (s.company.goodsSold[g.id] || 0) + n;
       // 记进「本期成交量」—— 抛压结算时与本期产出对比，多出来的部分就是砸盘
       s.company.soldThisPeriod[g.id] = (s.company.soldThisPeriod[g.id] || 0) + n;
     }
+    const revenue = moneyRev.add(stoneRev);
     if (revenue.gt(0)) {
-      s.money = s.money.add(revenue);
+      // 总营业额（市场累计收入、成就口径）仍按金钱量级记全量
       s.company.totalRevenue = s.company.totalRevenue.add(revenue);
+      s.money = s.money.add(moneyRev);
+      const stone = stoneRev.mul(stoneExchangeRate());
+      if (stone.gt(0)) s.spiritStone = s.spiritStone.add(stone);
     }
-    return { revenue: revenue, sold: sold };
+    return { revenue: revenue, money: moneyRev, stone: stoneRev.mul(stoneExchangeRate()), sold: sold };
   }
 
   /**
@@ -3482,7 +3639,7 @@
     if (goodId === undefined || goodId === null || goodId === 'all') {
       const r = sellAllInternal(s);
       if (!r.revenue.gt(0)) return { ok: false, msg: '仓库是空的' };
-      return { ok: true, revenue: r.revenue, sold: r.sold, all: true };
+      return { ok: true, revenue: r.revenue, money: r.money, stone: r.stone, sold: r.sold, all: true };
     }
     const g = goodById(goodId);
     if (!g) return { ok: false, msg: '商品不存在' };
@@ -3495,9 +3652,15 @@
     s.company.stock[g.id] = have - n;
     s.company.goodsSold[g.id] = (s.company.goodsSold[g.id] || 0) + n;
     s.company.soldThisPeriod[g.id] = (s.company.soldThisPeriod[g.id] || 0) + n;
-    s.money = s.money.add(revenue);
     s.company.totalRevenue = s.company.totalRevenue.add(revenue);
-    return { ok: true, revenue: revenue, count: n, price: price, goodId: g.id };
+    const isStone = goodCurrency(g) === 'stone';
+    const stone = isStone ? revenue.mul(stoneExchangeRate()) : new D(0);
+    if (!isStone) s.money = s.money.add(revenue);
+    if (stone.gt(0)) s.spiritStone = s.spiritStone.add(stone);
+    return {
+      ok: true, revenue: revenue, count: n, price: price, goodId: g.id,
+      currency: isStone ? 'stone' : 'money', stone: stone,
+    };
   }
 
   /** 开关自动卖出 */
@@ -3626,6 +3789,25 @@
     if (!stockCfg().implemented) return false;
     const need = stockCfg().unlock || {};
     return (s ? s.realm : 0) >= (need.realm || 0);
+  }
+
+  /**
+   * **单只**股票是否可交易（v3.6）：系统级开户之外，
+   * 个股还可以有自己的 unlockRealm（融合赛道 50 家 = 元婴解锁）。
+   */
+  function stockAccessible(s, stock) {
+    if (!stockUnlocked(s)) return false;
+    if (!stock) return false;
+    const need = stock.unlockRealm || 0;
+    return (s ? s.realm : 0) >= need;
+  }
+
+  /** 逐股锁定原因（界面直接显示） */
+  function stockAccessReason(s, stock) {
+    if (stockUnlocked(s) && stock && (stock.unlockRealm || 0) > (s ? s.realm : 0)) {
+      return '需达到「' + realmName(stock.unlockRealm) + '」解锁';
+    }
+    return '';
   }
 
   function stockLockedReason(s) {
@@ -3980,6 +4162,7 @@
     const stock = stockById(stockId);
     if (!stock) return { ok: false, msg: '股票不存在' };
     if (!stockUnlocked(s)) return { ok: false, msg: stockLockedReason(s) };
+    if (!stockAccessible(s, stock)) return { ok: false, msg: stockAccessReason(s, stock) };
 
     const q = stockBuyQuote(s, stock, shares);
     if (!q.ok) return q;
@@ -4128,7 +4311,7 @@
         trend: stockTrend(s, st),
         nextChangeIn: stockNextChangeIn(st, marketClock(s)),
         maxBuy: stockMaxBuy(s, st),
-        unlocked: stockUnlocked(s),
+        unlocked: stockAccessible(s, st),
       };
     });
 
@@ -4143,11 +4326,13 @@
     const pnlAll = totalValue.sub(totalCost);
     const liquidatePnl = liquidateValue.sub(totalCost);
 
-    // 榜单：按市值降序取前 N 家。池子里一共 50 家，界面只列这 10 家 ——
-    // 但**交易对全部 50 家开放**（接口按 id 找，不在榜上也能买），
+    // 榜单：按市值降序取前 N 家。界面只列这 10 家 ——
+    // 但**交易对全部开放**（接口按 id 找，不在榜上也能买），
     // 否则「想买的刚好掉出前十」会变成硬性阻断，而榜单本就该随行情换人。
+    // v3.6：**未解锁的个股不进榜**（融合赛道 50 家元婴后才上板），
+    // 锁定行在列表里灰显展示、标注解锁条件。
     const boardSize = Math.max(1, Math.floor(cfg.boardSize || 10));
-    const board = list.slice().sort((a, b) => {
+    const board = list.filter((x) => x.unlocked).slice().sort((a, b) => {
       if (b.marketCap.gt(a.marketCap)) return 1;
       if (b.marketCap.lt(a.marketCap)) return -1;
       return a.id < b.id ? -1 : 1;
@@ -4617,6 +4802,7 @@
     autoIncome, qiMultiplier,
     allocatableInvestments, investmentAvailable, investmentLockReason,
     investOutput, investOutputRate, hardwareCostFactor, investedHardwareOf, hasAnyTechnique,
+    goodCurrency, stoneExchangeRate, setAllocationShare, stockAccessible, stockAccessReason, techCondProgress,
     // 修仙
     realmInfo, nextRealm, techniqueUnlocked, spiritAllowed, fmtBig,
     // 公司（产业）

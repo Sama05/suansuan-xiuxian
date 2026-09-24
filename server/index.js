@@ -463,7 +463,8 @@ app.post('/api/action', auth, (req, res) => {
       break;
     }
     case 'buyLine': {
-      const r = GameCore.buyLine(s, payload && payload.lineId);
+      // v3.6 批量购买：payload.count = 想买的台数（1~100，逐台计价，钱不够停在上一次成功）
+      const r = GameCore.buyLine(s, payload && payload.lineId, payload && payload.count);
       if (!r.ok) {
         dbm.saveGame(req.user.userId, GameCore.serialize(s));
         return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
@@ -471,6 +472,7 @@ app.post('/api/action', auth, (req, res) => {
       result = {
         ok: true, lineId: payload.lineId, cost: r.cost.toJSON(),
         owned: r.owned, index: r.index, product: r.product,
+        bought: r.bought, asked: r.asked, unitCost: r.unitCost.toJSON(),
       };
       break;
     }

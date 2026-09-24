@@ -137,6 +137,7 @@
          页面：境界
          ========================================================== -->
     <section class="page active" data-page="realm">
+      <div class="quick-alloc" data-qa="xiuxian"><span class="qa-label">修仙方向算力投入调整</span><input type="range" min="0" max="100" step="5" value="0" data-role="qarange"><span class="qa-pct" data-role="qapct">0%</span><span class="qa-hint">其余方向按比例让位，合计恒为 100%</span></div>
       <div class="grid-2">
 
         <div class="panel">
@@ -398,6 +399,7 @@
          页面：设备
          ========================================================== -->
     <section class="page" data-page="tech">
+      <div class="quick-alloc" data-qa="ai"><span class="qa-label">AI 领域算力投入调整</span><input type="range" min="0" max="100" step="5" value="0" data-role="qarange"><span class="qa-pct" data-role="qapct">0%</span><span class="qa-hint">其余方向按比例让位，合计恒为 100%</span></div>
       <div class="panel">
         <div class="panel-head">
           <h2>算力设备</h2>
@@ -580,6 +582,10 @@
           <div class="panel-head">
             <h2>生产线</h2>
             <span class="hint" id="ui-co-line-hint">买下一条线只是拿到产能上限，转起来要靠工业算力</span>
+            <span class="line-buy-qty">批量购买
+              <input type="number" id="line-buy-qty" min="1" max="100" step="1" value="1" aria-label="批量购买台数"> 台
+              <span class="faint">（1~100，逐台计价，钱不够停在上一次成功）</span>
+            </span>
           </div>
           <div id="co-line-list"></div>
         </div>
@@ -957,7 +963,7 @@
 <script src="/shared/game-config.js"></script>
 <!-- 版本参数用于打破浏览器缓存：shared 与 public 改动后忘了强刷，
      玩家会一直跑旧代码（本机实测踩过 —— 页面明明更新了，事件栏却永远不动）。 -->
-<script src="/shared/game-core.js?v=3.5"></script>
-<script src="/js/app.js?v=3.5"></script>
+<script src="/shared/game-core.js?v=3.6"></script>
+<script src="/js/app.js?v=3.6"></script>
 </body>
 </html>

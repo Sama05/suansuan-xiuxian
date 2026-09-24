@@ -2504,3 +2504,56 @@ body::before {
 }
 .codex-state.got { border-color: #2f6349; }
 .codex-state.not { border-color: var(--border); }
+
+/* ---------- v3.6：融合产业 / 折叠 / 快捷投向 / 批量购买 ---------- */
+
+/* 融合 = 紫（区别于科技的蓝金与修仙的青） */
+.mk-group.fusion { border-left: 2px solid #8f6fd0; }
+.mk-group.fusion .mk-group-name { color: #b99ce8; }
+.co-good.fusion { border-left: 2px solid #8f6fd0; }
+.co-good.fusion .co-good-title { color: #cdb5f2; }
+.st-row.fusion { border-left: 2px solid #8f6fd0; }
+.st-row.fusion .st-title { color: #cdb5f2; }
+.co-line.fusion { border-left: 2px solid #8f6fd0; }
+.co-line.fusion .co-line-title { color: #cdb5f2; }
+.co-line-tag.fusion { color: #b99ce8; border-color: #513a78; background: rgba(185,156,232,.10); }
+
+/* 售灵石标签 */
+.co-line-tag.cur { color: var(--jade); border-color: #2f6349; background: rgba(127,201,160,.10); }
+
+/* 折叠 */
+.mk-fold { flex: none; width: 16px; color: var(--text-faint); font-size: 11px; }
+.mk-group-head { cursor: pointer; user-select: none; }
+.mk-group-head:hover .mk-group-name { color: var(--gold); }
+.mk-group.folded .mk-group-body,
+.co-line-group.folded .mk-group-body { display: none; }
+.co-line-group { border-bottom: 1px solid var(--border); }
+.co-line-group:last-child { border-bottom: none; }
+
+/* 快捷算力投向 */
+.quick-alloc {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 20px;
+  background: linear-gradient(180deg, rgba(232,185,98,.06), transparent);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.quick-alloc .qa-label { flex: none; color: var(--gold); font-weight: 600; }
+.quick-alloc [data-role="qarange"] { flex: 1; max-width: 260px; accent-color: var(--gold); }
+.quick-alloc .qa-pct {
+  flex: none; min-width: 44px; text-align: center;
+  font-family: var(--mono); color: var(--gold);
+}
+.quick-alloc .qa-hint { flex: none; font-size: 11px; color: var(--text-faint); }
+
+/* 批量购买控件 */
+.line-buy-qty { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+.line-buy-qty input {
+  width: 64px; padding: 3px 6px;
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius);
+  color: var(--text); font-family: var(--mono); font-size: 12px; text-align: center;
+}
+.line-buy-qty .faint { font-size: 11px; }

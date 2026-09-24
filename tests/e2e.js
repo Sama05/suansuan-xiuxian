@@ -1198,13 +1198,19 @@ async function req(path, opts) {
     ok(mineV && mineV.maxCompute > 0, 'view 给出单台算力上限', String(mineV.maxCompute));
     ok(CO.lines.every((l) => !!l.industry), '每条产线都归属某个行业');
 
-    // ---- 股市：池子 50 家、榜单只列前 10 ----
+    // ---- 股市：v3.6 起池子 100 家（原 50 + 50 家元婴解锁的融合赛道）、榜单只列前 10 ----
     const SKv = v.stock;
-    ok(SKv.stocks.length === 50, '池子里共 50 家上市公司', String(SKv.stocks.length));
+    ok(SKv.stocks.length === 100, '池子里共 100 家上市公司', String(SKv.stocks.length));
     const techN = GAME.stock.stocks.filter((x) => x.kind === 'tech').length;
+    const xiuN = GAME.stock.stocks.filter((x) => x.kind === 'xiuxian').length;
+    const fuN = GAME.stock.stocks.filter((x) => x.kind === 'fusion').length;
     ok(techN === 30, '其中 30 家科技', String(techN));
-    ok(GAME.stock.stocks.length - techN === 20, '其中 20 家修仙宗门',
-      String(GAME.stock.stocks.length - techN));
+    ok(xiuN === 20, '其中 20 家修仙宗门', String(xiuN));
+    ok(fuN === 50, '另有 50 家融合赛道（元婴解锁）', String(fuN));
+    // 融合赛道要元婴才上板：此刻（炼气）榜单里不该出现
+    ok(SKv.board.every((x) => x.kind !== 'fusion'),
+      '元婴之前榜单里没有融合赛道公司',
+      SKv.board.filter((x) => x.kind === 'fusion').map((x) => x.id).join(','));
     ok(SKv.board.length === (GAME.stock.boardSize || 10), '榜单长度 = boardSize',
       String(SKv.board.length));
     ok(SKv.board.every((x) => typeof x.business === 'string' && x.business.length > 0),
