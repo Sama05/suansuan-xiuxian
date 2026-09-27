@@ -1,0 +1,63 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "算力修仙 · 启动服务（F5）",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "${config:suansuan.node}",
+      "program": "${workspaceFolder}/server/index.js",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "restart": true,
+      "skipFiles": ["<node_internals>/**"],
+      "env": { "NODE_ENV": "development" },
+      "presentation": { "group": "① 启动服务", "order": 1 }
+    },
+    {
+      "name": "算力修仙 · 换端口 3211 启动",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "${config:suansuan.node}",
+      "program": "${workspaceFolder}/server/index.js",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "restart": true,
+      "skipFiles": ["<node_internals>/**"],
+      "env": { "NODE_ENV": "development", "PORT": "3211" },
+      "presentation": { "group": "① 启动服务", "order": 2 }
+    },
+    {
+      "name": "算力修仙 · 跑全部测试",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "${config:suansuan.node}",
+      "program": "${workspaceFolder}/tests/run.js",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"],
+      "presentation": { "group": "② 测试", "order": 1 }
+    },
+    {
+      "name": "算力修仙 · 只跑核心测试（最快）",
+      "type": "node",
+      "request": "launch",
+      "runtimeExecutable": "${config:suansuan.node}",
+      "program": "${workspaceFolder}/tests/core.test.js",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "skipFiles": ["<node_internals>/**"],
+      "presentation": { "group": "② 测试", "order": 2 }
+    },
+    {
+      "name": "算力修仙 · 真浏览器验收",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/verify-v38.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": { "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8" },
+      "presentation": { "group": "② 测试", "order": 3 }
+    }
+  ]
+}

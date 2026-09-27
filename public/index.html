@@ -60,32 +60,32 @@
     <div class="brand">算力修仙</div>
 
     <div class="res-group">
-      <div class="res">
+      <div class="res" data-res="money">
         <span class="k">金钱</span>
         <span class="v gold" id="ui-money">0</span>
         <span class="sub" id="ui-income">+0 / 秒</span>
       </div>
-      <div class="res">
+      <div class="res" data-res="compute">
         <span class="k">算力</span>
         <span class="v azure" id="ui-compute">0</span>
         <span class="sub" id="ui-compute-sub">设备提供</span>
       </div>
-      <div class="res">
+      <div class="res" data-res="qi">
         <span class="k">灵气</span>
         <span class="v violet" id="ui-qi">0</span>
         <span class="sub" id="ui-qi-sub">突破境界用</span>
       </div>
-      <div class="res">
+      <div class="res" data-res="spirit">
         <span class="k">灵石</span>
         <span class="v jade" id="ui-spirit">0</span>
         <span class="sub" id="ui-spirit-sub">购修仙设备</span>
       </div>
-      <div class="res">
+      <div class="res" data-res="shenshi">
         <span class="k">神识</span>
         <span class="v rose" id="ui-shenshi">1</span>
         <span class="sub" id="ui-shenshi-sub">增幅算力与修炼</span>
       </div>
-      <div class="res">
+      <div class="res" data-res="realm">
         <span class="k">境界</span>
         <span class="v" id="ui-realm-top">凡人</span>
         <span class="sub" id="ui-realm-prog">0.00%</span>
@@ -946,6 +946,9 @@
 
 <div id="toast-zone"></div>
 
+<!-- 顶栏资源悬停明细（内容由 app/res-tip.js 按悬停项实时生成） -->
+<div id="res-tip" class="res-tip hidden"></div>
+
 <!-- ---------- 兵解确认弹窗（不可撤销，必须列清三栏） ---------- -->
 <div class="modal-mask hidden" id="rebirth-modal">
   <div class="modal-box">
@@ -976,9 +979,39 @@
 
 <script src="/shared/decimal.js"></script>
 <script src="/shared/game-config.js"></script>
-<!-- 版本参数用于打破浏览器缓存：shared 与 public 改动后忘了强刷，
-     玩家会一直跑旧代码（本机实测踩过 —— 页面明明更新了，事件栏却永远不动）。 -->
-<script src="/shared/game-core.js?v=3.6"></script>
-<script src="/js/app.js?v=3.6"></script>
+<!-- 版本参数 v=4 只是占位：server/index.js 启动时会把所有 ?v=<数字> 统一改写成
+     ?v=<启动时间戳>，并把 index.html 响应设为 no-cache —— 每次重启服务端浏览器
+     必然拉新脚本，不再依赖「改完代码手动 bump 版本号」的记忆（那个纪律失败过两次）。 -->
+<!-- game-core 的系统模块（各自把工厂推入 window.__gcMods），必须先于聚合器加载 -->
+<script src="/shared/core/util.js?v=4"></script>
+<script src="/shared/core/state.js?v=4"></script>
+<script src="/shared/core/time.js?v=4"></script>
+<script src="/shared/core/shenshi.js?v=4"></script>
+<script src="/shared/core/rebirth.js?v=4"></script>
+<script src="/shared/core/job.js?v=4"></script>
+<script src="/shared/core/technique.js?v=4"></script>
+<script src="/shared/core/compute.js?v=4"></script>
+<script src="/shared/core/company.js?v=4"></script>
+<script src="/shared/core/stock.js?v=4"></script>
+<script src="/shared/core/tick.js?v=4"></script>
+<script src="/shared/core/ops.js?v=4"></script>
+<script src="/shared/game-core.js?v=4"></script>
+<!-- app 模块群（各自挂载到 window.App），app.js 主入口必须最后加载 -->
+<script src="/js/app/state.js?v=4"></script>
+<script src="/js/app/ui.js?v=4"></script>
+<script src="/js/app/format.js?v=4"></script>
+<script src="/js/app/charts.js?v=4"></script>
+<script src="/js/app/events.js?v=4"></script>
+<script src="/js/app/res-tip.js?v=4"></script>
+<script src="/js/app/page-realm.js?v=4"></script>
+<script src="/js/app/page-work.js?v=4"></script>
+<script src="/js/app/page-tech.js?v=4"></script>
+<script src="/js/app/page-invest.js?v=4"></script>
+<script src="/js/app/page-company.js?v=4"></script>
+<script src="/js/app/page-market.js?v=4"></script>
+<script src="/js/app/page-stock.js?v=4"></script>
+<script src="/js/app/page-technique.js?v=4"></script>
+<script src="/js/app/page-rebirth.js?v=4"></script>
+<script src="/js/app.js?v=4"></script>
 </body>
 </html>

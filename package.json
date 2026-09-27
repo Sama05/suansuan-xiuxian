@@ -5,14 +5,18 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node tests/run.js"
+    "test": "node tests/run.js",
+    "doctor": "node tools/doctor.js",
+    "free-port": "node tools/free-port.js",
+    "fix-native": "node tools/fix-native.js",
+    "postinstall": "node tools/fix-native.js --soft"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "better-sqlite3": "^11.3.0",
+    "better-sqlite3": "^12.11.1",
     "bcryptjs": "^2.4.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

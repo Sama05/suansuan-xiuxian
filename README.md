@@ -5,19 +5,49 @@
 ## 快速开始
 
 ```bash
-npm install
+npm install        # 装完会自动跑一次原生模块自检（见下）
 npm start          # 启动服务，默认 http://localhost:3210
 ```
-
-> 需要 Node ≥ 18（`better-sqlite3` 是原生模块，首次安装会编译，Windows 上可能需要 VS Build Tools）。
 
 浏览器打开 `http://localhost:3210`，注册账号即可开玩。
 
 ```bash
-npm test           # 运行全部测试（4053 项）
+npm test           # 运行全部测试（4067 项）
+npm run doctor     # 环境自检：跑不起来先跑这个
 ```
 
 > 想在测试里跑端到端用例，需先 `npm start` 另开一个终端。未启动时该套件会自动跳过。
+
+### 用 VSCode 跑（推荐）
+
+仓库里带了 `.vscode/` 配置，打开文件夹即可用：
+
+| 入口 | 做什么 |
+|---|---|
+| **F5** | 启动服务（默认 3210），Ctrl+C 干净退出 |
+| 运行配置「换端口 3211 启动」 | 3210 被占用时的备选 |
+| 运行配置「跑全部测试 / 只跑核心测试 / 真浏览器验收」 | 调试验证 |
+| 任务面板（`Ctrl+Shift+B`） | 启动服务 / 环境自检 / 释放端口 / 修复原生模块 / 安装依赖 |
+
+### 原生模块 better-sqlite3 与 Node 版本（重要）
+
+`better-sqlite3` 是**原生模块**，二进制绑定安装它时那个 Node 的 **ABI**：换 Node 就必须重装，
+否则报 `ERR_DLOPEN_FAILED / NODE_MODULE_VERSION xxx`（提示会直接告诉你该做什么，不会只丢一坨栈）。
+
+这台机器上有两套 Node（系统 `D:\Application\nodejs` 的 24.x，另有 22.x），所以运行时**在
+`.vscode/settings.json` 里钉死**为 `suansuan.node`，F5 与所有任务都引用它；换机器/换 Node
+改这一行，然后跑 `npm run fix-native` 重装成匹配的 ABI。
+
+```bash
+npm run fix-native     # 已能加载就秒过；不匹配才去拉对应 ABI 的预编译包，并如实回报验证结果
+```
+
+> 坑：npmmirror 的 tarball 里自带一个旧 ABI 的 `build/Release/better_sqlite3.node`，
+> `prebuild-install` 见到文件已存在就跳过 —— 于是 `npm install` 报成功但模块其实是坏的。
+> 所以修复脚本必须带 `--force`，并且装完要真的 `require` 一次来验证。`postinstall` 已挂上这一步。
+
+> `.npmrc` 把 registry 指向 npmmirror：本机直连 `registry.npmjs.org` 不通，不指镜像 `npm install` 会超时失败。
+> 换到能直连 npmjs 的机器时删掉 `registry` 那行即可。
 
 ## 玩法
 
@@ -552,25 +582,46 @@ state 差值读出来（公司收入看 `totalRevenue` 增量、段位看 `learn
 ## 目录结构
 
 ```
-shared/           前后端共用（同一份代码，保证进度一致）
-  decimal.js        十进制浮点（尾数+指数），支持超大数值
-  game-config.js    全部数值参数，集中调优（jobs / devices / techniques / realms / shenshi / company / stock）
-  game-core.js      核心逻辑：tick / 工作 / 精力 / 时间 / 购买 / 分配 / 功法 / 神识 / 境界 / 公司 / 股市
+shared/               前后端共用（同一份代码，保证进度一致）
+  decimal.js            十进制浮点（尾数+指数），支持超大数值
+  game-config.js        全部数值参数，集中调优（jobs / devices / techniques / realms / shenshi / company / stock）
+  game-core.js          核心聚合出口：把 core/ 下 12 个系统模块装配成一份 GameCore
+  core/                 核心模块群（共享命名空间 C，新增系统挂上去即可，见 game-core.js 头注释）
+    util.js               工具 / 确定性散列 / 行情时钟 / 时间常量
+    state.js              存档三件套（createState / hydrate / serialize）与全部字段迁移
+    time.js               时间档位 / 游戏日历 / 精力 / 境界信息
+    shenshi.js            神识与分层阻尼乘区
+    rebirth.js            转生（兵解）/ 渡劫 / 道行加成
+    job.js                工作（职业）
+    technique.js          功法（习得条件 / 熟练度 / 独立等级 / 被动）
+    compute.js            设备与投向
+    company.js            公司 / 市场 / 行业传导 / 抛压 / 财务快照缓存
+    stock.js              股市（三层价格 / 持仓冲击 / 逐期衰减）
+    tick.js               核心 tick（stepTick 顺序不可打乱）
+    ops.js                玩家操作（服务端 /api/action 与前端共用）
 
 server/
-  index.js          Express 接口层 + 会话
+  index.js          Express 接口层 + 会话（端口占用 / 优雅退出 / 未处理拒绝都在这里兜底）
   db.js             SQLite 存档层（users / saves / sessions —— 会话落盘，重启不掉登录）
+  port-info.js      端口占用查询（server / free-port / doctor 三处共用，避免各写一份 netstat 解析）
 
 public/           前端（原生 HTML/CSS/JS，无框架）
-  index.html        八个子页面 + 顶栏资源条 + 标签导航
+  index.html        八个子页面 + 顶栏资源条 + 标签导航（按序加载 core/ 与 app/ 模块群）
   css/style.css
-  js/app.js
+  js/app.js         前端主入口：网络层 / 登录 / 切页 / 顶栏 / renderAll 与 renderFrame / 主循环 / boot
+  js/app/           前端模块群（全部挂到 window.App，可变状态由 state.js 统一初始化）
+    state.js          全局可变状态（state / token / dirty / 当前页 / 选择游标……）
+    ui.js             toast / $ / setText·setT·setHTML 写前比对 / 通用折叠组件 / 弹窗
+    format.js         数字与时长格式化
+    charts.js         走势 SVG（lineChartSVG 统一实现）+ 迷你图缓存
+    events.js         事件通知栏（客户端差值观察器，不进存档）
+    page-*.js         按页拆分：realm / work / tech / invest / company / market / stock / technique / rebirth
 
-tests/            测试（node tests/run.js 跑全量，当前 4053 条）
+tests/            测试（node tests/run.js 跑全量，当前 4067 条）
   decimal.test.js   Decimal 单元测试（87，含负数比较回归）
   core.test.js      游戏核心单元测试（2944，含公司系统 / 工业算力 / 行业传导 / 可换产物产线 / 股市 / 转生 / 渡劫 / 投向口径 / 灵石节奏）
   frontend.test.js  前端结构 + 真实渲染值测试（529，含公司页 + 市场独立页 + 股市页 + 走势图 + 抛压条 + 兵解面板 + 投向锁定文案）
-  e2e.js            接口端到端测试（493，含公司接口、setLineUnit、工业算力、市值榜、防作弊、抛压结算、股市成交、兵解与渡劫）
+  e2e.js            接口端到端测试（507，含公司接口、setLineUnit、工业算力、市值榜、防作弊、抛压结算、股市成交、兵解与渡劫）
   run.js            总入口
 
 tools/
@@ -588,11 +639,44 @@ tools/
   advance-account.js   把某个账号「模拟推进」到指定境界 / 产业规模（存档改写工具，不是后门）
   make-scarce-demo.js  造一个「工业算力不足」的演示存档，用来验证「优先生产」的分档效果
   verify-v38.py        真浏览器回归：批量操作 / 优先生产分档 / 四种排序 / 折叠动画 / 顶栏算力拆解，逐项断言
+  doctor.js            环境自检：实际生效的 Node/Python 是哪个、依赖能否加载、端口是否空闲、VSCode 配置能否用
+  free-port.js         释放被占端口（只杀 node，别的程序只报告）；支持 3210-3215 段与 --dry
+  fix-native.js        原生模块 ABI 修复：按当前 Node 拉取匹配的 better-sqlite3 预编译包并验证（npm run fix-native）
 
+.vscode/          F5 启动 / 任务面板 / 终端与编码设置 / 运行时钉死（随仓库走）
+.npmrc            registry 指向 npmmirror（本机直连 npmjs 不通）
 docs/             设计草案与清单（兵解转生-设计草案.md、待办与优化清单-v3.8.md）
 data/             SQLite 数据库（运行时生成）
 preview/          chart-preview.js / demo-*.py 的输出（静态预览页 + 截图）
 ```
+
+> 模块拆分（v4）的两条纪律：**模块间只经命名空间互调**（core 的 C.xxx / 前端的
+> A.xxx，调用期惰性解析，互引不用关心加载顺序）；**可变状态只有一个归属地**
+> （core 在各 state 字段、前端在 app/state.js）。新增一个系统 = 新增一个模块文件
+> + 在聚合器/脚本序里加一行，不再往 5000 行大文件里堆。
+
+## 性能（v4 深度优化的三处热点）
+
+1. **渲染：按页门控。** 主循环每 100ms 一帧只画「顶栏 + 当前页」（`renderFrame`），
+   不再每帧全量九个页面；市场 / 股市两页的重列表（288 行 + 100 行迷你走势）只在
+   首帧或「当前页就是它」时绘制，切页补画。大段 HTML 写入走 `setHTML` 写前比对，
+   值没变就不让浏览器重新解析子树（`setText` / `setT` 同思路，早已存在）。
+2. **离线结算：公司段快照化 + 只算一遍。** 行情时钟在 stepTick 内不推进，所以
+   「维护费 / 产量 / 成交价」在一个大步里是常量 —— `companyFinance` 按
+   「配置版本号 + 算力池 + 时钟 + 抛压版本」记忆化，离线十几个生产周期共用一份
+   快照；自动卖出走 `sellAllWithPrices` 复用价格表。`/api/load` 原先用
+   `previewOffline` 在副本上完整 tick 一遍拿汇总、再对真实状态重跑同一份 tick，
+   现在只跑一遍（48h 离线的接口耗时约减半）。
+3. **配置查表 + 缓存 key。** `goodById / goodIndex / stockById / stockIndex`
+   等 288 件商品 / 100 只股票的线性 find 换成加载期建好的 Map；两级算力分配与
+   财务快照的缓存 key 从「全量遍历产线拼签名字符串」改为 O(1) 的配置版本号
+   （`_unitsVer`，改产物 / 产能 / 优先 / 购线 / 兵解都会 bump）。CPU 剖析显示
+   优化前 `companyComputeTiers` 的 key 构建单点占 21%。
+   另：功法习得检查（每步 tick × 41 本功法）优先读 `s.realCompute` 缓存，
+   不再逐本全链重算实际算力。
+
+> 这些优化全部有 4067 项测试 + 203 项核心自检兜底，行为与优化前逐位一致；
+> `tools/sim.js` 的数值曲线不受影响。
 
 > `node tools/chart-preview.js` 会用 DOM 桩在 Node 里真跑一遍 `public/js/app.js`，
 > 把渲染结果导出成 `preview/company-chart.html`。**不是重新画一遍**，走的是页面里

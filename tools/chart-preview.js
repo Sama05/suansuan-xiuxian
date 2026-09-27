@@ -40,6 +40,15 @@ function mkEl(id) {
     },
     addEventListener() {}, removeEventListener() {},
     appendChild(c) { this.children.push(c); }, remove() {}, focus() {},
+    // 属性读写必须支持：app.js 的 renderLineUnits 会读 `data-usig`（每台产线
+    // 配置行的重建签名）。缺了它，renderCompanyPage 一进产线循环就抛
+    // TypeError，renderAll 整条链断掉，预览什么都画不出来。
+    _attr: {},
+    getAttribute(n) {
+      return Object.prototype.hasOwnProperty.call(this._attr, n) ? this._attr[n] : null;
+    },
+    setAttribute(n, v) { this._attr[n] = String(v); },
+    removeAttribute(n) { delete this._attr[n]; },
     querySelector() { return mkEl('q'); },
     querySelectorAll() { return []; },
     closest() { return null; },
@@ -128,6 +137,12 @@ function installStubs() {
   s.working = false;
   s.playTime = 60 * 40;               // 停在第 40 期（科技类 60 秒一期），避开开市期
   Core.foundCompany(s);
+  // v3.6 起产线挂在「工业算力」上：没有设备就没有算力、没拨份额就全厂停产，
+  // 预览存档必须两者都给够，syncCompany 才会真的出货（否则库存恒为 0）。
+  s.spiritStone = new Decimal(1e10);
+  Core.buyDevice(s, 'megacenter');
+  Core.buyDevice(s, 'array');
+  s.alloc.industry = 0.5;
   // 沿解锁链铺开：每条线尽量多买，买不动（前置数量/境界不够）就停在那一档
   for (const l of GAME.company.lines) {
     for (let i = 0; i < 6; i++) {

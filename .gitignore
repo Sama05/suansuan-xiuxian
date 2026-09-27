@@ -14,7 +14,13 @@ __pycache__/
 
 # 工具/编辑器
 .workbuddy/
-.vscode/
+.vscode/*
+# 但下面这几个是**团队共用**的项目配置：F5 启动、任务面板、UTF-8/终端设置。
+# 不跟着仓库走的话，换台机器克隆下来就「跑不起来、还得手搓」，所以显式放行。
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
 *.log
 .DS_Store

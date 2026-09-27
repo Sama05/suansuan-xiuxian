@@ -7,6 +7,7 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const dbm = require('./db');
 const GameCore = require('../shared/game-core.js');
@@ -15,6 +16,26 @@ const GAME = require('../shared/game-config.js');
 
 const app = express();
 const PORT = process.env.PORT || 3210;
+
+/**
+ * 静态脚本缓存戳 —— 服务端启动时自动注入，替代「改完代码手动 bump ?v=」。
+ *
+ * 为什么必须自动化：index.html 不带缓存戳，浏览器会一直用缓存的旧 HTML 去配
+ * 新脚本（或反过来）；而手动 bump 已经失败过两次 —— v3.6→v4 的大改只 bump 了
+ * 一次，其后每轮改动都沿用同一个 ?v=4，用户端跑到旧代码（本次「悬停明细不显示」
+ * 的排查里这也是嫌疑之一）。现在每次重启服务端，版本戳必然变化：
+ *   ① 启动时读入 index.html，把所有 ?v=<数字> 统一替换为 ?v=<启动时间戳>；
+ *   ② 静态文件本身（/js/...、/shared/...）的 URL 带上了新戳，浏览器重新拉取；
+ *   ③ index.html 响应显式 no-cache，HTML 永远取最新的一份。
+ */
+const CACHE_STAMP = 'v=' + Date.now().toString(36);
+const INDEX_HTML = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8')
+  .replace(/\?v=\d+/g, '?' + CACHE_STAMP);
+
+app.get('/', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.send(INDEX_HTML);
+});
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -32,6 +53,20 @@ function auth(req, res, next) {
   req.user = sess;
   req.token = sess.token;
   next();
+}
+
+/**
+ * /api/action 失败时的统一出口。
+ *
+ * 服务端在执行操作前已按离线时长推进过状态，这份进度**必须落库保留**
+ * （哪怕本次操作被拒绝），并把完整 state 回传给前端纠偏。
+ * 早先这段样板在 19 个 case 里各抄一份、每份还各 serialize 两遍 ——
+ * 收到这里之后 serialize 只跑一次，行为不变。
+ */
+function rejectAction(res, s, userId, msg) {
+  const snap = GameCore.serialize(s);
+  dbm.saveGame(userId, snap);
+  return res.status(400).json({ ok: false, msg: msg, state: snap });
 }
 
 // ---------- 账号 ----------
@@ -98,36 +133,43 @@ app.get('/api/load', auth, (req, res) => {
   if (elapsedSec > 0.5) {
     // 短暂离开（刷新/切标签页）→ 全额结算，不打折，避免频繁刷新吃亏
     // 真正离线（超过阈值）→ 按 ratio 折算，且有封顶
+    //
+    // 结算只跑一次：早先这里先用 previewOffline 在副本上完整 tick 一遍拿汇总，
+    // 再对真实状态重跑同一份 tick —— 48 小时离线等于跑两份 600 步。tick 的
+    // 返回值 + 结算后的状态足以拼出一模一样的汇总，副本那份省掉了。
     const isRealOffline = elapsedSec >= GAME.offline.thresholdSeconds;
-    const preview = GameCore.previewOffline(s, elapsedSec, isRealOffline);
-    GameCore.tick(s, preview.seconds, { offline: isRealOffline });
+    const capped = isRealOffline
+      ? Math.min(elapsedSec, GameCore.offlineMaxHours(s) * 3600)
+      : elapsedSec;
+    const r = GameCore.tick(s, capped, { offline: isRealOffline });
 
     if (isRealOffline) {
+      const stk = GameCore.stockSummary(s);
       offlineResult = {
-        seconds: preview.seconds,
+        seconds: capped,
         realSeconds: elapsedSec,
-        cappedOut: preview.cappedOut,
-        money: preview.money.toJSON(),
-        spirit: preview.spirit.toJSON(),
-        stone: preview.stone.toJSON(),
-        jobDone: preview.jobDone,
-        gameSeconds: preview.gameSeconds,
-        realm: preview.realm,
-        learned: preview.learned,
-        company: preview.company ? {
-          cycles: preview.company.cycles,
-          revenue: preview.company.revenue.toJSON(),
-          upkeep: preview.company.upkeep.toJSON(),
-          produced: preview.company.produced,
-          overflow: preview.company.overflow,
-          starved: preview.company.starved,
+        cappedOut: elapsedSec > capped,
+        money: r.money.toJSON(),
+        spirit: r.spirit.toJSON(),
+        stone: r.stone.toJSON(),
+        jobDone: r.jobDone,
+        gameSeconds: s.gameSeconds,
+        realm: s.realm,
+        learned: Object.keys(s.learned),
+        company: r.company ? {
+          cycles: r.company.cycles,
+          revenue: r.company.revenue.toJSON(),
+          upkeep: r.company.upkeep.toJSON(),
+          produced: r.company.produced,
+          overflow: r.company.overflow,
+          starved: r.company.starved,
         } : null,
-        stock: preview.stock ? {
-          totalValue: preview.stock.totalValue.toJSON(),
-          pnl: preview.stock.pnl.toJSON(),
-          realized: preview.stock.realized.toJSON(),
-          totalFee: preview.stock.totalFee.toJSON(),
-          totalTrades: preview.stock.totalTrades,
+        stock: stk ? {
+          totalValue: stk.totalValue.toJSON(),
+          pnl: stk.pnl.toJSON(),
+          realized: stk.realized.toJSON(),
+          totalFee: stk.totalFee.toJSON(),
+          totalTrades: stk.totalTrades,
         } : null,
         ratio: GAME.offline.ratio,
       };
@@ -375,10 +417,7 @@ app.post('/api/action', auth, (req, res) => {
       // 手动催工：立即完成当前工作的若干份。上限 1000 次/请求。
       const times = Math.max(1, Math.min(parseInt(payload && payload.times, 10) || 1, 1000));
       const r = GameCore.rushJob(s, times);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, done: r.done,
         money: r.money.toJSON(), spirit: r.spirit.toJSON(), stone: r.stone.toJSON(),
@@ -387,10 +426,7 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'setJob': {
       const r = GameCore.setJob(s, payload && payload.jobId);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = { ok: true, jobId: r.jobId };
       break;
     }
@@ -401,10 +437,7 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'setTimeTier': {
       const r = GameCore.setTimeTier(s, payload && payload.tier);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = { ok: true, tier: r.tier, auto: r.auto };
       break;
     }
@@ -415,16 +448,11 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'buyDevice': {
       const r = GameCore.buyDevice(s, payload && payload.deviceId);
-      result = r.ok
-        ? {
-          ok: true, cost: r.cost.toJSON(), owned: r.owned,
-          stoneCost: r.stoneCost.toJSON(), learned: r.learned,
-        }
-        : { ok: false, msg: r.msg };
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
+      result = {
+        ok: true, cost: r.cost.toJSON(), owned: r.owned,
+        stoneCost: r.stoneCost.toJSON(), learned: r.learned,
+      };
       break;
     }
     case 'setAllocation': {
@@ -435,10 +463,7 @@ app.post('/api/action', auth, (req, res) => {
     case 'setTechnique': {
       // 切换当前修炼的功法（同一时间只能修炼一本）
       const r = GameCore.setTechnique(s, payload && payload.techniqueId);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = { ok: true, technique: r.technique };
       break;
     }
@@ -451,10 +476,7 @@ app.post('/api/action', auth, (req, res) => {
       // 参悟：消耗灵气换熟练度
       const times = Math.max(1, Math.min(parseInt(payload && payload.times, 10) || 1, 1000));
       const r = GameCore.comprehend(s, times);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, done: r.done, gain: r.gain, tier: r.tier,
         passive: r.passive, cost: r.cost.toJSON(),
@@ -464,20 +486,14 @@ app.post('/api/action', auth, (req, res) => {
     // ---------- 公司（产业）----------
     case 'foundCompany': {
       const r = GameCore.foundCompany(s);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = { ok: true, cost: r.cost.toJSON(), foundedDay: r.foundedDay };
       break;
     }
     case 'buyLine': {
       // v3.6 批量购买：payload.count = 想买的台数（1~100，逐台计价，钱不够停在上一次成功）
       const r = GameCore.buyLine(s, payload && payload.lineId, payload && payload.count);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, lineId: payload.lineId, cost: r.cost.toJSON(),
         owned: r.owned, index: r.index, product: r.product,
@@ -494,10 +510,7 @@ app.post('/api/action', auth, (req, res) => {
         payload && payload.lineId,
         payload && payload.index,
         { product: payload && payload.product, rate: payload && payload.rate });
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, lineId: r.lineId, index: r.index, all: r.all, count: r.count,
       };
@@ -509,10 +522,7 @@ app.post('/api/action', auth, (req, res) => {
     case 'setLinePriority': {
       const r = GameCore.setLinePriority(s,
         payload && payload.lineId, payload && payload.priority);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = { ok: true, lineId: r.lineId, priority: r.priority };
       break;
     }
@@ -522,10 +532,7 @@ app.post('/api/action', auth, (req, res) => {
     case 'setIndustryRate': {
       const r = GameCore.setIndustryRate(s,
         payload && payload.industryId, payload && payload.rate);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, industryId: r.industryId, rate: r.rate,
         lines: r.lines, units: r.units,
@@ -534,10 +541,7 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'upgradeWarehouse': {
       const r = GameCore.upgradeWarehouse(s);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, level: r.level, capacity: r.capacity, cost: r.cost.toJSON(),
       };
@@ -545,10 +549,7 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'sellGoods': {
       const r = GameCore.sellGoods(s, payload && payload.goodId, payload && payload.count);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, revenue: r.revenue.toJSON(), sold: r.sold,
         count: r.count || null, price: r.price ? r.price.toJSON() : null,
@@ -557,20 +558,14 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'setAutoSell': {
       const r = GameCore.setAutoSell(s, payload && payload.autoSell);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = { ok: true, autoSell: r.autoSell };
       break;
     }
     // ---------- 股市（证券账户）----------
     case 'buyStock': {
       const r = GameCore.buyStock(s, payload && payload.stockId, payload && payload.shares);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, stockId: r.stockId, shares: r.shares,
         unitPrice: r.unitPrice.toJSON(), gross: r.gross.toJSON(),
@@ -581,10 +576,7 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'sellStock': {
       const r = GameCore.sellStock(s, payload && payload.stockId, payload && payload.shares);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, stockId: r.stockId, shares: r.shares,
         unitPrice: r.unitPrice.toJSON(), gross: r.gross.toJSON(),
@@ -601,10 +593,7 @@ app.post('/api/action', auth, (req, res) => {
       // 主动入口在界面上；被动入口由 doTribulation 内部调用，走的是后端同一段代码。
       const mode = (payload && payload.mode === 'passive') ? 'passive' : 'active';
       const r = GameCore.doRebirth(s, mode);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, dao: r.dao, count: r.count, mode: r.mode,
         fullWipe: r.fullWipe, discount: r.discount, lost: r.lost,
@@ -620,10 +609,7 @@ app.post('/api/action', auth, (req, res) => {
       // 服务端会把清掉的资产原样补回来，出现「界面已归零、服务器还留着元婴」。
       // 走 /api/action 则直接落库，绕开了那层只增保护，两端才一致。
       const r = GameCore.doTribulation(s);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true,
         success: r.success,
@@ -648,10 +634,7 @@ app.post('/api/action', auth, (req, res) => {
     }
     case 'buyPerk': {
       const r = GameCore.buyPerk(s, payload && payload.perkId);
-      if (!r.ok) {
-        dbm.saveGame(req.user.userId, GameCore.serialize(s));
-        return res.status(400).json({ ok: false, msg: r.msg, state: GameCore.serialize(s) });
-      }
+      if (!r.ok) return rejectAction(res, s, req.user.userId, r.msg);
       result = {
         ok: true, id: r.id, name: r.name, level: r.level,
         cost: r.cost, daoLeft: r.daoLeft,
@@ -1113,8 +1096,11 @@ function buildView(s) {
 // ---------- 启动 ----------
 // 会话表落盘，所以重启服务端不会让所有人重新登录 —— 只顺手清掉已过期的那些。
 const purgedSessions = dbm.purgeSessions();
+// 端口占用查询抽在 server/port-info.js：tools/free-port.js 与 tools/doctor.js 也用，
+// 免得三处各抄一份 netstat 解析（以及那个「stdin 管道 EBUSY」的坑）。
+const portInfo = require('./port-info');
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   const ss = dbm.sessionStats();
   console.log('');
   console.log('  算力修仙 服务已启动');
@@ -1124,5 +1110,65 @@ app.listen(PORT, () => {
   console.log('  会话: 有效 ' + ss.total + ' 个（有效期 ' + ss.ttlDays + ' 天，已落盘）'
     + (purgedSessions > 0 ? '，本次清理过期 ' + purgedSessions + ' 个' : ''));
   console.log('  登录状态会保留：服务端重启后，之前登录过的浏览器无需重新登录');
+  console.log('  停止：终端里按 Ctrl+C（会合并 WAL 后干净退出）');
   console.log('');
+});
+
+/**
+ * 裸 `app.listen` 遇到端口占用只会抛一个没人处理的 'error' 事件，
+ * 打一大段栈就退出 —— 既不说是谁占的，也不说怎么办。之前排查端口冲突只能手动
+ * `netstat` 找 PID。这里把占用者直接查出来，并给出三种换端口的方式。
+ */
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    let holder = '';
+    try { holder = portInfo.describe(PORT); } catch (e) { /* 查不到就少一行 */ }
+    console.error('');
+    console.error('  启动失败：端口 ' + PORT + ' 已被占用。');
+    if (holder) console.error('  占用者：' + holder);
+    console.error('  处理其一：');
+    console.error('    ① 结束占用进程：node tools/free-port.js ' + PORT);
+    console.error('    ② 换端口启动  —— PowerShell : $env:PORT=3211; npm start');
+    console.error('                      Git Bash   : PORT=3211 npm start');
+    console.error('                      VSCode     : 选运行配置「换端口 3211 启动」');
+    console.error('');
+    process.exit(1);
+  }
+  console.error('');
+  console.error('  启动失败：' + (err && err.stack ? err.stack : String(err)));
+  console.error('');
+  process.exit(1);
+});
+
+// ---------- 退出 ----------
+// Ctrl+C / 被要求结束时，先把 WAL 合并回主库再退出，避免留下未合并的写入。
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('\n  收到 ' + signal + '，正在关闭…');
+  server.close(() => {
+    dbm.closeDb();
+    console.log('  已关闭（WAL 已合并回主库）。');
+    process.exit(0);
+  });
+  // 兜底：有长连接挂着时 server.close 可能迟迟不回调，3 秒后强制收尾，别把终端挂住。
+  setTimeout(() => { dbm.closeDb(); process.exit(0); }, 3000).unref();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+/**
+ * 未处理的 Promise 拒绝必须**响亮地失败**。
+ * 历史教训：db.register 改成异步后，离线脚本仍在同步调用 → 拿到的是 Promise →
+ * `r.ok` 是 undefined → 建号静默失败，没有报错、没有日志，查了很久。
+ * 这类静默失败比直接崩溃难查得多，所以在服务端一律打出来并退出。
+ */
+process.on('unhandledRejection', (reason) => {
+  console.error('');
+  console.error('  [致命] 未处理的 Promise 拒绝：');
+  console.error(reason && reason.stack ? reason.stack : String(reason));
+  console.error('  服务将退出：静默失败比崩溃更难排查。');
+  console.error('');
+  process.exit(1);
 });

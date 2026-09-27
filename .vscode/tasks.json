@@ -1,0 +1,110 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "① 启动服务（3210）",
+      "detail": "node server/index.js —— 启动后浏览器打开 http://localhost:3210",
+      "type": "shell",
+      "command": "${config:suansuan.node}",
+      "args": ["server/index.js"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "suanxiuxian",
+        "pattern": { "regexp": "^(.*)$" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "算力修仙 服务已启动",
+          "endsPattern": "登录状态会保留"
+        }
+      },
+      "presentation": { "reveal": "always", "panel": "shared", "group": "服务", "clear": true },
+      "runOptions": { "instanceLimit": 1 }
+    },
+    {
+      "label": "① 启动服务（换端口 3211）",
+      "detail": "3210 被占用时用这个",
+      "type": "shell",
+      "command": "${config:suansuan.node}",
+      "args": ["server/index.js"],
+      "options": { "cwd": "${workspaceFolder}", "env": { "PORT": "3211" } },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "suanxiuxian",
+        "pattern": { "regexp": "^(.*)$" },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "算力修仙 服务已启动",
+          "endsPattern": "登录状态会保留"
+        }
+      },
+      "presentation": { "reveal": "always", "panel": "shared", "group": "服务", "clear": true },
+      "runOptions": { "instanceLimit": 1 }
+    },
+    {
+      "label": "① 释放端口 3210（结束残留 node）",
+      "detail": "只结束 name 为 node/node.exe 的占用者，别的程序只报告不动手",
+      "type": "shell",
+      "command": "${config:suansuan.node}",
+      "args": ["tools/free-port.js", "3210"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "服务" }
+    },
+    {
+      "label": "② 跑全部测试（需服务已启动）",
+      "detail": "node tests/run.js —— 端到端那套会自动跳过未启动的情况",
+      "type": "shell",
+      "command": "${config:suansuan.node}",
+      "args": ["tests/run.js"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "测试", "clear": true }
+    },
+    {
+      "label": "② 真浏览器验收（verify-v38）",
+      "detail": "需先启动服务；跑完截图落在 preview/",
+      "type": "shell",
+      "command": "python",
+      "args": ["tools/verify-v38.py"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": { "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8" }
+      },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "测试", "clear": true }
+    },
+    {
+      "label": "环境自检（跑不起来先跑这个）",
+      "detail": "node tools/doctor.js —— 只读检查：Node/Python 实际生效的是哪一个、依赖能否加载、端口是否空闲、VSCode 配置是否可用",
+      "type": "shell",
+      "command": "${config:suansuan.node}",
+      "args": ["tools/doctor.js"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "环境", "clear": true }
+    },
+    {
+      "label": "修复原生模块（ABI 不匹配时）",
+      "detail": "node tools/fix-native.js —— better-sqlite3 与当前 Node 不匹配时，重新拉取匹配的预编译包并验证",
+      "type": "shell",
+      "command": "${config:suansuan.node}",
+      "args": ["tools/fix-native.js"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "环境", "clear": true }
+    },
+    {
+      "label": "③ 安装依赖",
+      "detail": "用 cmd.exe 执行 npm，绕开 PowerShell 的 npm.ps1 执行策略限制",
+      "type": "shell",
+      "command": "npm install",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "group": "环境" }
+    }
+  ]
+}

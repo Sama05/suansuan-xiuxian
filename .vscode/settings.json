@@ -1,0 +1,91 @@
+{
+  // 全项目 UTF-8。这个仓库到处是中文（源码注释、文案、文档、tools 里的 Python 脚本），
+  // 不钉死编码就会出现「本地能读的字变成乱码」或 Python 侧 UnicodeDecodeError。
+  "files.encoding": "utf8",
+  "files.autoGuessEncoding": false,
+
+  // 与 .gitattributes 的 `* text=auto eol=lf` 保持一致，避免每行都被标成改动。
+  "files.eol": "\n",
+
+  // ── 运行时钉死 ─────────────────────────────────────────────────────
+  // better-sqlite3 是原生模块，二进制绑定 Node 的 ABI：装的时候用哪个 Node，
+  // 就只有那个 Node 能加载。这台机器上有两套 Node（系统 24.x / 22.x），
+  // 一旦 VSCode 用了另一套，启动就是 ERR_DLOPEN_FAILED。
+  //
+  // 这里显式指定运行时，launch.json / tasks.json 都用 ${config:suansuan.node}
+  // 引用它 —— 只改这一处，F5、任务面板、调试器就全都对齐了。
+  // 换机器/换 Node 时改这一行，然后 `npm run fix-native`（或在 VSCode 里跑
+  // 「修复原生模块」任务）把 better-sqlite3 重装成匹配的 ABI。
+  "suansuan.node": "D:\\Application\\nodejs\\node.exe",
+
+  // 终端默认走 Git Bash：一是本项目所有脚本/命令都是在它下面验证的，
+  // 二是 PowerShell 里输入 npm 会命中 npm.ps1，受 ExecutionPolicy 管辖（常见报错
+  // “因为在此系统上禁止运行脚本”）。Git Bash 没有这一层。
+  //
+  // 这里**显式**给出路径：本机 Git 装在 D:\Application\Git，不在 VSCode 自动扫描的
+  // 几个常见位置里（Program Files / LOCALAPPDATA\Programs\Git），不写死就认不出来，
+  // 结果静默回退到 PowerShell —— 那正是我们要避开的那个。
+  "terminal.integrated.profiles.windows": {
+    "Git Bash": {
+      "path": "D:\\Application\\Git\\bin\\bash.exe",
+      "args": ["--login", "-i"],
+      "icon": "terminal-bash"
+    },
+    "Command Prompt": {
+      "path": "C:\\Windows\\System32\\cmd.exe",
+      "args": [],
+      "icon": "terminal-cmd"
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "Git Bash",
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.defaultProfile.osx": "zsh",
+  "terminal.integrated.cwd": "${workspaceFolder}",
+
+  // git 也装在自定义位置，显式指路，否则侧边栏「源代码管理」会显示找不到 git。
+  "git.path": "D:\\Application\\Git\\cmd\\git.exe",
+  // 本项目不是 git 仓库的子目录，自动检测够用；关掉自动 fetch 免得打扰
+  "git.autofetch": false,
+  "git.confirmSync": false,
+
+  // 任务(npm/node 命令)固定用 cmd.exe：不依赖任何 PowerShell 策略，行为最可预测。
+  "terminal.integrated.automationProfile.windows": {
+    "path": "C:\\Windows\\System32\\cmd.exe"
+  },
+
+  // Python 侧统一 UTF-8 —— 与手工跑脚本时的约定一致（见项目 memory）
+  "terminal.integrated.env.windows": {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8"
+  },
+  "terminal.integrated.env.linux": {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8"
+  },
+  "terminal.integrated.env.osx": {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8"
+  },
+
+  // 搜索/监视排除：
+  // data/ 里 game.db-wal 会被服务端持续写入，preview/ 是几百 KB 的截图 ——
+  // 不排除的话文件监视器一直在wake，纯属浪费。
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/data": true,
+    "**/preview": true,
+    "**/.bak-*": true,
+    "package-lock.json": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/data/**": true,
+    "**/preview/**": true,
+    "**/.bak-*/**": true
+  },
+
+  "js/ts.implicitProjectConfig.checkJs": false,
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "[python]": { "editor.tabSize": 4 }
+}

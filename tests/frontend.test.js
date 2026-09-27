@@ -25,6 +25,23 @@ const ROOT = path.join(__dirname, '..');
 
 function read(rel) { return fs.readFileSync(path.join(ROOT, rel), 'utf8'); }
 
+/** 拼接全部 core 模块源码 —— 拆分后内核实现分散在 shared/core/*.js，聚合器只剩出口表 */
+function coreSrc() {
+  return fs.readdirSync(path.join(ROOT, 'shared', 'core'))
+    .filter((f) => f.endsWith('.js')).sort()
+    .map((f) => read(path.join('shared', 'core', f)))
+    .join('\n');
+}
+
+/** 拼接前端入口与全部 app 模块源码 —— 拆分后前端实现分散在 public/js/app/*.js */
+function allAppSrc() {
+  return [read('public/js/app.js')]
+    .concat(fs.readdirSync(path.join(ROOT, 'public', 'js', 'app'))
+      .filter((f) => f.endsWith('.js')).sort()
+      .map((f) => read(path.join('public', 'js', 'app', f))))
+    .join('\n');
+}
+
 // ---------- DOM 桩 ----------
 let EL_CACHE = {};
 
@@ -164,7 +181,7 @@ function installStubs() {
   const html = read('public/index.html');
   {
     // app.js 引用的每个 id 都必须在 HTML 里存在，否则运行时会 null 报错
-    const appSrc = read('public/js/app.js');
+    const appSrc = allAppSrc();
     const usedIds = new Set();
     const re = /\$\('([^']+)'\)/g;
     let m;
@@ -255,11 +272,11 @@ function installStubs() {
 
     // 折叠（v3.7）：一处实现 + 声明式挂载。新增折叠点只加 data-collapse 属性，
     // 不用再复制一份展开/收起代码 —— 这里把「只有一处实现」钉死，防止以后各写各的。
-    const appSrc = read('public/js/app.js');
+    const appSrc = allAppSrc();
     ok((appSrc.match(/function slideToggle/g) || []).length === 1,
       '折叠动画只有一处实现（新增折叠点复用即可）');
     ok(/data-collapse="next"/.test(appSrc), '组头用 data-collapse 声明折叠目标');
-    ok(/bindCollapse\(\$\('co-line-list'\)/.test(appSrc) && /bindCollapse\(\$\('mk-good-list'\)/.test(appSrc),
+    ok(/bindCollapse\((A\.)?\$\('co-line-list'\)/.test(appSrc) && /bindCollapse\((A\.)?\$\('mk-good-list'\)/.test(appSrc),
       '公司 / 市场两处折叠都走同一个 bindCollapse');
 
     // 折叠动画的**根因回归**（v3.8 修）：
@@ -348,7 +365,7 @@ function installStubs() {
   {
     const css = read('public/css/style.css');
     const html0 = read('public/index.html');
-    const app = read('public/js/app.js');
+    const app = allAppSrc();
 
     // 资源条必须是「固定列数网格」：列宽只由容器决定，与文本长度无关。
     // 若退回 flex + flex-wrap，副标题一变长就可能跨过换行阈值折行，
@@ -381,7 +398,7 @@ function installStubs() {
   console.log('\n=== 生产线批量操作 · 优先生产 · 商品排序 ===');
   {
     const html = read('public/index.html');
-    const app = read('public/js/app.js');
+    const app = allAppSrc();
     const css = read('public/css/style.css');
 
     // ---- 市场排序条：四个互斥按钮 ----
@@ -395,14 +412,14 @@ function installStubs() {
     ok(html.indexOf('id="ui-mk-sort-hint"') > 0, '排序条有状态说明位');
 
     // 排序状态必须是**单一**的 { field, dir } —— 否则「互斥」无从谈起
-    ok(/const mktSort = \{ field: 'industry', dir: 1 \}/.test(app),
+    ok(/A\.mktSort = \{ field: 'industry', dir: 1 \}/.test(app),
       '排序状态只有一个 field + dir（天然互斥）');
-    ok(/mktSort\.dir = -mktSort\.dir/.test(app), '再点同一按钮切换升 / 降序');
-    ok(/mktSort\.field = f;[\s\S]{0,80}mktSort\.dir = 1/.test(app), '换字段时重置为升序');
-    ok(/ar\.textContent = on \? \(mktSort\.dir === 1 \? '↓' : '↑'\)/.test(app),
+    ok(/A\.mktSort\.dir = -A\.mktSort\.dir/.test(app), '再点同一按钮切换升 / 降序');
+    ok(/A\.mktSort\.field = f;[\s\S]{0,80}A\.mktSort\.dir = 1/.test(app), '换字段时重置为升序');
+    ok(/ar\.textContent = on \? \(A\.mktSort\.dir === 1 \? '↓' : '↑'\)/.test(app),
       '升序显示下箭头、降序显示上箭头');
     ok(/function applyMarketSort\(force\)/.test(app), '存在统一的排序落地函数');
-    ok(/mktSort\.field === 'industry'[\s\S]{0,120}buildMarketGroups\(\)/.test(app),
+    ok(/A\.mktSort\.field === 'industry'[\s\S]{0,120}A\.buildMarketGroups\(\)/.test(app),
       '点「行业」回到分组展示');
     ok(/function maybeResortMarket\(\)[\s\S]{0,200}applyMarketSort\(false\)/.test(app),
       '刷新后按当前字段保持排序（节流重排，不每帧抖动）');
@@ -417,7 +434,7 @@ function installStubs() {
     ok(/async function setIndustryRate\(industryId, rate\)/.test(app),
       '存在行业批量设产能的入口');
     ok(/case 'setIndustryRate'/.test(read('server/index.js')), '服务端受理 setIndustryRate');
-    ok(/function setIndustryRate\(s, industryId, rate\)/.test(read('shared/game-core.js')),
+    ok(/function setIndustryRate\(s, industryId, rate\)/.test(coreSrc()),
       '内核实现 setIndustryRate');
     ok(/r\.lines[\s\S]{0,40}r\.units/.test(app), '批量操作给出作用范围的状态反馈');
 
@@ -426,7 +443,7 @@ function installStubs() {
     ok(/co-prio\.on/.test(css) || /\.co-prio\.on/.test(css), '优先开关的开启态有独立样式');
     ok(/async function setLinePriority\(lineId, on\)/.test(app), '存在优先开关入口');
     ok(/case 'setLinePriority'/.test(read('server/index.js')), '服务端受理 setLinePriority');
-    ok(/function companyComputeTiers\(s\)/.test(read('shared/game-core.js')),
+    ok(/function companyComputeTiers\(s\)/.test(coreSrc()),
       '算力按两级分配（优先线先吃满）');
   }
 
@@ -1428,11 +1445,33 @@ function installStubs() {
 
   console.log('\n=== 已移除 API 不应残留引用 ===');
   {
-    const appSrc = read('public/js/app.js');
+    const appSrc = allAppSrc();
     const serverSrc = read('server/index.js');
     for (const bad of ['clickIncome', 'doWork', 'clickCount', 'baseClickIncome']) {
       ok(appSrc.indexOf(bad) < 0, 'app.js 不再引用 ' + bad);
       ok(serverSrc.indexOf(bad) < 0, 'server/index.js 不再引用 ' + bad);
+    }
+  }
+
+  console.log('\n=== Decimal API 契约（前端不得调用不存在的方法）===');
+  {
+    // 历史坑（v4.1 悬停明细）：res-tip 里写了 p.companyUpkeep.neg()，而自研
+    // decimal.js 根本没有 neg() —— Node 桩冒烟没覆盖到拼 HTML 的分支，直到
+    // 真浏览器悬停时才抛 TypeError，面板永远不显示。这里反向断言钉住：
+    // 前端源码禁止出现 decimal.js 未实现的链式方法（原生 Number 才有的方法
+    // 不在列，JS 里数字不会带这些调用出现歧义的方法只有以下几个）。
+    const dec = read(path.join('shared', 'decimal.js'));
+    const allSrc = allAppSrc();
+    const banned = ['neg', 'abs', 'ceil', 'floor', 'round', 'sqrt', 'log', 'ln', 'recip'];
+    for (const m of banned) {
+      if (new RegExp('(?<![.\\w])' + m + '\\s*\\(', 'm').test(dec)) continue; // 核里实现了就放行
+      // (?<!Math) —— Math.round / Math.ceil 是静态调用，不是 Decimal 链式方法
+      ok(!new RegExp('(?<!Math)\\.' + m + '\\(').test(allSrc),
+        'app 源码不得调用 Decimal 未实现的 .' + m + '()');
+    }
+    // Decimal API 契约本身也钉住：以下方法被前端广泛依赖，删掉任何一个是破坏性变更
+    for (const must of ['isNeg', 'cmp', 'gt', 'gte', 'lt', 'lte', 'add', 'sub', 'mul', 'div', 'pow']) {
+      ok(new RegExp(must + '\\(').test(dec), 'decimal.js 提供 .' + must + '()');
     }
   }
 
@@ -1570,7 +1609,7 @@ function installStubs() {
       && html.indexOf('rb-col gain') > 0, '确认弹窗含「失去 / 保留 / 获得」三栏');
 
     // app.js 引用同一套 id，且不再引用被删掉的神识旧字段
-    const appJs = read('public/js/app.js');
+    const appJs = allAppSrc();
     ok(appJs.indexOf('renderRebirthPage') > 0, 'app.js 已接入 renderRebirthPage');
     ok(appJs.indexOf('computeBonusPerPoint') < 0, 'app.js 不再引用被移除的神识旧系数');
     ok(appJs.indexOf('shenshiComputeMultiplier') > 0, 'app.js 用分层后的实际乘区显示加成');

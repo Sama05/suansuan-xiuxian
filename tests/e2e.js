@@ -1520,6 +1520,127 @@ async function req(path, opts) {
       '测试账号已清理');
   }
 
+  // ============================================================
+  // 运行环境：端口占用提示 / 优雅退出 / 外部命令 stdin / VSCode 配置
+  //
+  // 这段全是**静态守卫 + 子进程实测**，防的是「跑起来才发现」的那类问题：
+  // 端口冲突、退出不干净、以及本机特有的 spawnSync EBUSY。
+  // 它们不依赖服务端接口，所以即便服务没起也照样能跑（本文件已在跑说明服务是活的）。
+  {
+    const fsx = require('fs');
+    const pathx = require('path');
+    const { spawnSync } = require('child_process');
+    const ROOT = pathx.join(__dirname, '..');
+    const readSrc = (rel) => fsx.readFileSync(pathx.join(ROOT, rel), 'utf8');
+    // 本机环境下子进程带 stdin 管道会 EBUSY，所以测试自己的子进程也要关掉 stdin
+    const spawnOpt = { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] };
+
+    console.log('\n=== 运行环境：端口提示 / 优雅退出 / 外部命令 / VSCode 配置 ===');
+
+    // —— db.closeDb：存在且幂等（在子进程里验，别把本进程正在用的库关了）——
+    {
+      const dbm3 = require('../server/db.js');
+      ok(typeof dbm3.closeDb === 'function', 'db 层导出 closeDb（退出时合并 WAL 用）');
+      const r = spawnSync(process.execPath, ['-e',
+        "const d=require('./server/db');d.closeDb();d.closeDb();console.log('closed-ok');",
+      ], spawnOpt);
+      ok((r.stdout || '').includes('closed-ok'),
+        'closeDb 连调两次不抛（幂等）', (r.stdout || '') + (r.stderr || ''));
+    }
+
+    // —— 外部命令必须显式关掉 stdin ——
+    // 踩过的坑：execFileSync('netstat', ...) 在本机静默 EBUSY，表现为
+    // 「查不到端口占用者」，看起来像解析逻辑写错了，其实是子进程压根没起来。
+    //
+    // 注意不能用 `execFileSync\([^)]*\)` 去截整段调用 —— 参数里只要出现嵌套括号
+    // （例如 `String(pid)`）就会在第一个 `)` 处提前截断，于是「没看到 stdio」被误判。
+    // 改成：每个 execFileSync( 之后开一个窗口，只要窗口内有 stdio 就算过。
+    {
+      const bad = [];
+      for (const f of ['server/index.js', 'server/port-info.js', 'tools/free-port.js',
+        'tools/doctor.js', 'tools/fix-native.js']) {
+        const src = readSrc(f);
+        let i = -1;
+        while ((i = src.indexOf('execFileSync(', i + 1)) !== -1) {
+          const window = src.slice(i, i + 400);
+          if (!/stdio\s*:/.test(window)) {
+            bad.push(f + ' :: ' + window.split('\n')[0].replace(/\s+/g, ' ').slice(0, 64));
+          }
+        }
+      }
+      ok(bad.length === 0,
+        '所有 execFileSync 调用都显式 stdio（否则本机 EBUSY）', bad.join(' | '));
+    }
+
+    // —— 启动失败 / 退出路径 ——
+    {
+      const src = readSrc('server/index.js');
+      // 端口占用处理被抽到了 server/port-info.js（三处共用），所以两件事分开断言：
+      // ① index.js 里确实接了 EADDRINUSE 这个分支；② 查出占用者的能力真实存在。
+      const pi = readSrc('server/port-info.js');
+      ok(/EADDRINUSE/.test(src) && /portInfo\s*\.\s*describe\(/.test(src),
+        'server 接了 EADDRINUSE，并调用 port-info 查占用者');
+      ok(/module\.exports/.test(pi) && /listenersOf/.test(pi) && /describe/.test(pi),
+        'server/port-info.js 导出 listenersOf / describe');
+      ok(/process\.on\('SIGINT'/.test(src) && /process\.on\('SIGTERM'/.test(src),
+        'server 注册了 SIGINT / SIGTERM 优雅退出');
+      ok(/unhandledRejection/.test(src),
+        'server 对未处理的 Promise 拒绝会响亮失败（不再静默）');
+      ok(/const server = app\.listen\(/.test(src),
+        'listen 的返回句柄被接住（server.on(\'error\') 才有处可挂）');
+    }
+
+    // —— ABI 不匹配必须给出可执行提示，而不是一坨 dlopen 栈 ——
+    {
+      const dbSrc = readSrc('server/db.js');
+      ok(/ERR_DLOPEN_FAILED/.test(dbSrc),
+        'server/db.js 捕获原生模块 ABI 不匹配（ERR_DLOPEN_FAILED）');
+      // require 本身不加载原生二进制，是在 new Database() 时才 dlopen —— 两处都得包。
+      const tryIdx = dbSrc.indexOf('let db;');
+      const seg = dbSrc.slice(tryIdx, tryIdx + 400);
+      ok(/require\('better-sqlite3'\)/.test(seg) && /new Database\(/.test(seg),
+        'require 与 new Database 包在同一个 try 里（否则提示不会触发）');
+    }
+
+    // —— 端口释放工具真的能跑 ——
+    {
+      const r = spawnSync(process.execPath,
+        [pathx.join(ROOT, 'tools', 'free-port.js'), '65500', '--dry'], spawnOpt);
+      const out = (r.stdout || '') + (r.stderr || '');
+      ok(r.status === 0 && /65500/.test(out) && /空闲/.test(out),
+        'tools/free-port.js 可用（未占用的端口报空闲）', out.trim().slice(0, 80));
+    }
+
+    // —— VSCode 配置：能解析，且 launch 的目标文件真实存在 ——
+    {
+      const strip = (s) => s.split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
+      const VSC = pathx.join(ROOT, '.vscode');
+      const names = ['launch.json', 'tasks.json', 'settings.json', 'extensions.json'];
+      const detail = [];
+      let allOk = true;
+      for (const f of names) {
+        try {
+          const o = JSON.parse(strip(fsx.readFileSync(pathx.join(VSC, f), 'utf8')));
+          detail.push(f + ':' + Object.keys(o).length);
+        } catch (e) { allOk = false; detail.push(f + ':解析失败'); }
+      }
+      ok(allOk, '.vscode 下四个配置文件都是合法 JSON', detail.join(' '));
+
+      const lj = JSON.parse(strip(fsx.readFileSync(pathx.join(VSC, 'launch.json'), 'utf8')));
+      const missing = [];
+      for (const c of lj.configurations || []) {
+        const m = String(c.program || '').match(/\$\{workspaceFolder\}\/(.+)$/);
+        if (m && !fsx.existsSync(pathx.join(ROOT, m[1]))) missing.push(c.name + ' -> ' + m[1]);
+      }
+      ok(missing.length === 0, 'launch.json 里每个 program 都真实存在', missing.join(' | '));
+
+      // .vscode 必须跟着仓库走，否则换台机器克隆下来就「跑不起来还得手搓」
+      const gi = fsx.readFileSync(pathx.join(ROOT, '.gitignore'), 'utf8');
+      ok(names.every((n) => gi.includes('!.vscode/' + n)),
+        '.gitignore 放行了这四个 .vscode 配置（团队共用）');
+    }
+  }
+
   console.log('\n' + '='.repeat(46));
   console.log('  通过  ' + pass + '   失败  ' + fail);
   console.log('='.repeat(46) + '\n');

@@ -5,14 +5,49 @@
 
 const path = require('path');
 const fs = require('fs');
-const Database = require('better-sqlite3');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
+/**
+ * better-sqlite3 是**原生模块**，绑死在「装它时用的那个 Node」的 ABI 上。
+ *
+ * 这台机器上有两套 Node（D:\Application\nodejs 的 24.x，以及别处的 22.x），
+ * 用错版本只会得到一坨 dlopen / NODE_MODULE_VERSION 的栈 —— 从里面根本看不出
+ * 该做什么。这里翻译成「怎么办」，并把当前实际生效的 Node 打出来。
+ *
+ * 注意 ①：**两处都要包**。`require('better-sqlite3')` 只加载 JS 包装层，原生二进制
+ *   是在 `new Database()` 时才 dlopen 的 —— 只包 require 的话，友好提示根本不会触发，
+ *   玩家看到的仍是原始栈（这个坑实测踩过一次）。
+ * 注意 ②：不要试图用一个 JS shim 去“兼容”过去。WorkBuddy 注入的 node-language-shim
+ *   会拦 process.dlopen，能让 ABI 不匹配**假通过** —— 那次排查里就因此误判过一轮。
+ *   真正靠谱的做法只有「用匹配的 Node 重装」。
+ */
 const DATA_DIR = path.join(__dirname, '..', 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'game.db'));
+let db;
+try {
+  const Database = require('better-sqlite3');
+  db = new Database(path.join(DATA_DIR, 'game.db'));
+} catch (e) {
+  if (e && e.code === 'ERR_DLOPEN_FAILED') {
+    console.error('');
+    console.error('  [依赖错误] better-sqlite3 与当前 Node 版本不匹配（原生模块 ABI 不同）。');
+    console.error('    当前 Node : ' + process.version + '（ABI ' + process.versions.modules + '）');
+    console.error('    可执行文件: ' + process.execPath);
+    console.error('    报错原文  : ' + String(e.message).split('\n')[0]);
+    console.error('');
+    console.error('  原因：原生模块装一次只认一个 Node 版本，换 Node 必须重装。');
+    console.error('  修法（在项目根目录执行）：');
+    console.error('    ① 一条命令修好（并自检）:  npm run fix-native');
+    console.error('    ② 先看清实际用的是哪个 Node:  node tools/doctor.js');
+    console.error('    ③ 或在 VSCode 里跑任务「修复原生模块（ABI 不匹配时）」');
+    console.error('');
+    process.exit(1);
+  }
+  throw e;
+}
+
 db.pragma('journal_mode = WAL');
 // WAL 不做 checkpoint 的话 -wal 文件会一直涨（写入越多涨越快），读性能也会退化。
 // 这里两件事一起做：① 启动时把已有的 WAL 合并回主库并截断；② 开自动 checkpoint，
@@ -216,8 +251,22 @@ function sessionStats() {
   return { total: q.countSessions.get().n, ttlDays: Math.round(SESSION_TTL_MS / 86400000) };
 }
 
+/**
+ * 优雅关闭：把 WAL 合并回主库再断连接，幂等。
+ *
+ * 为什么必须做：better-sqlite3 在进程被强杀 / Ctrl+C 时不会自动 checkpoint，
+ * 未合并的写入会留在 data/game.db-wal 里。虽然下次启动也能恢复（不会丢数据），
+ * 但文件会一直偏大，且断电时更容易留下半截 WAL。启动时会 checkpoint 一次，
+ * 退出时再来一次，才能保证「不跑的时候 WAL 是干净的」。
+ */
+function closeDb() {
+  try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { /* 已关闭 —— 幂等 */ }
+  try { db.close(); } catch (e) { /* 已关闭 —— 幂等 */ }
+}
+
 module.exports = {
   register, login, registerSync, loginSync, loadSave, saveGame, getUser, db,
   createSession, getSession, deleteSession, purgeSessions, sessionStats,
+  closeDb,
   SESSION_TTL_MS,
 };
